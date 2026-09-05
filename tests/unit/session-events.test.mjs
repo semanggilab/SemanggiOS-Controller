@@ -135,6 +135,63 @@ test("a replayed end event is ignored once the execution is final", async () => 
   assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
 });
 
+test("a late end resolves a watchdog-parked task: BLOCKED follows the truth", async () => {
+  // TASK-7A3CC32A, measured live: the watchdog parked task and execution on
+  // BLOCKED after 30 quiet minutes, then the run's real lifecycle end arrived
+  // — stopReason "stop". The execution was finalised COMPLETE but the task
+  // transition BLOCKED -> COMPLETE did not exist, the throw was swallowed by
+  // handle()'s catch-all, and the task sat BLOCKED under a COMPLETE execution.
+  // The parking was a guess; the end is the truth, and the truth wins.
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "t" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+
+  // What reclaimStalledDispatches does when no runtime event arrives.
+  await h.repos.executions.setStatus(execution.id, ExecutionStatus.BLOCKED, {
+    result: "no runtime event for 1821s after dispatch",
+  });
+  await h.repos.tasks.setStatus(task.id, Status.BLOCKED, {
+    reason: "no runtime event for 1821s after dispatch", actor: "dispatch-watchdog",
+  });
+
+  const sink = await sinkFor(h);
+  await sink.handle(...endEvent(execution.id));
+
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
+});
+
+test("an end arriving after a mid-run cancel leaves the task abandoned, without swallowing anything", async () => {
+  // The sibling shape, also measured live ("illegal task transition CANCELLED
+  // -> COMPLETE" in the service log): cancel does not abort the run at the
+  // gateway, so the run finishes with stopReason "stop" afterwards. CANCELLED
+  // is a dead end by design — the task stays abandoned — but the execution
+  // still records what really happened, and the lease release and audit event
+  // that used to be skipped behind the swallowed throw must still run.
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "t" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const path = (await h.repos.tasks.get(task.id)).workspace_path;
+  await h.repos.tasks.cancel(task.id, { actor: "satria" });
+  assert.ok(await h.repos.leases.get(path), "cancel leaves the live run holding the lease");
+
+  const sink = await sinkFor(h);
+  await sink.handle(...endEvent(execution.id));
+
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.CANCELLED);
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE);
+  assert.equal(await h.repos.leases.get(path), null, "the lease is still released");
+  const events = await h.events.list({ subjectType: "execution", subjectId: execution.id });
+  assert.ok(
+    events.some((e) => e.kind === "execution.status" && e.payload.source === "sessions.subscribe"),
+    "the audit event is written even though the task did not move",
+  );
+});
+
 test("non-lifecycle chatter is ignored", async () => {
   const h = await buildHarness();
   const sink = await sinkFor(h);

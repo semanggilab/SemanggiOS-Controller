@@ -48,13 +48,21 @@ export function shortId(prefix) {
 }
 
 /**
- * The only statuses a task may be deleted from (D54). Both are provably idle:
- * CREATED never reached the queue, and CANCELLED is a dead end the state
- * machine has no exit from — so deleting one cannot stop work that is
- * happening. Every other status either is live work or can become it without
- * anyone asking again, and deleting those would be stopping work silently.
+ * The only statuses a task may be deleted from (D54, extended D57). All four
+ * are provably idle: CREATED never reached the queue, CANCELLED is a dead end
+ * the state machine has no exit from, and COMPLETE/FAILED are terminal — the
+ * revision that could revive the last two is exactly what a deletion
+ * deliberately forecloses, so that is the operator's decision to make, not a
+ * reason to refuse. Every other status either is live work or can become it
+ * without anyone asking again, and deleting those would be stopping work
+ * silently.
  */
-export const DELETABLE_STATUSES = Object.freeze([Status.CREATED, Status.CANCELLED]);
+export const DELETABLE_STATUSES = Object.freeze([
+  Status.CREATED,
+  Status.CANCELLED,
+  Status.COMPLETE,
+  Status.FAILED,
+]);
 
 const hydrateTask = (r) =>
   r && {

@@ -102,6 +102,25 @@ test("a CANCELLED task with executions is soft-deleted: hidden, not removed", as
   assert.equal(events.find((e) => e.kind === "task.deleted").payload.method, "soft");
 });
 
+test("a finished task is deletable — the revision it could still get is what deletion forecloses", async () => {
+  const h = await buildHarness();
+  const { project } = await seedBasics(h);
+
+  const complete = await h.repos.tasks.create({ projectId: project.id, title: "done" });
+  await h.repos.tasks.setStatus(complete.id, Status.QUEUED);
+  await h.repos.tasks.setStatus(complete.id, Status.DISPATCHED);
+  await h.repos.tasks.setStatus(complete.id, Status.COMPLETE);
+  const result = await h.repos.tasks.delete(complete.id, { actor: "satria" });
+  assert.equal(result.deleted, true);
+
+  // A FAILED task is terminal the same way.
+  const failed = await h.repos.tasks.create({ projectId: project.id, title: "failed" });
+  await h.repos.tasks.setStatus(failed.id, Status.QUEUED);
+  await h.repos.tasks.setStatus(failed.id, Status.DISPATCHED);
+  await h.repos.tasks.setStatus(failed.id, Status.FAILED);
+  assert.equal((await h.repos.tasks.delete(failed.id)).deleted, true);
+});
+
 test("deletion refuses anything that is or could become live work", async () => {
   const h = await buildHarness();
   const { project } = await seedBasics(h);
@@ -110,16 +129,20 @@ test("deletion refuses anything that is or could become live work", async () => 
   await h.repos.tasks.setStatus(queued.id, Status.QUEUED);
   await assert.rejects(() => h.repos.tasks.delete(queued.id), /is QUEUED/);
 
-  const complete = await h.repos.tasks.create({ projectId: project.id, title: "done" });
-  await h.repos.tasks.setStatus(complete.id, Status.QUEUED);
-  await h.repos.tasks.setStatus(complete.id, Status.DISPATCHED);
-  await h.repos.tasks.setStatus(complete.id, Status.COMPLETE);
-  await assert.rejects(() => h.repos.tasks.delete(complete.id), /is COMPLETE/);
+  // BLOCKED is parked work, not finished work: a human is expected to look,
+  // so deleting it would be stopping work silently.
+  const blocked = await h.repos.tasks.create({ projectId: project.id, title: "parked" });
+  await h.repos.tasks.setStatus(blocked.id, Status.QUEUED);
+  await h.repos.tasks.setStatus(blocked.id, Status.BLOCKED, { reason: "test" });
+  await assert.rejects(() => h.repos.tasks.delete(blocked.id), /is BLOCKED/);
 
   await assert.rejects(() => h.repos.tasks.delete("TASK-NOPE"), /unknown task/);
 
-  // The allowlist is exactly the provably-idle pair.
-  assert.deepEqual([...DELETABLE_STATUSES], [Status.CREATED, Status.CANCELLED]);
+  // The allowlist is exactly the four provably-idle statuses.
+  assert.deepEqual(
+    [...DELETABLE_STATUSES],
+    [Status.CREATED, Status.CANCELLED, Status.COMPLETE, Status.FAILED],
+  );
 });
 
 test("a task is deleted exactly once", async () => {

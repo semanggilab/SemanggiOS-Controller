@@ -1893,6 +1893,55 @@ berikutnya, ketika update state masih in flight. Guard dilepas 150 ms
 setelah scroll berhenti, sehingga panel yang lain bebas menjadi driver.
 
 
+## D57 — hasil akhir eksekusi yang datang terlambat mengalahkan parkir watchdog: BLOCKED → COMPLETE; sink tidak lagi menelan galat; endpoint settle
+
+**Keputusan (2026-09-06).** TASK-7A3CC32A terukur hidup dengan keadaan
+mustahil: eksekusi `#1` COMPLETE, task-nya BLOCKED. Urutannya terbaca di
+event_log: dispatch 21:20 → watchdog memarkir keduanya BLOCKED 21:50
+("no runtime event for 1821s") → `end` lifecycle yang asli baru tiba 22:05
+(stopReason "stop"). Sink mengeksekusi vonisnya dua langkah: eksekusi
+COMPLETE berhasil, lalu `tasks.setStatus(BLOCKED → COMPLETE)` melempar
+`illegal task transition` — dan lemparan itu DITELAN oleh catch-all
+`handle()`, sehingga rilis lease, entri audit, dan notify scheduler ikut
+terlewat bersama dia. Komentar watchdog sendiri sudah meramalkan kasus ini
+("the run may even have completed on the gateway while we lost the event"),
+tetapi state machine tidak punya tepi untuk mencatat kebenarannya.
+
+**BLOCKED → COMPLETE ditambahkan.** BLOCKED sudah bisa selesai ke FAILED
+dan CANCELLED; COMPLETE satu-satunya terminal yang hilang. Parkir watchdog
+adalah dugaan dari ABSENSI bukti, bukan bukti kegagalan; `end` yang datang
+belakangan adalah bukti, dan bukti menang atas dugaan. Bentuk saudaranya
+terukur di log pada hari yang sama ("illegal task transition CANCELLED ->
+COMPLETE"): cancel tidak menghentikan run di gateway, jadi run yang
+ditinggalkan bisa selesai sendiri. Untuk bentuk ini keputusan operator
+MENANG — CANCELLED tetap jalan buntu, task tidak dibangkitkan — tetapi
+eksekusi tetap mencatat apa yang sungguh terjadi.
+
+**`applyEnd` kini memeriksa `canTransition` alih-alih melempar ke
+catch-all.** Task yang sudah terminal dipertahankan, dengan log
+`run.ended-task-unmoved` yang menyebut status dan vonis; rilis lease, entri
+audit, dan notify scheduler selalu jalan. Catch-all `handle()` tetap ada —
+tetapi sebagai jaring pengaman kejadian tak terduga, bukan sebagai tempat
+tinggal permanen bagi galat yang sudah dikenal.
+
+**Endpoint `POST /api/work/tasks/{id}/settle` (admin-only)** memperbaiki
+baris yang sudah telanjur divergen: baca eksekusi terakhir yang final,
+pakai pemetaan yang SAMA dengan reconciler (`TASK_FOR_EXECUTION`, kini
+diekspor supaya dua pemakai tidak berdrift), tolak dengan menyebut
+transisinya bila state machine menolak. Aturan 6 melarang memperbaiki
+baris dengan tangan, maka perbaikan punya jalur API. TASK-7A3CC32A
+diselesaikan lewat endpoint ini setelah deploy.
+
+**Penghapusan task diperluas ke status terminal (melengkapi D54).**
+`DELETABLE_STATUSES` kini `CREATED, CANCELLED, COMPLETE, FAILED`: dua yang
+baru sama-sama terbukti menganggur, dan revisi yang secara teori bisa
+menghidupkan COMPLETE/FAILED kembali adalah persis hal yang sebuah
+penghapusan tutup dengan sengaja. QUEUED, WAIT_*, DISPATCHED, RUNNING,
+BLOCKED, RESUMABLE tetap tertolak — BLOCKED termasuk yang tertolak karena
+ia pekerjaan yang DIPARKIR untuk dilihat manusia, bukan pekerjaan yang
+selesai.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

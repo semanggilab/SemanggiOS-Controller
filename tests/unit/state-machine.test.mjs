@@ -26,6 +26,15 @@ test("BLOCKED recovers only through RESUMABLE", () => {
   assert.equal(canTransition(Status.BLOCKED, Status.QUEUED), false);
 });
 
+test("BLOCKED resolves to COMPLETE when the run's real end arrives late", () => {
+  // The watchdog parks on absence of evidence; a late lifecycle end IS the
+  // evidence, and must be recordable (D57, TASK-7A3CC32A). FAILED and
+  // CANCELLED were already reachable — COMPLETE was the missing terminal.
+  assert.ok(canTransition(Status.BLOCKED, Status.COMPLETE));
+  // The dead end stays dead: an operator's cancel outranks a late clean end.
+  assert.equal(canTransition(Status.CANCELLED, Status.COMPLETE), false);
+});
+
 test("CANCELLED is terminal", () => {
   for (const status of Object.values(Status)) {
     assert.equal(canTransition(Status.CANCELLED, status), false);

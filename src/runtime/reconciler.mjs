@@ -21,7 +21,10 @@ const TERMINAL_RUNTIME = {
   failed: ExecutionStatus.FAILED,
 };
 
-const TASK_FOR_EXECUTION = {
+// Exported because the settle API endpoint answers the same question the
+// reconciler does — "this execution is final, so where does the task stand?"
+// — and the two must not drift apart on the mapping.
+export const TASK_FOR_EXECUTION = {
   [ExecutionStatus.COMPLETE]: Status.COMPLETE,
   [ExecutionStatus.FAILED]: Status.FAILED,
   [ExecutionStatus.CANCELLED]: Status.CANCELLED,

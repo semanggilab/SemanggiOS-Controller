@@ -108,7 +108,14 @@ const TRANSITIONS = new Map(
     // call mid-turn, so the run is alive but waiting on a person. It returns to
     // RUNNING on approval (POC-3 E3), which is why this is not a terminal exit.
     RUNNING: [Status.WAIT_HUMAN, Status.COMPLETE, Status.BLOCKED, Status.FAILED, Status.CANCELLED],
-    BLOCKED: [Status.RESUMABLE, Status.FAILED, Status.CANCELLED],
+    // BLOCKED is where the watchdog parks a task on ABSENCE of evidence, not on
+    // evidence of failure — its own comment says the run may have completed on
+    // the gateway while the event was lost. When the run's real end then
+    // arrives late, the outcome outranks the parking: BLOCKED already resolves
+    // to FAILED and CANCELLED, and without COMPLETE the sink's task transition
+    // threw inside a catch-all, leaving a COMPLETE execution under a BLOCKED
+    // task (TASK-7A3CC32A, measured live).
+    BLOCKED: [Status.RESUMABLE, Status.FAILED, Status.CANCELLED, Status.COMPLETE],
     RESUMABLE: [Status.QUEUED, Status.CANCELLED],
     // Re-entry from a terminal-ish state is only legal through a revision, which
     // is why callers must pass reason="revision" (checked below).

@@ -7,8 +7,9 @@ import { createServer } from "node:http";
 import { nullLogger } from "../domain/logger.mjs";
 import { verifySlackRequest, parseSlackBody } from "../interface/slack-verify.mjs";
 import { timingSafeEqual } from "node:crypto";
-import { Status } from "../domain/state-machine.mjs";
+import { Status, canTransition } from "../domain/state-machine.mjs";
 import { DELETABLE_STATUSES } from "../domain/repositories.mjs";
+import { TASK_FOR_EXECUTION } from "../runtime/reconciler.mjs";
 import { isExpedited, effectivePriority } from "../scheduler/selection.mjs";
 import { WakeReason } from "../scheduler/scheduler.mjs";
 import { buildAgentInventory, summariseInventory } from "../runtime/agent-inventory.mjs";
@@ -851,6 +852,50 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       statuses: [...new Set(statuses)], deleted: deleted.length, refused: refused.length, by,
     });
     return { deleted, refused };
+  });
+
+  // Repairs a task whose status disagrees with its own final execution —
+  // the divergence left behind when a run's end could not be applied to the
+  // task (TASK-7A3CC32A: execution COMPLETE under a task the watchdog had
+  // parked BLOCKED, D57). Rule 6 forbids fixing rows by hand, so the repair
+  // is an endpoint: same mapping the reconciler uses, same state-machine
+  // gate as everyone else, and a refusal that names the transition rather
+  // than a silent nothing.
+  route("POST", "/api/work/tasks/{id}/settle", async ({ id }, body, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may settle tasks");
+    const task = await repos.tasks.get(id);
+    if (!task) throw notFound(`unknown task ${id}`);
+    const execution = await repos.executions.latest(id);
+    if (!execution || execution.finalized_at == null) {
+      throw badRequest(`task ${id} has no finalized execution to settle from`);
+    }
+    const target = TASK_FOR_EXECUTION[execution.status];
+    if (!target) throw badRequest(`execution ${execution.id} is ${execution.status}, which maps to no task status`);
+    if (task.status === target) {
+      return { settled: false, reason: `task already ${target}`, task: presentTask(task, now()) };
+    }
+    if (!canTransition(task.status, target)) {
+      throw badRequest(`cannot settle task ${id}: illegal transition ${task.status} -> ${target}`);
+    }
+    const by = actor.kind === "operator" ? actor.name : "service";
+    await repos.tasks.setStatus(id, target, {
+      reason: `settled by ${by} from execution ${execution.id} (${execution.status})`,
+      actor: by,
+    });
+    // The divergent path also skipped the sink's lease release; if anything is
+    // still held under this execution, let it go now.
+    if (task.workspace_path) {
+      const lease = await repos.leases.get(task.workspace_path);
+      if (lease?.execution_id === execution.id) {
+        await repos.leases.release(task.workspace_path, { executionId: execution.id, actor: "settle" });
+      }
+    }
+    await scheduler.notify(WakeReason.MANUAL);
+    log.info("task.settled", { task: id, from: task.status, to: target, exec: execution.id, by });
+    return {
+      settled: true, from: task.status, to: target, execution: execution.id,
+      task: presentTask(await repos.tasks.get(id), now()),
+    };
   });
 
   // --- approvals ------------------------------------------------------------

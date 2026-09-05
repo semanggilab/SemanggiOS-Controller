@@ -219,3 +219,65 @@ test("malformed input is rejected rather than half-applied", async () => {
     await api.close();
   }
 });
+
+test("settle repairs a task that disagrees with its own final execution", async () => {
+  // The TASK-7A3CC32A shape: the watchdog parked the task BLOCKED, the run's
+  // late end finalised the execution COMPLETE, and the task transition that
+  // did not exist left the pair divergent. Rule 6 forbids fixing the row by
+  // hand, so the repair is this endpoint.
+  const h = await buildHarness();
+  const { project } = await seedBasics(h);
+  const api = await startApi(h);
+  try {
+    const task = await h.repos.tasks.create({ projectId: project.id, title: "divergent" });
+    const execution = await h.repos.executions.create({ taskId: task.id, instruction: "do it" });
+    await h.repos.executions.setStatus(execution.id, "COMPLETE", { result: "stop" });
+    await h.repos.tasks.setStatus(task.id, Status.QUEUED);
+    await h.repos.tasks.setStatus(task.id, Status.BLOCKED, { reason: "no runtime event", actor: "dispatch-watchdog" });
+
+    const { token } = await h.operators.create({ name: "budi", role: "operator" });
+    assert.equal((await api.call("POST", `/api/work/tasks/${task.id}/settle`, {}, { token })).status, 403);
+
+    const settled = await api.call("POST", `/api/work/tasks/${task.id}/settle`, {});
+    assert.equal(settled.status, 200);
+    assert.equal(settled.body.settled, true);
+    assert.equal(settled.body.from, Status.BLOCKED);
+    assert.equal(settled.body.to, Status.COMPLETE);
+    assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
+
+    // A second call is an honest no-op, not an error.
+    const again = await api.call("POST", `/api/work/tasks/${task.id}/settle`, {});
+    assert.equal(again.body.settled, false);
+    assert.match(again.body.reason, /already COMPLETE/);
+  } finally {
+    await api.close();
+  }
+});
+
+test("settle refuses when there is nothing final to settle from, or the move is illegal", async () => {
+  const h = await buildHarness();
+  const { project } = await seedBasics(h);
+  const api = await startApi(h);
+  try {
+    // No executions at all.
+    const bare = await h.repos.tasks.create({ projectId: project.id, title: "bare" });
+    assert.equal((await api.call("POST", `/api/work/tasks/${bare.id}/settle`, {})).status, 400);
+
+    // Execution still live.
+    const live = await h.repos.tasks.create({ projectId: project.id, title: "live" });
+    await h.repos.executions.create({ taskId: live.id, instruction: "do it" });
+    assert.equal((await api.call("POST", `/api/work/tasks/${live.id}/settle`, {})).status, 400);
+
+    // CANCELLED is a dead end: even a COMPLETE execution cannot resurrect it,
+    // and the refusal must name the transition.
+    const abandoned = await h.repos.tasks.create({ projectId: project.id, title: "abandoned" });
+    const execution = await h.repos.executions.create({ taskId: abandoned.id, instruction: "do it" });
+    await h.repos.executions.setStatus(execution.id, "COMPLETE", { result: "stop" });
+    await h.repos.tasks.cancel(abandoned.id, { actor: "satria" });
+    const refused = await api.call("POST", `/api/work/tasks/${abandoned.id}/settle`, {});
+    assert.equal(refused.status, 400);
+    assert.match(refused.body.error, /CANCELLED -> COMPLETE/);
+  } finally {
+    await api.close();
+  }
+});

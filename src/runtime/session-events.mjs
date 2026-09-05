@@ -32,7 +32,7 @@
 // status to an already-finalised execution is expected and ignored, not an
 // error.
 import { EventKind } from "../domain/events.mjs";
-import { ExecutionStatus, Status } from "../domain/state-machine.mjs";
+import { ExecutionStatus, Status, canTransition } from "../domain/state-machine.mjs";
 import {
   QUOTA_RETRY_LIMIT,
   RESOURCE_RETRY_LIMIT,
@@ -188,11 +188,32 @@ export function createSessionEventSink({
     }
 
     await repos.executions.setStatus(runId, verdict.execution, { result: verdict.reason });
-    await repos.tasks.setStatus(execution.task_id, verdict.task, {
-      reason: verdict.task === Status.COMPLETE ? null : `run ended: ${verdict.reason}`,
-      actor: "session-events",
-    });
-    if (verdict.task === Status.COMPLETE) {
+    // The run's outcome is recorded on the execution no matter where the task
+    // went, but the task only follows where the state machine allows. Two
+    // measured shapes of "the task moved on": the watchdog parked it BLOCKED
+    // and the real end arrived late (that one is now a legal BLOCKED →
+    // COMPLETE — the parking was a guess, this is the truth), and an operator
+    // CANCELLED the task while its run was still alive — CANCELLED is a dead
+    // end by design, so the task stays abandoned while the execution above
+    // says what really happened. Before this check, the forced transition
+    // threw inside handle()'s catch-all and the lease release, the audit
+    // event and the scheduler wake below were all skipped along with it —
+    // which is how TASK-7A3CC32A sat BLOCKED against a COMPLETE execution.
+    const taskBefore = await repos.tasks.get(execution.task_id);
+    const taskFollows =
+      taskBefore && (taskBefore.status === verdict.task || canTransition(taskBefore.status, verdict.task));
+    if (taskFollows) {
+      await repos.tasks.setStatus(execution.task_id, verdict.task, {
+        reason: verdict.task === Status.COMPLETE ? null : `run ended: ${verdict.reason}`,
+        actor: "session-events",
+      });
+    } else {
+      log.warn("run.ended-task-unmoved", {
+        task: execution.task_id, exec: runId,
+        taskStatus: taskBefore?.status ?? null, verdict: verdict.task,
+      });
+    }
+    if (taskFollows && verdict.task === Status.COMPLETE) {
       // D51/D52: success starts the retry counts over. A task that got
       // through once does not carry the attempts of the run that finally
       // worked — the counts measure one losing streak, not a task's life.
@@ -225,7 +246,9 @@ export function createSessionEventSink({
       task: execution.task_id, exec: runId,
       provider: execution.model_provider, model: execution.model_id,
       stopReason: verdict.reason, aborted: Boolean(data?.aborted),
-      taskStatus: verdict.task,
+      // The status the task ACTUALLY has now — normally the verdict's, but a
+      // task that went terminal first (e.g. cancelled mid-run) keeps its own.
+      taskStatus: task?.status ?? verdict.task,
       durationMs: data?.startedAt && data?.endedAt ? data.endedAt - data.startedAt : null,
       tokens: usage
         ? {
@@ -237,7 +260,7 @@ export function createSessionEventSink({
       sessionId: payload?.sessionId ?? null,
     });
     await scheduler?.notify?.("RUN_ENDED");
-    return { handled: true, status: verdict.task };
+    return { handled: true, status: task?.status ?? verdict.task };
   }
 
   /**

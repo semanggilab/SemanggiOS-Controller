@@ -1700,6 +1700,45 @@ lalu BLOCKED — itulah perilaku yang diminta, bukan bug. Otak kebijakan ada di
 `GET /api/work/brains` supaya UI tidak pernah menurunkan kebijakan sendiri.
 
 
+## D52 — ambang retry jadi 10 menit (dinamis, bukan milik Gemini); late-error transient → WAIT_RESOURCE + backoff + batas 5
+
+**Keputusan (2026-09-05, penyempurnaan D51 atas permintaan operator).** Dua
+perubahan:
+
+**(1) Ambang "retry in place" naik dari 60 dtk ke `< 10 menit` dan bersifat
+dinamis.** Perilaku itu bukan milik Gemini: SETIAP model yang jendela reset
+terpendeknya di bawah sepuluh menit mendapat perlakuan yang sama — parkir
+`WAIT_QUOTA` tepat satu jendela lalu redispatch, sampai
+`QUOTA_RETRY_LIMIT` = 10. Aturan menempel pada jendela (properti Brain),
+bukan pada nama provider; provider baru atau jendela kustom operator langsung
+tercakup tanpa perubahan kode.
+
+**(2) Late-error transient tidak lagi langsung BLOCKED.** Pesan late-error
+ber-sinyal *rate limit / UNAVAILABLE / overloaded / 5xx* menggambarkan runtime
+yang tidak sanggup SAAT INI, bukan pekerjaan yang mustahil — memblokir pada
+frame pertama membunuh task untuk gangguan yang reda sebelum operator
+melihat. Jalur baru: parkir `WAIT_RESOURCE` dengan backoff eksponensial
+(30 dtk → 15 menit, `resourceRetryBackoffMs`) dan **batas retry terpisah**
+`RESOURCE_RETRY_LIMIT` = 5 (penghitung kolom `tasks.resource_retries`,
+di-nol-kan bersama `quota_retries` saat COMPLETE dan revisi). Habis batas →
+`BLOCKED` dengan alasan menyebut hitungan. Sisanya (penolakan definitif —
+model salah, request salah) tetap `BLOCKED` seketika.
+
+**Urutan klasifikasi di `applyLateError` jadi tiga tingkat:** kuota +
+jendela < 10 menit → `WAIT_QUOTA` satu jendela (D51); kuota jendela panjang
+ATAU transient non-kuota → `WAIT_RESOURCE` backoff (baru); lainnya →
+`BLOCKED`. Rate limit jendela panjang (tembok 5 jam Claude) jatuh ke tingkat
+dua: sinyal kuotanya tetap direkam (D51), task menunggu dengan backoff, dan
+gerbang pra-dispatch yang mengambil alih dengan ETA jendela begitu resource
+tertandai `QUOTA_EXHAUSTED`.
+
+**Transisi baru: `DISPATCHED → WAIT_RESOURCE`** — saudara dari
+`DISPATCHED → WAIT_QUOTA` (D51) dengan alasan yang sama: penolakan
+pasca-accept adalah event yang admission tangani pra-accept. Ekor BLOCKED
+ketiga jalur dipusatkan di `blockLateError()` supaya mekanikanya tidak
+bercerai — celah sinyal D51 lahir persis dari salinan yang berdrift.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

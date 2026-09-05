@@ -21,16 +21,45 @@ export const QUOTA_WINDOWS_BY_PROVIDER = Object.freeze({
 });
 
 /**
- * Sebuah jendela pendek sependek ini berarti "coba lagi dalam menit yang
- * sama": menunggu 1× jendela lalu redispatch jauh lebih murah daripada
- * memblokir task dan menunggu operator resume. Jendela 5 jam ke atas bukan
- * kasus itu — menahannya di WAIT_* dengan ETA lebih jujur daripada siklus
- * redispatch.
+ * Ambang "retry in place": model dengan jendela reset terpendek di bawah
+ * sepuluh menit (D52; D51 memakai 60 dtk dan itu kebetulan hanya menangkap
+ * Gemini). Aturannya dinamis terhadap jendela, bukan terhadap provider —
+ * model mana pun yang resetnya cepat layak dicoba ulang satu jendela;
+ * memblokirnya berarti membunuh task untuk tembok yang hilang dalam hitungan
+ * menit. Jendela 5 jam ke atas bukan kasus itu — menunggu dengan backoff
+ * (lewat jalur WAIT_RESOURCE) lebih jujur daripada siklus redispatch.
  */
-export const RETRYABLE_SHORT_WINDOW_MS = 60_000;
+export const RETRYABLE_SHORT_WINDOW_MS = 10 * 60_000;
 
 /** Batas ulang sebelum jendela pendek menyerah dan task diblokir (D51). */
 export const QUOTA_RETRY_LIMIT = 10;
+
+/**
+ * Batas ulang terpisah untuk penolakan TRANSIENT di jalur late-error —
+ * rate limit pada jendela panjang dan UNAVAILABLE/overloaded (D52). Lebih
+ * kecil dari QUOTA_RETRY_LIMIT karena setiap percobaan berbackoff 30 dtk →
+ * 15 menit: lima percobaan ≈ seperempat jam menunggu sebelum menyerah.
+ */
+export const RESOURCE_RETRY_LIMIT = 5;
+export const RESOURCE_RETRY_BASE_MS = 30_000;
+export const RESOURCE_RETRY_MAX_MS = 15 * 60_000;
+
+/** Backoff eksponensial untuk percobaan transient ke-n (0-based). */
+export function resourceRetryBackoffMs(retries) {
+  return Math.min(RESOURCE_RETRY_BASE_MS * 2 ** Math.max(0, retries), RESOURCE_RETRY_MAX_MS);
+}
+
+/**
+ * Detektor penolakan transient — runtime/gateway sedang tidak sanggup, bukan
+ * task yang salah: UNAVAILABLE, overloaded, "try again later", 5xx (D52).
+ * Rate limit TIDAK di sini: ia sudah tertangkap isQuotaErrorMessage dan
+ * membawa jadwal reset sendiri; tempatnya di klasifikasi kuota.
+ */
+export function isTransientRuntimeError(text) {
+  return /(?:\bUNAVAILABLE\b|unavailable|overloaded|temporarily|try again later|\b50[234]\b)/i.test(
+    String(text ?? ""),
+  );
+}
 
 /**
  * Detektor pesan kuota lintas sumber.
@@ -59,14 +88,15 @@ export function parseQuotaReset(text) {
   return { resetsAt, rateLimitType };
 }
 
-/** true bila jendela pendek Brain masuk kelas "retry in place". */
+/** true bila jendela pendek Brain masuk kelas "retry in place" (< 10 menit). */
 export function isRetryableWindow(shortMs) {
-  return Number.isFinite(shortMs) && shortMs > 0 && shortMs <= RETRYABLE_SHORT_WINDOW_MS;
+  return Number.isFinite(shortMs) && shortMs > 0 && shortMs < RETRYABLE_SHORT_WINDOW_MS;
 }
 
 const WINDOW_LABELS = new Map([
   [60_000, "per-minute"],
   [5 * 60_000, "5-minute"],
+  [10 * 60_000, "10-minute"],
   [3_600_000, "hourly"],
   [5 * 3_600_000, "5-hour"],
   [24 * 3_600_000, "daily"],

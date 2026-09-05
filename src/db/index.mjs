@@ -114,6 +114,13 @@ class SqliteStore {
       this.#db.exec(`ALTER TABLE tasks ADD COLUMN quota_retries INTEGER NOT NULL DEFAULT 0`);
     }
 
+    // D52: penghitung terpisah untuk penolakan transient (rate limit jendela
+    // panjang, UNAVAILABLE) di jalur late-error — batas dan backoff-nya
+    // berbeda dari quota_retries.
+    if (taskCols.length > 0 && !taskCols.includes("resource_retries")) {
+      this.#db.exec(`ALTER TABLE tasks ADD COLUMN resource_retries INTEGER NOT NULL DEFAULT 0`);
+    }
+
     // D37: template and profile move from a per-request parameter (typed into
     // the Control page every time) to a per-project setting (typed once, in
     // Settings → Project). Existing rows get the same defaults the code

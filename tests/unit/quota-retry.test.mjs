@@ -9,10 +9,13 @@ import { buildHarness, seedBasics, queuedTask } from "../helpers/harness.mjs";
 import { createSessionEventSink } from "../../src/runtime/session-events.mjs";
 import {
   QUOTA_RETRY_LIMIT,
+  RESOURCE_RETRY_LIMIT,
   describeWindow,
   isQuotaErrorMessage,
   isRetryableWindow,
+  isTransientRuntimeError,
   parseQuotaReset,
+  resourceRetryBackoffMs,
 } from "../../src/domain/quota-windows.mjs";
 import { Status, ExecutionStatus } from "../../src/domain/state-machine.mjs";
 
@@ -55,11 +58,33 @@ test("quota detection recognises Gemini's vocabulary, not just rate-limit phrasi
   assert.equal(isQuotaErrorMessage(null), false);
 });
 
-test("only per-minute-class short windows are retryable in place", () => {
+test("only windows shorter than ten minutes are retryable in place", () => {
+  // D52: the threshold is dynamic — any provider whose shortest window is
+  // under ten minutes gets retry-in-place, not just per-minute Gemini.
   assert.equal(isRetryableWindow(60_000), true);
-  assert.equal(isRetryableWindow(18_000_000), false, "a 5-hour window is not worth a retry loop");
+  assert.equal(isRetryableWindow(300_000), true, "a 5-minute window is worth one wait");
+  assert.equal(isRetryableWindow(600_000), false, "the threshold is strict: exactly 10 minutes is not under it");
+  assert.equal(isRetryableWindow(18_000_000), false, "a 5-hour window takes the backoff path instead");
   assert.equal(isRetryableWindow(null), false);
   assert.equal(QUOTA_RETRY_LIMIT, 10);
+});
+
+test("transient runtime errors are detected separately from quota", () => {
+  assert.equal(isTransientRuntimeError("model runner is UNAVAILABLE"), true);
+  assert.equal(isTransientRuntimeError("gateway overloaded, try again later"), true);
+  assert.equal(isTransientRuntimeError("HTTP 503"), true);
+  // Rate limit is quota's vocabulary — it carries a reset schedule and is
+  // classified there, never here.
+  assert.equal(isTransientRuntimeError("rate limit exceeded"), false);
+  assert.equal(isTransientRuntimeError("model not found"), false);
+});
+
+test("resource backoff doubles from 30s and caps at 15 minutes", () => {
+  assert.equal(resourceRetryBackoffMs(0), 30_000);
+  assert.equal(resourceRetryBackoffMs(1), 60_000);
+  assert.equal(resourceRetryBackoffMs(2), 120_000);
+  assert.equal(resourceRetryBackoffMs(99), 15 * 60_000);
+  assert.equal(RESOURCE_RETRY_LIMIT, 5);
 });
 
 test("reset metadata survives being embedded in an error string", () => {
@@ -137,19 +162,75 @@ test("the eleventh per-minute refusal blocks the task, naming the count", async 
   assert.equal(blocked.quota_retries, QUOTA_RETRY_LIMIT);
 });
 
-test("a 5-hour late refusal still blocks, but now records the resource signal", async () => {
+test("a 5-hour late refusal parks WAIT_RESOURCE with backoff, not BLOCKED", async () => {
   const h = await buildHarness();
   const { project, worker } = await seedBasics(h);
-  // glm-4.7 is zai: 5-hour short window — not retryable, by design.
-  const task = await queuedTask(h, { project, worker, title: "glm-wall", category: "documentation", modelPolicy: { preferred: ["glm-4.7"] } });
+  // glm-4.7 is zai: 5-hour short window — over the retry threshold, so the
+  // D52 transient path applies: backoff + its own counter, not a block.
+  const task = await queuedTask(h, { project, worker, title: "glm-wall", modelPolicy: { preferred: ["glm-4.7"] } });
   await h.scheduler.notify();
   const execution = await h.repos.executions.latest(task.id);
 
   await lateQuotaError(h, execution, 'session limit reached, "resetsAt":1787113200, "rateLimitType":"five_hour"');
 
-  assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED, "a 5-hour wall is a human decision");
+  const parked = await h.repos.tasks.get(task.id);
+  assert.equal(parked.status, Status.WAIT_RESOURCE, "a long-window wall is waited out with backoff, not died on");
+  assert.equal(parked.resource_retries, 1);
+  assert.equal(parked.next_retry_at, h.clock.now() + 30_000, "first transient backoff is 30s");
+  assert.equal(parked.quota_retries, 0, "the quota counter is not spent by the transient path");
   const resource = await h.repos.resources.get("zai", "glm-4.7");
   assert.equal(resource.availability, "QUOTA_EXHAUSTED", "the signal used to be skipped on this path entirely");
+});
+
+test("an UNAVAILABLE late refusal takes the same WAIT_RESOURCE backoff path", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "unavailable" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+
+  await lateQuotaError(h, execution, "model runner is currently UNAVAILABLE");
+
+  const parked = await h.repos.tasks.get(task.id);
+  assert.equal(parked.status, Status.WAIT_RESOURCE);
+  assert.equal(parked.resource_retries, 1);
+  assert.equal(parked.next_retry_at, h.clock.now() + 30_000);
+  // Not a quota event: the resource entry must stay AVAILABLE — no window is
+  // known, and manufacturing one would misroute every other task on it.
+  const resource = await h.repos.resources.get("google", "gemini-flash");
+  assert.equal(resource.availability, "AVAILABLE");
+});
+
+test("the sixth transient refusal blocks the task, naming the count", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "unavailable-cap" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+
+  await h.store.run(`UPDATE tasks SET resource_retries = ? WHERE id = ?`, [RESOURCE_RETRY_LIMIT, task.id]);
+  await lateQuotaError(h, execution, "gateway overloaded");
+
+  const blocked = await h.repos.tasks.get(task.id);
+  assert.equal(blocked.status, Status.BLOCKED);
+  assert.match(blocked.wait_reason ?? "", /resource retries exhausted/);
+});
+
+test("WAIT_RESOURCE from a late refusal re-dispatches once the backoff passes", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "unavailable-retry" });
+  await h.scheduler.notify();
+  const first = await h.repos.executions.latest(task.id);
+  await lateQuotaError(h, first, "model runner is currently UNAVAILABLE");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.WAIT_RESOURCE);
+
+  h.clock.advance(31_000);
+  await h.scheduler.notify();
+
+  const again = await h.repos.tasks.get(task.id);
+  assert.equal(again.status, Status.DISPATCHED, "the backoff expires and the queue moves on its own");
+  assert.equal(again.resource_retries, 1, "the count persists across the re-dispatch");
 });
 
 test("a non-quota late refusal is untouched by the retry machinery", async () => {
@@ -164,6 +245,7 @@ test("a non-quota late refusal is untouched by the retry machinery", async () =>
   const blocked = await h.repos.tasks.get(task.id);
   assert.equal(blocked.status, Status.BLOCKED);
   assert.equal(blocked.quota_retries, 0, "the counter counts quota attempts, not refusals in general");
+  assert.equal(blocked.resource_retries, 0, "a definitive refusal gets no retry budget");
 });
 
 // --- retry lifecycle --------------------------------------------------------

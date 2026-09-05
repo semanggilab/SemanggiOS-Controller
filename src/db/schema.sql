@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- pendek. Naik satu tiap parkir-retry; nol saat COMPLETE dan saat revisi —
   -- keberhasilan dan keputusan operator memulai hitungan baru.
   quota_retries  INTEGER NOT NULL DEFAULT 0,
+  -- D52: penghitung terpisah untuk penolakan transient (rate limit jendela
+  -- panjang, UNAVAILABLE) di jalur late-error. Terpisah dari quota_retries
+  -- karena batas dan backoff-nya berbeda; aturan resetnya sama.
+  resource_retries INTEGER NOT NULL DEFAULT 0,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL
 );
@@ -320,8 +324,8 @@ CREATE TABLE IF NOT EXISTS brains (
   mode           TEXT NOT NULL DEFAULT 'interactive',
   acp_agent      TEXT,
   -- D51: jadwal reset kuota provider milik model ini (dua level). Jendela
-  -- PENDek yang masuk kelas "retry in place" (≤ RETRYABLE_SHORT_WINDOW_MS,
-  -- saat ini per-menit) membuat kegagalan kuota dicoba ulang sampai
+  -- PENDek yang masuk kelas "retry in place" (< RETRYABLE_SHORT_WINDOW_MS,
+  -- saat ini 10 menit) membuat kegagalan kuota dicoba ulang sampai
   -- QUOTA_RETRY_LIMIT kali sebelum task diblokir; jendela panjang hanya
   -- informasi operator. NULL = belum diketahui (tidak pernah retry in place).
   quota_reset_short_ms INTEGER,

@@ -455,11 +455,23 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       return tasks.get(taskId);
     },
 
+    // D52: penghitung penolakan transient di jalur late-error. Kontrak yang
+    // sama dengan bumpQuotaRetry — penghitung dan ETA ditulis bersama.
+    async bumpResourceRetry(taskId, nextRetryAt) {
+      await store.run(
+        `UPDATE tasks SET resource_retries = resource_retries + 1, next_retry_at = ?, updated_at = ? WHERE id = ?`,
+        [nextRetryAt, now(), taskId],
+      );
+      return tasks.get(taskId);
+    },
+
     // Nol saat keberhasilan (COMPLETE) dan saat revisi: hitungan mengukur
     // satu rentetan kegagalan, bukan keseluruhan hidup task — task yang sudah
     // terbukti lewat sekali tidak pantas memikul dosa percobaan lamanya.
-    async resetQuotaRetries(taskId) {
-      await store.run(`UPDATE tasks SET quota_retries = 0 WHERE id = ?`, [taskId]);
+    // Kedua penghitung di-nol-kan bersama: keduanya mengukur rentetan yang
+    // sama (percobaan dispatch yang gagal), hanya penyakitnya berbeda.
+    async resetRetries(taskId) {
+      await store.run(`UPDATE tasks SET quota_retries = 0, resource_retries = 0 WHERE id = ?`, [taskId]);
       return tasks.get(taskId);
     },
 
@@ -482,11 +494,11 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
             taskId,
           ]);
         }
-        // A revision also resets the quota retry count (D51): an operator who
-        // re-queues blocked work has made a decision, and the counter that
-        // measured the OLD attempts must not condemn the new ones.
+        // A revision also resets the retry counters (D51/D52): an operator
+        // who re-queues blocked work has made a decision, and the counters
+        // that measured the OLD attempts must not condemn the new ones.
         await store.run(
-          `UPDATE tasks SET session_policy = ?, pending_instruction = ?, quota_retries = 0, updated_at = ? WHERE id = ?`,
+          `UPDATE tasks SET session_policy = ?, pending_instruction = ?, quota_retries = 0, resource_retries = 0, updated_at = ? WHERE id = ?`,
           [sessionMode, instruction, now(), taskId],
         );
         // BLOCKED cannot go straight back to QUEUED — the state machine routes

@@ -88,15 +88,18 @@ const TRANSITIONS = new Map(
     // observes outcomes, not every step: a short task can finish between two
     // polls and we never witness RUNNING. Inventing the missing transition
     // would be recording something that did not happen.
-    // WAIT_QUOTA is reachable the same way for the same reason: a provider
-    // refusal that arrives after accept is the same event admission handles
-    // BEFORE accept, and parking is the honest recording of it. Only quota
-    // gets this exit — a task that never started cannot wait on anything
-    // else (D51).
+    // WAIT_QUOTA and WAIT_RESOURCE are reachable the same way for the same
+    // reason: a provider refusal that arrives after accept is the same event
+    // admission handles BEFORE accept, and parking is the honest recording of
+    // it — a quota wall (D51) or a transient runtime refusal (D52) both
+    // disappear on their own, so the task waits rather than dies. Only those
+    // two get this exit — a task that never started cannot wait on anything
+    // else.
     DISPATCHED: [
       Status.RUNNING,
       Status.COMPLETE,
       Status.WAIT_QUOTA,
+      Status.WAIT_RESOURCE,
       Status.BLOCKED,
       Status.FAILED,
       Status.CANCELLED,

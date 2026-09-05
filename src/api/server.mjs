@@ -383,17 +383,22 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   });
 
   // Menyimpan suntingan dokumen dari modal Command Center (tombol Edit/Save).
-  // Whitelist nama + direktori konstan sama persis dengan GET di atasnya —
-  // workspace_path tervalidasi saat pembuatan, jadi tidak ada segmen path
-  // dari request yang pernah sampai ke filesystem. Menyimpan di luar dua
-  // direktori dokumen ini bukan kasus penggunaan modal, dan membukanya
-  // berarti membuka seluruh workspace untuk ditulis lewat satu PUT.
+  // D53: HANYA direktori docs/ — dokumen perencanaan operator (brief,
+  // architecture, plans, tasks). memory/ (blueprint, decisions) tetap
+  // read-only di jalur ini karena itu wilayah agen dua-tingkat (spec §9):
+  // controller yang menulis memori agen adalah penulis kedua atas berkas
+  // yang bukan miliknya. Whitelist nama sama persis dengan GET; tidak ada
+  // segmen path dari request yang sampai ke filesystem.
+  const WRITABLE_DOCS = new Set(["brief", "architecture", "migration-plan", "plans", "tasks"]);
   route("PUT", "/api/work/projects/{id}/docs/{name}", async ({ id, name }, body, _q, actor) => {
     const project = await repos.projects.get(id);
     if (!project) throw notFound(`unknown project ${id}`);
     const doc = String(name ?? "").toLowerCase();
     const dir = DOC_DIRS[doc];
     if (!dir) throw badRequest(`unknown document "${name}"`);
+    if (!WRITABLE_DOCS.has(doc)) {
+      throw badRequest(`"${doc}" adalah dokumen memori agen — hanya bisa dibaca, bukan disunting dari sini.`);
+    }
     if (typeof body?.content !== "string") throw badRequest("content is required");
     const root = project.workspace_path;
     if (!root) throw badRequest("Project belum punya workspace — dokumen tidak bisa disimpan.");

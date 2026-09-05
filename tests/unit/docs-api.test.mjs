@@ -94,6 +94,19 @@ test("nama dokumen di luar whitelist ditolak oleh PUT", async () => {
   }
 });
 
+test("dokumen memori agen (memory/) ditolak oleh PUT — wilayah agen, bukan operator", async () => {
+  const t = await setup();
+  try {
+    const res = await t.call("PUT", `/api/work/projects/${t.project.id}/docs/blueprint`, {
+      content: "mencoba menulis memori",
+    });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /memori agen/);
+  } finally {
+    await t.close();
+  }
+});
+
 test("PUT tanpa content ditolak", async () => {
   const t = await setup();
   try {

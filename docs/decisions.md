@@ -1767,44 +1767,6 @@ UPPERCASE ("deadbeef" lowercase tak terbedakan dari prosa) — karena pola
 yang lebih longgar akan memanen commit hash menjadi task id.
 
 
-## D54 — `[-]` sebagai tanda "sudah didaftarkan"; `/task cancel` dan `/task run` multi-id; controller menulis docs/ untuk suntingan operator
-
-**Keputusan (2026-09-06).** Tiga permukaan Command Center yang sebelumnya
-memaksa operator mengulang pekerjaan:
-
-**`[-]` di docs/tasks.md = task sudah hidup di basis data.** Register
-menulis balik checkbox `[ ]` → `[-]` SETELAH seluruh loop sukses (bukan per
-task di tengah loop — kegagalan task ke-N tidak boleh menandai task yang
-belum dibuat). Register berikutnya hanya mendaftarkan `[ ]`; `[-]` dan `[x]`
-dilewati, sehingga pendaftaran ulang tidak pernah menduplikasi. Bila tidak
-ada `[ ]` tersisa, jawabannya "Semua tasks sudah didaftarkan sebelumnya" —
-bukan pesan galat, karena tidak ada yang salah. Kegagalan menulis balik
-bukan kegagalan mendaftarkan (task sudah ada), jadi ia jadi peringatan di
-jawaban, bukan rollback.
-
-**`cancel` adalah verba sendiri, dan `run`/`cancel` menerima multi-id.**
-CANCEL ≠ PAUSE: CANCELLED jalan buntu, BLOCKED bisa dijalankan ulang.
-Classifier mengekstrak semua id (`taskIds`; duplikat dilipat), handler
-menilai setiap id mandiri — satu id yang sudah bergerak/mati dilaporkan,
-tidak menggagalkan batch. Konfirmasi destruktif multi-id mendeskripsikan
-SEMUA target sebelum minta "yes" (§8.7: cara paling halus membunuh B adalah
-konfirmasi yang hanya menyebut A).
-
-**Controller menulis docs/, tidak pernah memory/.** PUT
-`/api/work/projects/{id}/docs/{name}` untuk tombol Edit/Save modal —
-mount workspaces controller berubah dari read-only menjadi RW (stack),
-PEMBERIAN IZIN INI SEKECIL MUNGKIN: whitelist hanya nama di `docs/`
-(brief, architecture, migration-plan, plans, tasks); `memory/`
-(blueprint, decisions) tetap ditolak PUT karena itu wilayah agen dua-tingkat
-(spec §9) — controller yang menulis memori agen adalah penulis kedua atas
-berkas yang bukan miliknya. Setiap penyimpanan tercatat di event_log
-(`project.doc-updated`). Pelajaran berbayar dari hari pertama: smoke test
-PUT JANGAN memakai dokumen project hidup — brief.md production tertimpa
-"# smoke edit" dan harus dipulihkan byte-demi-byte dari transkrip
-(`execution_messages` menyimpan hasil Read agen); gunakan project buangan
-atau dokumen dummy.
-
-
 ## D54 — penghapusan task: hard delete tanpa riwayat eksekusi, soft delete bila ada; hanya CREATED dan CANCELLED
 
 **Keputusan (2026-09-06).** Papan penuh dengan pekerjaan yang tidak akan
@@ -1850,6 +1812,85 @@ penghapusan project. Dispatcher kini mem-parse body DELETE juga — `note`
 dibaca dari body, dan pelajaran D36 (route yang body-nya tidak pernah
 di-parse tidak bisa berhasil) berlaku untuk setiap method, bukan hanya
 POST/PATCH/PUT.
+
+
+## D55 — `[-]` sebagai tanda "sudah didaftarkan"; `/task cancel` dan `/task run` multi-id; controller menulis docs/ untuk suntingan operator
+
+**Keputusan (2026-09-06).** Tiga permukaan Command Center yang sebelumnya
+memaksa operator mengulang pekerjaan:
+
+**`[-]` di docs/tasks.md = task sudah hidup di basis data.** Register
+menulis balik checkbox `[ ]` → `[-]` SETELAH seluruh loop sukses (bukan per
+task di tengah loop — kegagalan task ke-N tidak boleh menandai task yang
+belum dibuat). Register berikutnya hanya mendaftarkan `[ ]`; `[-]` dan `[x]`
+dilewati, sehingga pendaftaran ulang tidak pernah menduplikasi. Bila tidak
+ada `[ ]` tersisa, jawabannya "Semua tasks sudah didaftarkan sebelumnya" —
+bukan pesan galat, karena tidak ada yang salah. Kegagalan menulis balik
+bukan kegagalan mendaftarkan (task sudah ada), jadi ia jadi peringatan di
+jawaban, bukan rollback.
+
+**`cancel` adalah verba sendiri, dan `run`/`cancel` menerima multi-id.**
+CANCEL ≠ PAUSE: CANCELLED jalan buntu, BLOCKED bisa dijalankan ulang.
+Classifier mengekstrak semua id (`taskIds`; duplikat dilipat), handler
+menilai setiap id mandiri — satu id yang sudah bergerak/mati dilaporkan,
+tidak menggagalkan batch. Konfirmasi destruktif multi-id mendeskripsikan
+SEMUA target sebelum minta "yes" (§8.7: cara paling halus membunuh B adalah
+konfirmasi yang hanya menyebut A).
+
+**Controller menulis docs/, tidak pernah memory/.** PUT
+`/api/work/projects/{id}/docs/{name}` untuk tombol Edit/Save modal —
+mount workspaces controller berubah dari read-only menjadi RW (stack),
+PEMBERIAN IZIN INI SEKECIL MUNGKIN: whitelist hanya nama di `docs/`
+(brief, architecture, migration-plan, plans, tasks); `memory/`
+(blueprint, decisions) tetap ditolak PUT karena itu wilayah agen dua-tingkat
+(spec §9) — controller yang menulis memori agen adalah penulis kedua atas
+berkas yang bukan miliknya. Setiap penyimpanan tercatat di event_log
+(`project.doc-updated`). Pelajaran berbayar dari hari pertama: smoke test
+PUT JANGAN memakai dokumen project hidup — brief.md production tertimpa
+"# smoke edit" dan harus dipulihkan byte-demi-byte dari transkrip
+(`execution_messages` menyimpan hasil Read agen); gunakan project buangan
+atau dokumen dummy.
+
+*(Dinomori ulang dari D54 duplikat; semua rujukan "D54" di kode —
+repositories.mjs, schema.sql, db/index.mjs, task-delete.test.mjs — menunjuk
+keputusan penghapusan task di atas, jadi entri ini yang mengalah.)*
+
+
+## D56 — whitelist proxy adalah bagian dari kontrak route; Edit/Save modal pindah ke header dan scroll kedua panel disinkronkan
+
+**Keputusan (2026-09-06).** Tombol Edit/Save modal dokumen sudah ada di
+controller sejak D55 (PUT `/api/work/projects/{id}/docs/{name}`), tetapi
+SETIAP simpan dari Command Center gagal 404 *"Semanggi proxy does not
+expose PUT /work/projects/…/docs/…"* — route-nya tidak pernah didaftarkan
+di daftar ALLOWED `app/api/semanggi/[...path]/route.ts`. Ini kegagalan
+kedua dari jenis yang persis sama; yang pertama `GET/PUT
+/work/projects/{id}/role-levels` (readiness.md, image `2026090403`).
+
+**Route controller belum nyata bagi halaman sampai ia terdaftar di proxy.**
+Daftar ALLOWED sengaja whitelist — proxy yang meneruskan apa saja akan
+memberi setiap pengunjung AgentOS seluruh permukaan admin controller — jadi
+konsekuensinya: setiap route baru yang dipakai UI MUST mendapat entri
+ALLOWED, dan verifikasinya MUST end-to-end dari halaman (jalur terautentikasi
+§5.3 CLAUDE.md), bukan curl langsung ke controller: controller yang menjawab
+200 tidak mengatakan apa pun tentang jalur proxy.
+
+Dua perbaikan modal ikut keputusan ini:
+
+**Edit/Save dipindah dari body ke header, di sebelah judul.** `Modal`
+mendapat slot `actions` yang dirender sebaris dengan judul: aksi yang
+milik dokumen yang dinamai judul harus duduk di sebelahnya, dan tombol
+yang melayang di body sebelumnya berpindah posisi setiap kali mode
+baca/sunting berganti.
+
+**Scroll textarea dan pratinjau markdown disinkronkan proporsional.**
+scrollTop tiap panel sebagai fraksi dari rentang scroll-nya sendiri —
+bukan pemetaan baris, karena markdown terender tak pernah setinggi
+sumbernya (tabel, heading, spasi) dan pemetaan baris akan langsung
+melenceng pada konstruk pertama. Guard anti-echo memakai ref, bukan state:
+menulis `scrollTop` panel lain memicu event scroll panel itu, dan tanpa
+guard kedua handler akan saling menjawab selamanya; echo tiba pada event
+berikutnya, ketika update state masih in flight. Guard dilepas 150 ms
+setelah scroll berhenti, sehingga panel yang lain bebas menjadi driver.
 
 
 ## Open questions for phase 4+

@@ -385,7 +385,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   });
 
   // Menyimpan suntingan dokumen dari modal Command Center (tombol Edit/Save).
-  // D53: HANYA direktori docs/ — dokumen perencanaan operator (brief,
+  // D55: HANYA direktori docs/ — dokumen perencanaan operator (brief,
   // architecture, plans, tasks). memory/ (blueprint, decisions) tetap
   // read-only di jalur ini karena itu wilayah agen dua-tingkat (spec §9):
   // controller yang menulis memori agen adalah penulis kedua atas berkas

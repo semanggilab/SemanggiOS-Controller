@@ -7,19 +7,26 @@
 // (bold hilang, dash en/em, `[x]` besar) karena dokumen itu ditulis model,
 // bukan mesin — satu variasi ejaan tidak boleh menggagalkan pendaftaran.
 //
+// Tiga keadaan checkbox, bukan dua: `[ ]` belum didaftarkan, `[-]` SUDAH
+// dipindahkan ke basis data oleh registerTasksFromDoc (tanda ini ditulis
+// balik oleh controller, bukan model), `[x]` selesai di dokumen. Tanpa
+// `[-]`, "daftarkan" kedua kali menduplikasi seluruh checklist — dan
+// operator tidak punya cara tahu task mana yang sudah hidup.
+//
 // Sengaja hanya parser murni (tanpa store, tanpa fs): keputusan "task mana
 // dibuat, status apa, dependensi bagaimana" hidup di caller supaya bisa
 // diuji terpisah dari bentuk dokumennya.
 
-const CHECKBOX = /^\s*-\s\[( |x|X)\]\s+(?:\*\*)?(T-\d+)\s*[—–-]+\s*(.+?)(?:\*\*)?\s*$/;
+const CHECKBOX = /^\s*-\s\[( |x|X|-)\]\s+(?:\*\*)?(T-\d+)\s*[—–-]+\s*(.+?)(?:\*\*)?\s*$/;
 const ROLE = /\*\*Role:\*\*\s*([^·\n]+)/i;
 const DEP = /\*\*Dep:\*\*\s*([^·\n]+)/i;
 const DESC = /\*\*Deskripsi:\*\*\s*(.+)$/i;
 
 /**
- * @returns {Array<{localId: string, done: boolean, title: string,
- *   role: string | null, deps: string[], description: string | null}>}
+ * @returns {Array<{localId: string, done: boolean, registered: boolean,
+ *   title: string, role: string | null, deps: string[], description: string | null}>}
  *   Urut sesuai dokumen; `deps` berisi localId (`T-XX`, uppercase).
+ *   `done` = `[x]`; `registered` = `[-]`.
  */
 export function parseTasksMd(markdown) {
   const lines = String(markdown ?? "").split(/\r?\n/);
@@ -31,6 +38,7 @@ export function parseTasksMd(markdown) {
       current = {
         localId: head[2].toUpperCase(),
         done: head[1].toLowerCase() === "x",
+        registered: head[1] === "-",
         title: head[3].trim(),
         role: null,
         deps: [],
@@ -58,6 +66,24 @@ export function parseTasksMd(markdown) {
     if (desc) current.description = desc[1].trim();
   }
   return tasks;
+}
+
+/**
+ * Menandai task yang baru didaftarkan: `- [ ]` → `- [-]` untuk localId yang
+ * disebut, baris lain tidak disentuh. Ditulis balik SETELAH task benar-benar
+ * ada di basis data — menandai lebih dulu berarti kegagalan tengah loop
+ * meninggalkan dokumen yang mengklaim task yang tidak pernah dibuat.
+ */
+export function markRegistered(markdown, localIds) {
+  const wanted = new Set((localIds ?? []).map((id) => String(id).toUpperCase()));
+  return String(markdown ?? "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const head = CHECKBOX.exec(line);
+      if (!head || head[1] !== " " || !wanted.has(head[2].toUpperCase())) return line;
+      return line.replace(/\[( )\]/, "[-]");
+    })
+    .join("\n");
 }
 
 /**

@@ -37,9 +37,14 @@ export const Action = Object.freeze({
   MODEL: "model",
   RUN: "run",
   QUEUE: "queue",
+  // Dead-end cancel (CANCELLED), bukan "stop sementara" — itu PAUSE/BLOCKED.
+  // Ditambah untuk Command Center: operator yang mendaftarkan 40 task dari
+  // docs/tasks.md butuh cara membuang yang salah tanpa menahannya dulu.
+  CANCEL: "cancel",
 });
 
 const TASK_ID = /\b(TASK-[A-Z0-9]{4,})\b/i;
+const TASK_ID_ALL = /\bTASK-[A-Z0-9]{4,}\b/g;
 
 /**
  * Operators refer to tasks by code, not by full id: "#4F59F63A" or bare
@@ -74,6 +79,10 @@ const VERBS = [
   { action: Action.REVIEW, re: /^(review|periksa|cek)(\s|$)/i, intent: Intent.TASK },
   { action: Action.MODEL, re: /^(model|ganti|pakai|gunakan)(\s|$)/i, intent: Intent.TASK },
   { action: Action.RUN, re: /^(run|jalankan|start|mulai)(\s|$)/i, intent: Intent.TASK },
+  // Setelah RUN: "cancel" adalah jalan buntu (CANCELLED), bukan tahan —
+  // verba tahan sudah ada di PAUSE. Diulang di sini, bukan dilewatkan ke
+  // PAUSE, karena dua kata itu menyelesaikan task ke status yang berbeda.
+  { action: Action.CANCEL, re: /^(cancel|batalkan|batal)(\s|$)/i, intent: Intent.TASK },
   // Deliberately after the task-scoped verbs: "queue" answers about everything
   // at once and takes no id, so it must not swallow a verb that needs one.
   { action: Action.QUEUE, re: /^(queue|antrian|antrean|daftar)(\s|$)/i, intent: Intent.TASK },
@@ -164,6 +173,11 @@ export function classify(raw) {
   }
 
   const taskId = TASK_ID.exec(text)?.[1]?.toUpperCase() ?? null;
+  // Multi-id ("run TASK-A TASK-B"): setiap id diekstrak, taskId tetap yang
+  // pertama agar pemanggil lama (single-id) tidak berubah perilaku. Sumber
+  // duplikat ("cancel TASK-A TASK-A") dilipat — satu task dibatalkan dua kali
+  // bukan dua task.
+  const taskIds = taskId ? [...new Set(text.toUpperCase().match(TASK_ID_ALL) ?? [])] : [];
   const verb = VERBS.find((v) => v.re.test(text));
 
   // Inside a declared prefix, a CREATE verb ("Buat rencana…") is the payload
@@ -174,19 +188,28 @@ export function classify(raw) {
     // A task-scoped verb without a task id is ambiguous: "approve" which one?
     const needsId = [
       Action.STATUS, Action.PAUSE, Action.EXPEDITE, Action.APPROVE, Action.REJECT,
-      Action.CONTINUE, Action.REVIEW, Action.MODEL, Action.RUN,
+      Action.CONTINUE, Action.REVIEW, Action.MODEL, Action.RUN, Action.CANCEL,
     ];
     if (needsId.includes(verb.action) && !taskId) {
       return {
         intent: Intent.CONFIRM,
         action: verb.action,
         taskId: null,
+        taskIds: [],
         confidence: 0.4,
         text,
         reason: `"${verb.action}" needs a task id`,
       };
     }
-    return { intent: verb.intent, action: verb.action, taskId, confidence: forced ? 0.95 : 0.9, text, hasVerbPrefix: true };
+    return {
+      intent: verb.intent,
+      action: verb.action,
+      taskId,
+      taskIds,
+      confidence: forced ? 0.95 : 0.9,
+      text,
+      hasVerbPrefix: true,
+    };
   }
 
   if (forced) {
@@ -199,6 +222,7 @@ export function classify(raw) {
       intent: forced === "WORK" ? Intent.WORK : forced === "PREPARE" ? Intent.PREPARE : Intent.TASK,
       action: Action.CREATE,
       taskId,
+      taskIds,
       confidence: 1,
       text,
       hasVerbPrefix: false,

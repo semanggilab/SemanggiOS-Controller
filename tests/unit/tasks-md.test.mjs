@@ -6,7 +6,7 @@
 // dokumen ini ditulis model, bukan mesin.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseTasksMd, wantsImmediateRun } from "../../src/interface/tasks-md.mjs";
+import { markRegistered, parseTasksMd, wantsImmediateRun } from "../../src/interface/tasks-md.mjs";
 
 const SAMPLE = `# Daftar Task Implementasi
 
@@ -91,4 +91,39 @@ test("wantsImmediateRun mengenali permintaan langsung jalankan", () => {
   assert.equal(wantsImmediateRun("LANGSUNG JALANKAN"), true);
   assert.equal(wantsImmediateRun("daftarkan semua tasks yang ada di docs/tasks.md"), false);
   assert.equal(wantsImmediateRun("jalankan nanti saja setelah saya review"), false);
+});
+
+// --- `[-]`: tanda "sudah didaftarkan ke basis data" ----------------------------
+
+test("checkbox [-] terbaca sebagai registered, bukan done dan bukan open", () => {
+  const md = `- [-] **T-01 — Sudah didaftarkan**
+  - **Role:** builder · **Dep:** —
+- [ ] **T-02 — Belum**
+- [x] **T-03 — Selesai**
+`;
+  const tasks = parseTasksMd(md);
+  assert.equal(tasks.length, 3);
+  assert.equal(tasks[0].registered, true);
+  assert.equal(tasks[0].done, false);
+  assert.equal(tasks[1].registered, false);
+  assert.equal(tasks[2].done, true);
+});
+
+test("markRegistered menandai hanya localId yang diminta, sisanya utuh", () => {
+  const md = `# Daftar
+
+- [ ] **T-01 — Satu**
+  - **Role:** builder · **Dep:** —
+- [ ] **T-02 — Dua**
+- [x] **T-03 — Tiga**
+- [-] **T-04 — Empat**
+`;
+  const out = markRegistered(md, ["t-01", "T-04", "T-99"]);
+  const tasks = parseTasksMd(out);
+  assert.equal(tasks[0].registered, true, "T-01 ditandai (input lowercase tetap kena)");
+  assert.equal(tasks[1].registered, false, "T-02 tidak disebut — tetap [ ]");
+  assert.equal(tasks[2].done, true, "T-03 [x] tidak boleh diubah");
+  assert.equal(tasks[3].registered, true, "T-04 sudah [-] — idempoten, tidak dobel");
+  // Baris di luar checkbox tidak tersentuh.
+  assert.match(out, /# Daftar/);
 });

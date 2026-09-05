@@ -24,13 +24,13 @@ import { DEFAULT_BRAIN_MAP } from "../domain/brain-map.mjs";
 import { buildPlan, ROLE_CATEGORY } from "../domain/decompose.mjs";
 import { EventKind } from "../domain/events.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
-import { parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
+import { markRegistered, parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
 import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
 import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
 import { readFileSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 
 /** Urutan kekuatan level — dipakai untuk menandai pemaku Brain yang basi. */
 const LEVEL_RANK = Object.freeze({ [Level.LOW]: 0, [Level.NORMAL]: 1, [Level.CRITICAL]: 2 });
@@ -39,7 +39,8 @@ const CONTROL_HELP =
   "Tulis pekerjaan yang ingin dikerjakan dan saya pecah menjadi task, " +
   "awali dengan `/prepare` untuk satu task penyusun docs/plans.md + docs/tasks.md, " +
   "awali dengan `/task` untuk satu task langsung, " +
-  "atau beri perintah pada task yang ada (status/stop/run/model TASK-XXXX).";
+  "atau beri perintah pada task yang ada (status/stop/run/cancel/model TASK-XXXX, " +
+  "run dan cancel menerima beberapa id sekaligus).";
 
 /**
  * Satu langkah rencana, siap ditampilkan.
@@ -379,6 +380,38 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     } catch {
       return { name, dir, exists: false, content: null };
     }
+  });
+
+  // Menyimpan suntingan dokumen dari modal Command Center (tombol Edit/Save).
+  // Whitelist nama + direktori konstan sama persis dengan GET di atasnya —
+  // workspace_path tervalidasi saat pembuatan, jadi tidak ada segmen path
+  // dari request yang pernah sampai ke filesystem. Menyimpan di luar dua
+  // direktori dokumen ini bukan kasus penggunaan modal, dan membukanya
+  // berarti membuka seluruh workspace untuk ditulis lewat satu PUT.
+  route("PUT", "/api/work/projects/{id}/docs/{name}", async ({ id, name }, body, _q, actor) => {
+    const project = await repos.projects.get(id);
+    if (!project) throw notFound(`unknown project ${id}`);
+    const doc = String(name ?? "").toLowerCase();
+    const dir = DOC_DIRS[doc];
+    if (!dir) throw badRequest(`unknown document "${name}"`);
+    if (typeof body?.content !== "string") throw badRequest("content is required");
+    const root = project.workspace_path;
+    if (!root) throw badRequest("Project belum punya workspace — dokumen tidak bisa disimpan.");
+    const by = actor?.kind === "operator" ? actor.name : String(body.user ?? "agentos-ui");
+    await mkdir(`${root}/${dir}`, { recursive: true });
+    await writeFile(`${root}/${dir}/${doc}.md`, body.content, "utf8");
+    // Perubahan dokumen direncanakan adalah keputusan operator — dicatat ke
+    // event log agar "siapa yang mengubah tasks.md" bisa dijawab dari jejak
+    // audit, bukan dari memori orang.
+    await controller.events.append({
+      kind: "project.doc-updated",
+      subjectType: "project",
+      subjectId: id,
+      actor: by,
+      payload: { document: `${dir}/${doc}.md`, size: body.content.length },
+    });
+    log.info("project.doc-updated", { project: id, doc: `${dir}/${doc}.md`, size: body.content.length, by });
+    return { name: doc, dir, exists: true, size: body.content.length };
   });
 
   // Project-level Role Level overrides (Settings → Project → Edit modal).
@@ -1337,11 +1370,20 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     } catch {
       return { ok: false, reason: "docs/tasks.md tidak ada — buat dulu lewat PREPARE “Create tasks”." };
     }
-    const items = parseTasksMd(content).filter((t) => !t.done);
-    if (items.length === 0) {
+    // Hanya `[ ]` yang belum hidup di basis data: `[-]` sudah pernah
+    // didaftarkan (controller yang menandainya balik saat pendaftaran
+    // berhasil) dan `[x]` selesai di dokumen — keduanya TIDAK boleh dibuat
+    // ulang, karena "daftarkan" kedua kali yang menduplikasi seluruh
+    // checklist adalah cara paling halus untuk menggandakan pekerjaan.
+    const docItems = parseTasksMd(content);
+    const items = docItems.filter((t) => !t.done && !t.registered);
+    if (docItems.length > 0 && items.length === 0) {
+      return { ok: false, reason: "Semua tasks sudah didaftarkan sebelumnya", already: true };
+    }
+    if (docItems.length === 0) {
       return {
         ok: false,
-        reason: "Tidak ada task yang bisa didaftarkan dari docs/tasks.md — semua sudah [x], atau format checklist tidak dikenali.",
+        reason: "Tidak ada task yang bisa didaftarkan dari docs/tasks.md — format checklist tidak dikenali.",
       };
     }
     // D43: setiap permukaan pembuat task match worker dengan cara yang sama.
@@ -1391,8 +1433,21 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       });
     }
     if (immediate) await scheduler.notify(WakeReason.TASK_CREATED);
-    log.info("control.tasks-registered", { project: projectId, count: registered.length, immediate, by: actor });
-    return { ok: true, registered, immediate };
+    // Tulis balik `[-]` SETELAH seluruh loop sukses — menandai per task di
+    // tengah loop berarti kegagalan task ke-N meninggalkan tanda untuk task
+    // yang belum dibuat. Kegagalan menulis bukan kegagalan mendaftarkan
+    // (task sudah hidup di basis data), jadi ia jadi peringatan di jawaban,
+    // bukan rollback: berbohong "gagal semua" akan menyuruh operator
+    // mengulang pendaftaran yang justru menduplikasi.
+    let marked = true;
+    try {
+      await writeFile(`${root}/docs/tasks.md`, markRegistered(content, registered.map((r) => r.localId)), "utf8");
+    } catch (err) {
+      marked = false;
+      log.warn("control.tasks-mark-failed", { project: projectId, error: err.message });
+    }
+    log.info("control.tasks-registered", { project: projectId, count: registered.length, immediate, marked, by: actor });
+    return { ok: true, registered, immediate, marked };
   }
 
   // --- control surface ------------------------------------------------------
@@ -1458,6 +1513,9 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
             (outcome.immediate
               ? "semua masuk antrian (QUEUED) dan mengalir sesuai dependensinya."
               : "semua berstatus CREATED, menunggu dijalankan; tambah “langsung jalankan” untuk mengantrekannya.") +
+            (outcome.marked === false
+              ? " Peringatan: docs/tasks.md gagal ditandai `[-]` — perbaiki izinnya sebelum mendaftarkan lagi, atau task ini akan terdaftar dua kali."
+              : " Checkbox task di docs/tasks.md kini bertanda `[-]`.") +
             `  _(${by})_`,
           tasks: [],
           registered: outcome.registered,

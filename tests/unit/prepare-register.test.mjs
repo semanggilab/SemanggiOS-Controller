@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApi } from "../../src/api/server.mjs";
@@ -122,6 +122,60 @@ test("docs/tasks.md hilang dijawab, bukan dilempar", async () => {
     assert.equal(body.action, "register");
     assert.deepEqual(body.registered, []);
     assert.match(body.reply, /tasks\.md tidak ada/);
+  } finally {
+    await t.close();
+  }
+});
+
+// --- `[-]`: dokumen adalah memori pendaftaran ---------------------------------
+
+test("setelah register, checkbox task terdaftar berubah [ ] → [-] di docs/tasks.md", async () => {
+  const t = await setup();
+  try {
+    const { body } = await t.send("PREPARE: daftarkan semua tasks yang ada di docs/tasks.md");
+    assert.equal(body.registered.length, 2);
+    const after = readFileSync(join(t.root, "docs", "tasks.md"), "utf8");
+    assert.match(after, /- \[-\] \*\*T-01 — Fondasi\*\*/);
+    assert.match(after, /- \[-\] \*\*T-02 — Layanan inti\*\*/);
+    // [x] tidak ikut ditandai ulang — ia sudah punya arti sendiri.
+    assert.match(after, /- \[x\] \*\*T-03/);
+  } finally {
+    await t.close();
+  }
+});
+
+test("register kedua tidak menduplikasi task [-] dan menjawab pesan sudah terdaftar", async () => {
+  const t = await setup();
+  try {
+    const first = await t.send("PREPARE: daftarkan semua tasks yang ada di docs/tasks.md");
+    assert.equal(first.body.registered.length, 2);
+    const second = await t.send("PREPARE: daftarkan semua tasks yang ada di docs/tasks.md");
+    assert.equal(second.status, 200);
+    assert.deepEqual(second.body.registered, []);
+    assert.equal(second.body.reply, "Semua tasks sudah didaftarkan sebelumnya");
+    // Basis data tidak bertambah: dua task tetap dua.
+    const all = await t.h.repos.tasks.list({});
+    assert.equal(all.length, 2);
+  } finally {
+    await t.close();
+  }
+});
+
+test("register ulang setelah dokumen mendapat task baru hanya mendaftarkan yang [ ]", async () => {
+  const t = await setup();
+  try {
+    await t.send("PREPARE: daftarkan semua tasks yang ada di docs/tasks.md");
+    // Operator menambah satu task baru ke dokumen yang sama.
+    const current = readFileSync(join(t.root, "docs", "tasks.md"), "utf8");
+    writeFileSync(
+      join(t.root, "docs", "tasks.md"),
+      current + `\n- [ ] **T-04 — Tambahan**\n  - **Role:** builder · **Dep:** —\n  - **Deskripsi:** baru.\n`,
+    );
+    const again = await t.send("PREPARE: daftarkan semua tasks yang ada di docs/tasks.md");
+    assert.equal(again.body.registered.length, 1);
+    assert.equal(again.body.registered[0].localId, "T-04");
+    const all = await t.h.repos.tasks.list({});
+    assert.equal(all.length, 3, "T-01..T-02 tidak dibuat ulang");
   } finally {
     await t.close();
   }

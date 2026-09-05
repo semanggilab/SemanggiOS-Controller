@@ -229,6 +229,67 @@ test("run refuses a task that is already moving", async () => {
   assert.match(res.text, /nothing to start/i);
 });
 
+// --- cancel, and multi-id run/cancel -------------------------------------------
+
+test("classify reads cancel as its own verb and collects every task id", () => {
+  const parsed = classify("/task cancel TASK-AAAA1111 TASK-BBBB2222");
+  assert.equal(parsed.intent, "TASK");
+  assert.equal(parsed.action, Action.CANCEL);
+  assert.equal(parsed.taskId, "TASK-AAAA1111");
+  assert.deepEqual(parsed.taskIds, ["TASK-AAAA1111", "TASK-BBBB2222"]);
+  // Duplicate ids fold — cancelling the same task twice is one task.
+  assert.deepEqual(classify("cancel TASK-AAAA1111 TASK-AAAA1111").taskIds, ["TASK-AAAA1111"]);
+});
+
+test("cancel asks first, names the task, then lands it in CANCELLED", async () => {
+  const { h, app, project } = await slackHarness();
+  const task = await queuedTask(h, { project });
+
+  const asked = await cmd(app, `cancel ${task.id}`);
+  assert.match(asked.text, new RegExp(task.id));
+  assert.match(asked.text, /cancels/i);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED, "nothing changes before yes");
+
+  const done = await cmd(app, "yes");
+  assert.match(done.text, /Cancelled/);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.CANCELLED);
+});
+
+test("multi-id cancel names every target and cancels each independently", async () => {
+  const { h, app, project } = await slackHarness();
+  const a = await queuedTask(h, { project });
+  const b = await queuedTask(h, { project });
+  // c is already dead: it must be reported, not fail the batch.
+  const c = await queuedTask(h, { project });
+  await h.repos.tasks.setStatus(c.id, Status.CANCELLED, { actor: "test" });
+
+  const asked = await cmd(app, `cancel ${a.id} ${b.id} ${c.id}`);
+  // The confirmation describes the two live targets — c has nothing to lose.
+  assert.match(asked.text, new RegExp(a.id));
+  assert.match(asked.text, new RegExp(b.id));
+  assert.doesNotMatch(asked.text, new RegExp(c.id));
+
+  const done = await cmd(app, "yes");
+  assert.match(done.text, /Cancelled/);
+  assert.match(done.text, new RegExp(a.id));
+  assert.match(done.text, new RegExp(c.id), "already-cancelled is reported, not silently dropped");
+  assert.equal((await h.repos.tasks.get(a.id)).status, Status.CANCELLED);
+  assert.equal((await h.repos.tasks.get(b.id)).status, Status.CANCELLED);
+});
+
+test("multi-id run releases every held task in one message", async () => {
+  const { h, app, project, worker } = await slackHarness();
+  const a = await h.repos.tasks.create({ projectId: project.id, workerId: worker.id, title: "held a", description: "a" });
+  const b = await h.repos.tasks.create({ projectId: project.id, workerId: worker.id, title: "held b", description: "b" });
+  const res = await cmd(app, `/task run ${a.id} ${b.id}`);
+  assert.match(res.text, new RegExp(a.id));
+  assert.match(res.text, new RegExp(b.id));
+  for (const t of [a, b]) {
+    const after = await h.repos.tasks.get(t.id);
+    assert.notEqual(after.status, Status.CREATED, `${t.id} must be released`);
+  }
+});
+
 // --- misc ---------------------------------------------------------------------
 
 test("queue lists what is waiting without needing a task id", async () => {

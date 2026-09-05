@@ -27,15 +27,21 @@ import { nullLogger } from "../domain/logger.mjs";
 const ephemeral = (text, blocks) => ({ response_type: "ephemeral", text, ...(blocks ? { blocks } : {}) });
 const inChannel = (text, blocks) => ({ response_type: "in_channel", text, ...(blocks ? { blocks } : {}) });
 
-/** Verbs that stop or destroy work, and therefore ask before acting. */
-const DESTRUCTIVE = new Set([Action.PAUSE]);
+/**
+ * Verbs that stop or destroy work, and therefore ask before acting.
+ * CANCEL sits here too: CANCELLED is a dead end in the state machine — the
+ * operator should get the same "name what will die" pause for a permanent
+ * cancel as for a stop.
+ */
+const DESTRUCTIVE = new Set([Action.PAUSE, Action.CANCEL]);
 const LIVE = ["PENDING", "DISPATCHED", "RUNNING"];
 
 const HELP =
   "`task <what to do>` · `/work <what to do>` (decompose into phases) · " +
   "`/prepare <guidance>` (one analyst task → docs/plans.md + docs/tasks.md) · " +
   "`/task <what to do>` (one direct task) · `queue` · `status TASK-XXXX` · `stop TASK-XXXX` · " +
-  "`model TASK-XXXX glm-5.2 high` · `run TASK-XXXX` · `approve TASK-XXXX` · `expedite TASK-XXXX 30m`";
+  "`model TASK-XXXX glm-5.2 high` · `run TASK-XXXX [TASK-YYYY …]` · `cancel TASK-XXXX [TASK-YYYY …]` · " +
+  "`approve TASK-XXXX` · `expedite TASK-XXXX 30m`";
 
 export function createSlackApp(controller, { defaultProjectId = null, log = nullLogger } = {}) {
   const { repos, scheduler, now } = controller;
@@ -183,14 +189,23 @@ export function createSlackApp(controller, { defaultProjectId = null, log = null
     }
 
     if (DESTRUCTIVE.has(parsed.action)) {
-      const task = await repos.tasks.get(parsed.taskId);
-      if (!task) return ephemeral(`I don't know a task called \`${parsed.taskId}\`.`);
-      if ([Status.COMPLETE, Status.CANCELLED].includes(task.status)) {
-        return ephemeral(`\`${task.id}\` is already ${task.status} — nothing to stop.`);
+      // Multi-id destructive verbs describe EVERY target before asking —
+      // "cancel A B" confirmed against a description of only A is how B dies
+      // without ever being named.
+      const ids = parsed.taskIds?.length ? parsed.taskIds : [parsed.taskId];
+      const targets = [];
+      for (const id of ids) {
+        const task = await repos.tasks.get(id);
+        if (!task) return ephemeral(`I don't know a task called \`${id}\`.`);
+        if (![Status.COMPLETE, Status.CANCELLED].includes(task.status)) targets.push(task);
+      }
+      if (targets.length === 0) {
+        return ephemeral(`Already ${Status.COMPLETE} or ${Status.CANCELLED} — nothing to ${parsed.action.toLowerCase()}.`);
       }
       pendingConfirm.set(userId, { parsed, expiresAt: now() + CONFIRM_TTL_MS });
+      const verbWord = parsed.action === Action.CANCEL ? "cancels" : "stops";
       return ephemeral(
-        `This stops \`${task.id}\` — *${task.title}* (currently ${task.status}).\n` +
+        `This ${verbWord} ${targets.map((t) => `\`${t.id}\` — *${t.title}* (${t.status})`).join(", ")}.\n` +
           "Reply `yes` to go ahead, `no` to drop it.",
       );
     }
@@ -313,34 +328,100 @@ export function createSlackApp(controller, { defaultProjectId = null, log = null
       }
 
       case Action.RUN: {
-        const task = await repos.tasks.get(parsed.taskId);
-        if (!task) return ephemeral(`I don't know a task called \`${parsed.taskId}\`.`);
+        // Multi-id: "run TASK-A TASK-B" releases/resumes each in one breath —
+        // the operator who registered a dozen held tasks from docs/tasks.md
+        // should not send a dozen messages. Each id is judged independently:
+        // one that is already moving must not fail the whole batch.
+        const ids = parsed.taskIds?.length ? parsed.taskIds : [parsed.taskId];
+        const lines = [];
+        for (const id of ids) {
+          const task = await repos.tasks.get(id);
+          if (!task) {
+            lines.push(`I don't know a task called \`${id}\`.`);
+            continue;
+          }
 
-        // Three different meanings of "run", and conflating them is how a
-        // finished task quietly gets re-billed:
-        //   CREATED  -> it was stocked; release it
-        //   BLOCKED  -> it was stopped or it failed; a new revision resumes it
-        //   anything else -> it's already moving, or it's done
-        if (task.status === Status.CREATED) {
-          await repos.tasks.setStatus(task.id, Status.QUEUED, { actor: operator.name });
-          await scheduler.notify(WakeReason.TASK_CREATED);
-          return inChannel(`Released \`${task.id}\` into the queue _(${operator.name})_.`);
+          // Three different meanings of "run", and conflating them is how a
+          // finished task quietly gets re-billed:
+          //   CREATED  -> it was stocked; release it
+          //   BLOCKED  -> it was stopped or it failed; a new revision resumes it
+          //   anything else -> it's already moving, or it's done
+          if (task.status === Status.CREATED) {
+            await repos.tasks.setStatus(task.id, Status.QUEUED, { actor: operator.name });
+            await scheduler.notify(WakeReason.TASK_CREATED);
+            lines.push(`Released \`${task.id}\` into the queue.`);
+            continue;
+          }
+          if (task.status === Status.BLOCKED) {
+            try {
+              await repos.tasks.createRevision(task.id, {
+                sessionMode: "CONTINUE",
+                instruction: null,
+                actor: operator.name,
+              });
+            } catch (err) {
+              lines.push(`Can't run \`${task.id}\`: ${err.message}`);
+              continue;
+            }
+            await scheduler.notify(WakeReason.MANUAL);
+            log.info("slack.task-rerun", { task: task.id, by: operator.name });
+            lines.push(`Running \`${task.id}\` again.`);
+            continue;
+          }
+          lines.push(`\`${task.id}\` is ${task.status} — nothing to start.`);
         }
-        if (task.status === Status.BLOCKED) {
+        // Attribution once per message, not per task: it belongs to the
+        // command, and repeating it N times turns a two-task run into noise.
+        return inChannel(`${lines.join("\n")} _(${operator.name})_`);
+      }
+
+      case Action.CANCEL: {
+        // CANCELLED, bukan BLOCKED: permintaan "buang task ini", bukan
+        // "tahan sebentar". Run yang masih hidup di-finalisasi dan di-abort
+        // di gateway dulu (urutan yang sama dengan stopTask — finalisasi
+        // sebelum abort, supaya lifecycle `end` dari gateway tidak menimpa
+        // status yang operator minta), lease dilepas, baru status akhir.
+        const ids = parsed.taskIds?.length ? parsed.taskIds : [parsed.taskId];
+        const lines = [];
+        for (const id of ids) {
+          const task = await repos.tasks.get(id);
+          if (!task) {
+            lines.push(`I don't know a task called \`${id}\`.`);
+            continue;
+          }
+          if ([Status.COMPLETE, Status.CANCELLED].includes(task.status)) {
+            lines.push(`\`${task.id}\` is already ${task.status} — nothing to cancel.`);
+            continue;
+          }
+          const execution = await repos.executions.latest(task.id);
+          const live = execution && LIVE.includes(execution.status);
+          if (live) {
+            await repos.executions.setStatus(execution.id, "CANCELLED", { result: `cancelled by ${operator.name}` });
+            if (execution.session_ref && controller.runtime?.abortRun) {
+              try {
+                await controller.runtime.abortRun({ sessionKey: execution.session_ref });
+              } catch {
+                // Abort gagal bukan berarti cancel gagal — run akan berakhir
+                // sendiri; status task tetap CANCELLED sesuai permintaan.
+              }
+            }
+            if (task.workspace_path) {
+              await repos.leases.release(task.workspace_path, { executionId: execution.id, actor: operator.name });
+            }
+          }
           try {
-            await repos.tasks.createRevision(task.id, {
-              sessionMode: "CONTINUE",
-              instruction: null,
+            await repos.tasks.setStatus(task.id, Status.CANCELLED, {
+              reason: "cancelled by operator",
               actor: operator.name,
             });
           } catch (err) {
-            return ephemeral(`Can't run \`${task.id}\`: ${err.message}`);
+            lines.push(`Can't cancel \`${task.id}\`: ${err.message}`);
+            continue;
           }
-          await scheduler.notify(WakeReason.MANUAL);
-          log.info("slack.task-rerun", { task: task.id, by: operator.name });
-          return inChannel(`Running \`${task.id}\` again _(${operator.name})_.`);
+          log.info("slack.task-cancelled", { task: task.id, wasLive: Boolean(live), by: operator.name });
+          lines.push(`Cancelled \`${task.id}\` — *${String(task.title).slice(0, 60)}*.`);
         }
-        return ephemeral(`\`${task.id}\` is ${task.status} — nothing to start.`);
+        return inChannel(`${lines.join("\n")} _(${operator.name})_`);
       }
 
       case Action.CONTINUE: {
@@ -484,16 +565,31 @@ export function createSlackApp(controller, { defaultProjectId = null, log = null
    */
   async function runCommand({ parsed, operator, confirmed = false, projectId = null }) {
     if (DESTRUCTIVE.has(parsed.action) && !confirmed) {
-      const task = await repos.tasks.get(parsed.taskId);
-      if (!task) return { ok: false, needsConfirmation: false, text: `Tidak ada task \`${parsed.taskId}\`.` };
-      if ([Status.COMPLETE, Status.CANCELLED].includes(task.status)) {
-        return { ok: false, needsConfirmation: false, text: `\`${task.id}\` sudah ${task.status} — tidak ada yang dihentikan.` };
+      // Deskripsikan SEMUA target (multi-id), bukan hanya yang pertama —
+      // konfirmasi yang hanya menyebut A untuk "cancel A B" adalah cara B
+      // mati tanpa pernah dinamakan (§8.7).
+      const ids = parsed.taskIds?.length ? parsed.taskIds : [parsed.taskId];
+      const targets = [];
+      for (const id of ids) {
+        const task = await repos.tasks.get(id);
+        if (!task) return { ok: false, needsConfirmation: false, text: `Tidak ada task \`${id}\`.` };
+        if (![Status.COMPLETE, Status.CANCELLED].includes(task.status)) targets.push(task);
       }
+      if (targets.length === 0) {
+        return {
+          ok: false,
+          needsConfirmation: false,
+          text: `Semua task tersebut sudah ${Status.COMPLETE} atau ${Status.CANCELLED} — tidak ada yang perlu dihentikan.`,
+        };
+      }
+      const verbWord = parsed.action === Action.CANCEL ? "membatalkan" : "menghentikan";
       return {
         ok: false,
         needsConfirmation: true,
-        target: { id: task.id, title: task.title, status: task.status },
-        text: `Ini akan menghentikan \`${task.id}\` — *${task.title}* (sekarang ${task.status}).`,
+        target: { id: targets[0].id, title: targets[0].title, status: targets[0].status },
+        text:
+          `Ini akan ${verbWord} ${targets.map((t) => `\`${t.id}\` — *${t.title}* (sekarang ${t.status})`).join(", ")}.` +
+          (parsed.action === Action.CANCEL ? "\nCANCELLED adalah jalan buntu — task tidak bisa dijalankan ulang tanpa revisi." : ""),
       };
     }
     const reply = await runAction(parsed, operator, { confirmed: true, projectId });

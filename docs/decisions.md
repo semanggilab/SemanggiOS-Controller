@@ -1599,6 +1599,51 @@ bukan karena UI menyembunyikannya. Pertanyaan terbuka: apakah gateway 2026.7.1
 memancarkan reasoning lewat stream yang belum didengar controller.
 
 
+## D50 — `PREPARE:` sebagai intent deklaratif: satu task analyst untuk dokumen rencana, bukan rantai dekomposisi
+
+**Keputusan (2026-09-05).** Tombol "Create plans" / "Create tasks" di Command
+Center mengirim prefiks `PREPARE:` dan router intent memperlakukannya sebagai
+intent deklaratif: **satu task analyst** (level dari (template, profile) +
+snapshot project, Brain dari grid yang sama, kategori analysis) — bukan rantai
+dekomposisi lima fase. Membuat rencana selesai secara alami dalam satu run:
+baca dokumen, tulis rencana. Pipeline penuh membayar lima fase — termasuk fase
+builder yang untuk "tuliskan rencana" tidak punya apa pun untuk dibangun — dan
+menunda dokumen rencana di belakang dependensi yang tidak diperlukan. Task
+PREPARE meniru persis fase analyst dekomposisi; bedanya hanya tidak ada rantai.
+
+**Deklarasi menang atas verba CREATE.** Di `classify()`, payload di balik
+prefiks tetap diklasifikasi, tetapi verba CREATE di dalamnya tidak lagi membalik
+intent: "PREPARE: Buat rencana…" adalah bahasa natural yang menjelaskan
+pekerjaan, bukan perintah re-klasifikasi — menghormati verbanya akan membalik
+setiap permintaan prepare berbahasa Indonesia kembali ke WORK dan menggugurkan
+deklarasi. Hanya perintah lingkup-task (status/stop/…) yang tetap lebih tinggi.
+Prefiks dengan payload kosong tetap jatuh ke CONFIRM.
+
+**Kegagalan admission = alasan yang bisa ditindaklanjuti**, bukan WAIT yang
+misterius: tanpa worker analyst aktif untuk project → pesan menyebut cara
+mendaftarkannya; tanpa Brain untuk level analyst → pesan menyebut halaman Brain
+Map (D42).
+
+**Tombol UI bersyarat pada dokumen.** "Create plans" hanya muncul selama
+docs/plans.md belum ada; "Create tasks" hanya setelah plans ada dan tasks belum
+ada — tombol yang menggantung setelah filenya ada mengundang penimpaan tanpa
+sengaja, dan daftar task sebelum rencana adalah tebakan (prompt tasks-nya sendiri
+menolak berjalan tanpa docs/plans.md).
+
+**Terukur di cluster (2026-09-05, PRJ-A86973EC via
+`POST /api/work/control/message`).** "Create plans" → `TASK-230B1780`: tepat
+satu task (tidak ada task lain dalam 5 menit), analyst `WRK-034BFD58`
+(critical, glm-5-2-max), DISPATCHED → COMPLETE dalam ~9½ menit,
+docs/plans.md 19.596 byte. "Create tasks" → `TASK-293CD0A0`: tepat satu task,
+COMPLETE, docs/tasks.md 23.817 byte. Kedua dokumen menyebut sumbernya dan
+otoritas konfliknya.
+
+**Catatan terbuka.** Run kedua memangkas docs/plans.md sedikit (19.596 →
+19.122 byte) — prompt "Create tasks" tidak melarang menyentuh plans.md, dan
+analyst merapikannya. Prompt berikutnya sebaiknya membatasi run tasks pada
+menulis docs/tasks.md saja bila pengetatan ini diinginkan.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

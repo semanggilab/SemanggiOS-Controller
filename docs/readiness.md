@@ -2,7 +2,7 @@
 
 Ditinjau 2026-08-21; **diperbarui 2026-09-04** setelah migrasi state ke root `semanggios`, repair gateway, dan deploy `2026090401`. Aturan penilaian tidak berubah: sesuatu disebut siap kalau **terbukti hidup di cluster**, bukan kalau kodenya ada dan tesnya hijau. Unit test membuktikan logika, bukan kontrak dengan sistem lain. Sebagian besar temuan POC-3 dan POC-4 justru berupa selisih antara dokumen dan versi yang terpasang.
 
-**Keadaan saat ini:** `semanggi/agentos:2026090601`, `semanggi/work-controller:2026090405`, `semanggi/openclaw-gateway:2026083001`; klaster secara kontrak hanya melibatkan dua node — `kub01-01`/`kub01-02` berlabel `type=app` (semua placement `node.labels.type == app`), node lain tidak dilibatkan; 333 test controller lulus semua.
+**Keadaan saat ini:** `semanggi/agentos:2026090601`, `semanggi/work-controller:2026090405`, `semanggi/openclaw-gateway:2026083001`; klaster secara kontrak hanya melibatkan dua node — `kub01-01`/`kub01-02` berlabel `type=app` (semua placement `node.labels.type == app`), node lain tidak dilibatkan; 422 test controller lulus semua. Pembaruan terakhir 2026-09-06: whitelist proxy PUT docs + modal dokumen Command Center (D56), terbukti hidup di `agentos-src` tanpa rebuild image.
 
 ## Yang terbukti hidup
 
@@ -67,7 +67,9 @@ Ditinjau 2026-08-21; **diperbarui 2026-09-04** setelah migrasi state ke root `se
 | Project Role Level modal (D44) | Register dan Edit membuka modal yang sama: dropdown profile + level per role aktual (template ∪ worker ∪ tersimpan), kolom brain hasil resolusi; snapshot menang pada dekomposisi WORK (terbukti: reviewer/tester SDMK ikut snapshot lama, bukan default template) |
 | Brain Map per (template, role, level) (D45) | Grid kolom dropdown low/normal/critical dengan default `DEFAULT_BRAIN_MAP`; pemaku di bawah level dipakai dan ditandai `belowLevel`; pin lama ter-migrasi ke sel legal (14 baris live) |
 | Whitelist proxy Semanggi ikut endpoint baru | `GET/PUT /work/projects/{id}/role-levels` ditambahkan ke ALLOWED di `app/api/semanggi/[...path]/route.ts` — ditemukan dari modal Edit yang gagal di cluster ("proxy does not expose"), terverifikasi 200 lewat jalur terautentikasi di image `2026090403` |
-| Suite controller | **339 test**, semua lulus, tanpa dependensi runtime |
+| Whitelist proxy untuk PUT docs (D56) | Kegagalan kedua dari jenis yang sama: PUT `/work/projects/{id}/docs/{name}` ada di controller sejak D55 tapi tak terdaftar di proxy, setiap Edit/Save modal Command Center gagal 404 "does not expose PUT". Entri ALLOWED ditambahkan; terverifikasi 2026-09-06 di `agentos-src` (fork commit `97dd5b12`): probe project tak dikenal mencapai controller ("unknown project", bukan "does not expose"), dan round-trip PUT dokumen asli mengembalikan byte identik, 200 |
+| Modal dokumen Command Center (D56) | Edit/Save pindah ke header modal di sebelah judul (slot `actions` baru di `Modal`); scroll textarea dan pratinjau markdown tersinkron proporsional. Build standalone terautentikasi 2026-09-06 |
+| Suite controller | **422 test**, semua lulus, tanpa dependensi runtime |
 
 ## Yang masih menghalangi
 

@@ -10,6 +10,7 @@ export const EventKind = Object.freeze({
   TASK_STATUS: "task.status",
   TASK_CANCELLED: "task.cancelled",
   TASK_EXPEDITED: "task.expedited",
+  TASK_DELETED: "task.deleted",
   REVISION_CREATED: "revision.created",
   DISPATCH_DECISION: "dispatch.decision",
   DISPATCH_SENT: "dispatch.sent",

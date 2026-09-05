@@ -8,6 +8,7 @@ import { nullLogger } from "../domain/logger.mjs";
 import { verifySlackRequest, parseSlackBody } from "../interface/slack-verify.mjs";
 import { timingSafeEqual } from "node:crypto";
 import { Status } from "../domain/state-machine.mjs";
+import { DELETABLE_STATUSES } from "../domain/repositories.mjs";
 import { isExpedited, effectivePriority } from "../scheduler/selection.mjs";
 import { WakeReason } from "../scheduler/scheduler.mjs";
 import { buildAgentInventory, summariseInventory } from "../runtime/agent-inventory.mjs";
@@ -151,6 +152,7 @@ const presentTask = (t, now) => ({
   workspaceMode: t.workspace_mode,
   modelPolicy: t.model_policy,
   nextRetryAt: t.next_retry_at,
+  deletedAt: t.deleted_at ?? null,
   createdAt: t.created_at,
   updatedAt: t.updated_at,
 });
@@ -793,6 +795,62 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       throw badRequest(err.message);
     }
     return { task: presentTask(await repos.tasks.get(id), now()) };
+  });
+
+  // --- deletion --------------------------------------------------------------
+  //
+  // Deletion is for work that is provably idle — CREATED (never queued) and
+  // CANCELLED (a dead end) — so cleaning the board cannot stop anything that
+  // is running. Admin-only, like project deletion: this removes rows, and the
+  // attribution of a removal must be an identity someone vouches for.
+  route("DELETE", "/api/work/tasks/{id}", async ({ id }, body, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may delete tasks");
+    try {
+      const result = await repos.tasks.delete(id, {
+        actor: actor.kind === "operator" ? actor.name : "service",
+        note: body?.note ?? null,
+      });
+      return result;
+    } catch (err) {
+      if (String(err.message).startsWith("unknown task")) throw notFound(err.message);
+      throw badRequest(err.message);
+    }
+  });
+
+  // Bulk delete by status, because the thing an operator actually asks for is
+  // "clear out everything that was never started and everything abandoned",
+  // not 115 individual DELETE calls. The caller must name the statuses: a
+  // destructive bulk action with implicit defaults is the kind of thing that
+  // gets run by accident; naming them makes the request itself the record of
+  // intent. Each task is still checked and refused individually, and the
+  // response names every task touched (spec §8.7).
+  route("POST", "/api/work/tasks/purge", async (_p, body, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may purge tasks");
+    const statuses = body?.statuses;
+    if (!Array.isArray(statuses) || statuses.length === 0) {
+      throw badRequest(`statuses must be a non-empty array (one or more of ${DELETABLE_STATUSES.join(", ")})`);
+    }
+    for (const s of statuses) {
+      if (!DELETABLE_STATUSES.includes(s)) {
+        throw badRequest(`status "${s}" cannot be deleted (allowed: ${DELETABLE_STATUSES.join(", ")})`);
+      }
+    }
+    const by = actor.kind === "operator" ? actor.name : "service";
+    const deleted = [];
+    const refused = [];
+    for (const s of [...new Set(statuses)]) {
+      for (const task of await repos.tasks.list({ status: s, limit: 10_000 })) {
+        try {
+          deleted.push(await repos.tasks.delete(task.id, { actor: by, note: body?.note ?? null }));
+        } catch (err) {
+          refused.push({ taskId: task.id, status: task.status, reason: err.message });
+        }
+      }
+    }
+    log.info("tasks.purged", {
+      statuses: [...new Set(statuses)], deleted: deleted.length, refused: refused.length, by,
+    });
+    return { deleted, refused };
   });
 
   // --- approvals ------------------------------------------------------------
@@ -2187,7 +2245,10 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     // call with "template, role and level are required" — a route that could
     // not succeed under any input. Found by reading, not by a failing test,
     // which is the uncomfortable part: nothing exercised it end to end.
-    if (["POST", "PATCH", "PUT"].includes(req.method)) {
+    //
+    // DELETE reads `body.note` on the task route, so it joins the list for the
+    // same reason — a route's body only exists if the dispatcher parses it.
+    if (["POST", "PATCH", "PUT", "DELETE"].includes(req.method)) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const raw = Buffer.concat(chunks).toString("utf8");

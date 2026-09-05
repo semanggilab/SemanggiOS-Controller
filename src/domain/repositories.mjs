@@ -47,6 +47,15 @@ export function shortId(prefix) {
   return `${prefix}-${randomUUID().replaceAll("-", "").slice(0, 8).toUpperCase()}`;
 }
 
+/**
+ * The only statuses a task may be deleted from (D54). Both are provably idle:
+ * CREATED never reached the queue, and CANCELLED is a dead end the state
+ * machine has no exit from — so deleting one cannot stop work that is
+ * happening. Every other status either is live work or can become it without
+ * anyone asking again, and deleting those would be stopping work silently.
+ */
+export const DELETABLE_STATUSES = Object.freeze([Status.CREATED, Status.CANCELLED]);
+
 const hydrateTask = (r) =>
   r && {
     ...r,
@@ -374,9 +383,13 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       return hydrateTask(await store.get(`SELECT * FROM tasks WHERE id = ?`, [id]));
     },
 
-    async list({ status, projectId, limit = 200 } = {}) {
+    async list({ status, projectId, limit = 200, includeDeleted = false } = {}) {
       const where = [];
       const params = [];
+      // A soft-deleted task keeps its row only because immutable executions
+      // still reference it (D54); it must not appear in any listing — queue,
+      // board, or admission candidate — ever again.
+      if (!includeDeleted) where.push("deleted_at IS NULL");
       if (status) (where.push("status = ?"), params.push(status));
       if (projectId) (where.push("project_id = ?"), params.push(projectId));
       const rows = await store.all(
@@ -701,6 +714,82 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
         payload: { note },
       });
       return task;
+    },
+
+    /**
+     * Remove a task that is provably idle (DELETABLE_STATUSES), so finished
+     * and abandoned work can be cleaned out of the board.
+     *
+     * Deletion is not a state transition — the row leaves the table — but the
+     * audit trail is append-only and must survive it, so the event is written
+     * in the same transaction as the removal: a task that vanishes without a
+     * `task.deleted` entry would look like a database that loses history.
+     *
+     * Hard delete when nothing references the row anymore; soft delete
+     * (`deleted_at`) when executions exist, because execution history is
+     * immutable by trigger and holds the FK — the row has to stay, hidden
+     * from every listing (D54).
+     */
+    async delete(taskId, { actor = "operator", note = null } = {}) {
+      return store.tx(async () => {
+        const task = await tasks.get(taskId);
+        if (!task) throw new Error(`unknown task ${taskId}`);
+        if (task.deleted_at) throw new Error(`task ${taskId} is already deleted`);
+        if (!DELETABLE_STATUSES.includes(task.status)) {
+          throw new Error(
+            `task ${taskId} is ${task.status}; only ${DELETABLE_STATUSES.join(" and ")} tasks can be deleted`,
+          );
+        }
+        // Defence in depth: the status check above already rules out live work,
+        // but a PENDING/DISPATCHED/RUNNING execution under this task's name
+        // would mean the status and the execution disagree — and deleting on
+        // top of that disagreement would bury the evidence.
+        const live = await store.get(
+          `SELECT id FROM executions WHERE task_id = ? AND status NOT IN (?, ?, ?) LIMIT 1`,
+          [taskId, ExecutionStatus.COMPLETE, ExecutionStatus.FAILED, ExecutionStatus.CANCELLED],
+        );
+        if (live) throw new Error(`task ${taskId} still has live execution ${live.id}; refuse to delete`);
+
+        // Dependency edges point both ways; either direction would FK-fail the
+        // delete below. Approvals reference the task too. The event_log entries
+        // stay — they are the audit trail, not the task's.
+        await store.run(`DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?`, [
+          taskId,
+          taskId,
+        ]);
+        await store.run(`DELETE FROM approvals WHERE task_id = ?`, [taskId]);
+
+        const execCount = await store.get(`SELECT COUNT(*) AS n FROM executions WHERE task_id = ?`, [taskId]);
+        const method = execCount.n === 0 ? "hard" : "soft";
+        if (method === "hard") {
+          await store.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+        } else {
+          await store.run(`UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ?`, [
+            now(),
+            now(),
+            taskId,
+          ]);
+        }
+
+        await events.append({
+          kind: EventKind.TASK_DELETED,
+          subjectType: "task",
+          subjectId: taskId,
+          actor,
+          payload: {
+            status: task.status,
+            title: task.title,
+            projectId: task.project_id,
+            method,
+            note,
+          },
+        });
+        log.info("task.deleted", {
+          task: taskId, status: task.status, method, actor,
+          project: task.project_id, title: task.title,
+        });
+        return { deleted: true, taskId, method, status: task.status, title: task.title };
+      });
     },
   };
 

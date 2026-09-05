@@ -121,6 +121,12 @@ class SqliteStore {
       this.#db.exec(`ALTER TABLE tasks ADD COLUMN resource_retries INTEGER NOT NULL DEFAULT 0`);
     }
 
+    // D54: penanda hapus-lunak. Nullable: baris lama tidak pernah dihapus,
+    // jadi NULL berarti "hidup" tanpa perlu backfill.
+    if (taskCols.length > 0 && !taskCols.includes("deleted_at")) {
+      this.#db.exec(`ALTER TABLE tasks ADD COLUMN deleted_at INTEGER`);
+    }
+
     // D37: template and profile move from a per-request parameter (typed into
     // the Control page every time) to a per-project setting (typed once, in
     // Settings → Project). Existing rows get the same defaults the code

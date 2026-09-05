@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- panjang, UNAVAILABLE) di jalur late-error. Terpisah dari quota_retries
   -- karena batas dan backoff-nya berbeda; aturan resetnya sama.
   resource_retries INTEGER NOT NULL DEFAULT 0,
+  -- Set when the task is deleted. A row is only soft-deleted when immutable
+  -- execution history still references it (the executions_no_delete trigger
+  -- plus the FK make a hard delete impossible); tasks without executions are
+  -- hard-deleted and leave only their event_log entries behind. Either way the
+  -- row disappears from every listing once this is set (D54).
+  deleted_at     INTEGER,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL
 );

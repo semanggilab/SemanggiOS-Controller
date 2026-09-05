@@ -1570,6 +1570,35 @@ dibawa giliran assistant, dan delta `command_output` adalah noise setelah
 hasil teragregasi ada. Koneksi juga mengiklankan cap `tool-events`; ia tak
 berpengaruh pada versi ini tetapi murah untuk versi berikutnya.
 
+## D49 — Transkrip UI: satu region per aksi; pasangan call↔result tanpa call id; markdown mini tanpa dependensi
+
+**Keputusan (2026-09-06).** UI transkrip task (`task-dialog.tsx`, fork) menggabungkan
+giliran `toolResult` ke blok `toolCall` yang memintanya: satu region collapsible
+(default tertutup) berjudul kata kerja — Exec/Read/Write, bukan "Tool Call" — dengan
+command/isi file di atas dan hasil di bawah garis delimiter. `exit` tampil sebagai
+badge warning dan `durationMs` rata kanan di header region; `isError` merender region
+merah transparan berborder merah. Jawaban `<final>` dibuka bungkusnya dan dirender
+markdown; konten `write` tampil multiline penuh tanpa prefiks key (dulu ter-truncate
+satu baris).
+
+**Pasangan tanpa call id.** Frame result gateway 2026.7.1 (D48) tidak membawa id
+pemanggilan, jadi UI memasangkan FIFO per nama tool dalam satu eksekusi; antrean
+di-reset saat `executionId` berubah agar revisi berikutnya tidak menelan result
+revisi sebelumnya. Result tanpa pasangan tetap dirender sendiri, tidak disembunyikan
+(§8.7).
+
+**Markdown tanpa dependensi.** Fork tidak memaketkan renderer markdown; menambah
+paket = rebase tax (aturan §4.1 poin 2). Renderer mini (heading, list, fence, inline
+code/bold/italic/link) cukup untuk yang ditulis brain; yang tak dikenal jatuh
+menjadi paragraf polos.
+
+**Reasoning belum pernah terekam.** Diukur 2026-09-06: 0 dari 71 pesan di
+`execution_messages` memuat blok `thinking`. UI sudah merendernya collapsed sejak
+D48, jadi region reasoning tidak pernah muncul karena datanya memang tidak ada,
+bukan karena UI menyembunyikannya. Pertanyaan terbuka: apakah gateway 2026.7.1
+memancarkan reasoning lewat stream yang belum didengar controller.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

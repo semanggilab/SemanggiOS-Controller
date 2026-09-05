@@ -97,6 +97,14 @@ Sekarang workspace kita adalah `workspaces/semanggi/executions/T1` — `executio
 
 Ini juga menghapus satu sebab kegagalan yang terukur (D29): task yang diberi `workspace_path` berupa subdirektori bersarang terparkir permanen karena tidak ada agen yang terikat di sana.
 
+**Path agen ≠ path NFS.** Di dalam sandbox, workspace agen ter-mount di
+`/workspace`, jadi jawaban agen yang menyebut `/workspace/deliverables/<TASK-ID>/…`
+ada di `openclaw/workspaces/<project>/deliverables/<TASK-ID>/…` pada NFS.
+Kasus nyata (2026-09-06): TASK-4F59F63A menulis laporannya ke
+`/workspace/deliverables/TASK-4F59F63A/01-laporan-verifikasi-akhir.md`; operator
+mencarinya di root `workspaces/` dan tidak menemukannya — folder itu hidup di
+`workspaces/sdmk-kader/deliverables/TASK-4F59F63A/`.
+
 ## 3. Siapa menulis apa
 
 | Path | Penulis | Kapan |

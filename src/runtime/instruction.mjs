@@ -43,6 +43,16 @@ function effortLine(brain) {
 export const deliverablesDirFor = (taskId) => `deliverables/${taskId}`;
 
 /**
+ * Baris pembuka preamble — penanda stabil bahwa sebuah pesan dibungkus oleh
+ * controller. Dipakai transkrip untuk menyaring gema `user` dari dispatch
+ * kita sendiri: yang dikirim operator sungguhan tidak pernah diawali baris
+ * ini (D48).
+ */
+export const PREAMBLE_MARKER = "## Konteks eksekusi (Semanggi)";
+
+export const isPreambleWrapped = (text) => String(text ?? "").trimStart().startsWith(PREAMBLE_MARKER);
+
+/**
  * @param brain     baris Brain yang benar-benar dipilih, bukan yang diminta
  * @param task      untuk id dan mode workspace
  * @param role      role AgentOS yang diwakili worker, bila ada

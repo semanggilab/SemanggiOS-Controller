@@ -2,7 +2,7 @@
 
 Each entry records a choice the spec left open, or a place where implementation forced a decision. POC-4 §9 requires the storage choice to be recorded in the implementation PR; the rest are here for the same reason.
 
-**Cakupan:** D1–D35 adalah POC-4 (controller, scheduler, routing, Slack, Brain). D36–D41 adalah fase UI — halaman Semanggi di dalam AgentOS, setelan project, probe level empiris, transkrip yang lengkap, dan jalur build image.
+**Cakupan:** D1–D35 adalah POC-4 (controller, scheduler, routing, Slack, Brain). D36–D41 adalah fase UI — halaman Semanggi di dalam AgentOS, setelan project, probe level empiris, transkrip yang lengkap, dan jalur build image. D42–D45 adalah era Brain sebagai sumber routing. D46–D48 adalah era loop cepat NFS dan kejujuran kontrak gateway: iterasi tanpa build image, penolakan lambat yang dipetakan ke eksekusi, uji koneksi yang jujur, dan transkrip yang menangkap output tool.
 
 **Cara membaca:** judul yang ~~dicoret~~ adalah keputusan yang **sudah tidak berlaku** — isinya sengaja dipertahankan karena alasan sebuah keputusan gugur seringkali lebih berguna daripada keputusan penggantinya. Judul tanpa coretan berlaku sampai ada entri yang membatalkannya secara eksplisit.
 
@@ -1416,6 +1416,27 @@ Konsekuensi yang dicatat sengaja:
 Alat: `scripts/sync-controller-src.sh`, `scripts/sync-agentos-src.sh`;
 kontrak volume baru dijaga `tests/stack-schema.sh`.
 
+### D46 addendum — migrasi selesai, dan satu jebakan tag basi
+
+**Status 2026-09-06: migrasi satu kali selesai.** Image
+`semanggi/agentos:2026090601` dibangun dengan entrypoint berdukungan
+`SEMANGGI_AGENTOS_SRC_DIR` (entripoint diverifikasi SEBELUM deploy:
+`["/usr/local/bin/semanggi-agentos-entrypoint"]`), `agentos-src` diisi lewat
+skrip sync, dan kedua service terbukti menjalankan kode dari NFS — controller
+sejak deploy stack, AgentOS sejak image baru. Uji asap terautentikasi lulus
+(`/control` dan `/summary` 200, bundle memuat teks UI terbaru). Mulai sini
+iterasi UI/controller tidak lagi menyentuh image.
+
+**Jebakan yang ditemukan saat migrasi: `.env` stack adalah sumber tag, dan ia
+basi.** `docker stack deploy` mengambil tag dari `SEMANGGI_*_IMAGE` di
+`semanggi-agent-platform/.env`. Deploy image selama ini dilakukan manual lewat
+`docker service update --image`, yang **tidak pernah menulis balik ke
+`.env`** — sehingga satu stack deploy diam-diam menurunkan agentos dari
+`2026090408` ke `2026090205` (image tiga hari lebih tua, UI pun ikut basi).
+Aturan yang mengikat sejak sini: setiap deploy image manual MUST diikuti
+pembaruan tag di `.env`, dan `deploy.sh` adalah jalur yang membaca `.env`
+sehingga keduanya tidak bisa berpisah lagi.
+
 ## D47 — Penolakan lambat gateway dipetakan ke eksekusi; `reasoning` config adalah kontrak level thinking
 
 Insiden TASK-E28D15F3 / TASK-BFA56024 (2026-09-05): kedua task DISPATCHED,
@@ -1467,6 +1488,38 @@ probe lama yang kondisi config-nya tidak bisa direkonstruksi penuh. Bila
 kualitas hasil mengecewakan, probe ulang terhadap config yang sekarang —
 jangan percaya evidence lama (aturan §4.1 poin 9).
 
+### D47 addendum — probe ulang: `max` tidak ada, dan classifier probe ikut berbohong
+
+Probe ulang terhadap config yang sudah dikoreksi (2026-09-06) menjawab batas
+di atas dengan pengukuran, bukan rekonstruksi:
+
+```text
+zai/glm-5.2   off 7 → minimal 15 → low 36 → medium 44 → high 32 token   SELESAI, status ok
+              max, adaptive                                              DITOLAK saat run mulai (status: error)
+```
+
+Jadi gateway menawarkan **lima** level — `off/minimal/low/medium/high` — dan
+`max` tidak pernah ada di antaranya. Brain `glm-5-2-max` diturunkan ke
+`high` lewat API (nama dipertahankan supaya Brain Map tidak putus; evidence
+diperbarui menyebut penurunan ini).
+
+**Probe ulang itu juga membuka kebohongan kedua, di classifier probe sendiri.**
+Putaran pertama masih mencantumkan `max`/`adaptive` sebagai `included` —
+`classifySample` meloloskan run berstatus `error` lewat cabang "completed but
+reported no usable usage", karena ia hanya memeriksa ok/timeout/unsupported.
+Run yang ditolak saat mulai memang menjawab `ok` pada request probe, lalu
+`agent.wait` berstatus `error` dalam ~5 detik tanpa usage — dan itu terbaca
+sebagai "terukur, tanpa usage". Perbaikan: hanya status selesai yang terukur
+(`ok`/`completed`) yang dihitung selesai; yang lain excluded dengan alasannya.
+Konsekuensi yang diterima sadar: gateway versi depan yang memakai kata status
+baru untuk "selesai" akan membuat probe tampak kosong — kekosongan yang
+langsung terlihat, bukan level rusak yang ikut terkatalog.
+
+**Satu temuan ikhlas dari run probe:** stall ~13 menit pada eksekusi task
+(15:55→16:08 UTC) pulih sendiri dan menuntaskan pekerjaan — provider stream
+yang menggantung tanpa `timeoutMs` adalah kelas kegagalan nyata, dan watchdog
+tetap satu-satunya jaring untuknya.
+
 ## D48 — Uji koneksi Brain jujur sampai run selesai; transkrip dikaitkan lewat kunci sesi yang dikirim
 
 Dua lubang dengan akar yang sama — *frame balasan pertama gateway diperlakukan
@@ -1496,15 +1549,26 @@ idempoten; baris lama NULL dan jatuh ke jalur lama), handoff dispatch
 mengembalikan kunci yang dikirim, dan sink mengaitkan pesan lewat kunci itu
 dahulu — eksekusi yang belum final menang, karena revisi CONTINUE berbagi
 satu kunci percakapan. Tes regresi di `session-events.test.mjs` dan
-`session-key-migration.test.mjs`. UI tidak berubah bentuknya: `blocks`
-(thinking/text/toolCall) dan giliran toolResult memang sudah mengalir lewat
-endpoint transkrip — selama ini hanya tidak pernah terisi.
+`session-key-migration.test.mjs`. UI mendapat dua tambahan kecil: blok
+`toolResult` dirender sebagai kartu output tool (merah bila gagal), dan
+gema instruksi berbalut preamble disaring dari transkrip.
 
 **Batas yang disengaja:** transkrip merekam apa yang lewat event
-`session.message` (reasoning, jawaban, toolCall, toolResult), dibatasi
-`SEMANGGI_MAX_MESSAGE_BYTES` per giliran. Ia tidak merekam isi file yang
-diubah agen — itu jejak workspace, bukan percakapan — dan blok tak dikenal
-ditampilkan apa adanya, bukan disembunyikan.
+`session.message` (reasoning, jawaban, toolCall) dan stream `agent`
+(hasil tool), dibatasi `SEMANGGI_MAX_MESSAGE_BYTES` per giliran. Ia tidak
+merekam isi file yang diubah agen — itu jejak workspace, bukan percakapan —
+dan blok tak dikenal ditampilkan apa adanya, bukan disembunyikan.
+
+**Bentuk output tool diukur, bukan ditebak (aturan §4.1 poin 4).** Dokumen
+protokol menyebut keluarga event `session.tool` tetapi tidak memberi bentuk
+payload; gateway 2026.7.1 yang terpasang ternyata mengirim lifecycle tool
+lewat event `agent` dengan `stream:"tool"` (fase start/update/result, diukur
+2026-09-05 lewat jendela pengukuran sementara). Hanya fase `result` yang
+disimpan sebagai giliran `toolResult` (nama, meta, isError, exitCode,
+durationMs, teks output) — fase `start` menduplikasi blok toolCall yang sudah
+dibawa giliran assistant, dan delta `command_output` adalah noise setelah
+hasil teragregasi ada. Koneksi juga mengiklankan cap `tool-events`; ia tak
+berpengaruh pada versi ini tetapi murah untuk versi berikutnya.
 
 ## Open questions for phase 4+
 

@@ -124,11 +124,11 @@ test("a malformed blocks row degrades to null rather than 500ing the transcript"
   }
 });
 
-test("preamble-wrapped echoes of the instruction are deduplicated, not repeated", async () => {
-  // Measured on the cluster (D48): the gateway echoes the dispatched
-  // instruction back as `user` turns wrapped in the execution preamble — and
-  // more than once per run. The old exact-match dedup only caught a bare echo,
-  // so the operator appeared to have said the same thing twice (or thrice).
+test("preamble-wrapped echoes of the dispatch are deduplicated, not repeated", async () => {
+  // Measured on the cluster (D48): the gateway echoes the dispatched message
+  // back as `user` turns carrying the preamble wrapper — sometimes more than
+  // once per run, and with only the preamble, not the instruction itself.
+  // What an operator actually typed never starts with the preamble marker.
   const h = await buildHarness();
   const { project, worker } = await seedBasics(h);
   const task = await queuedTask(h, { project, worker, title: "echoes" });
@@ -140,17 +140,19 @@ test("preamble-wrapped echoes of the instruction are deduplicated, not repeated"
     modelProvider: "zai",
     modelId: "glm-5.1",
   });
-  const echoed = `## Konteks eksekusi (Semanggi)\nTask: ${task.id}\n\ndo the thing`;
+  const echoed = `## Konteks eksekusi (Semanggi)\nTask: ${task.id} — echoes\nPeran: analyst\n\n---`;
   await h.repos.messages.append(exec.id, { seq: 1, role: "user", at: 1000, content: echoed });
   await h.repos.messages.append(exec.id, { seq: 3, role: "user", at: 2000, content: echoed });
-  await h.repos.messages.append(exec.id, { seq: 4, role: "assistant", at: 3000, content: "done" });
+  await h.repos.messages.append(exec.id, { seq: 4, role: "user", at: 2500, content: "a real operator follow-up" });
+  await h.repos.messages.append(exec.id, { seq: 5, role: "assistant", at: 3000, content: "done" });
 
   const api = await startApi(h);
   try {
     const res = await api.call("GET", `/api/work/tasks/${task.id}/transcript`);
     assert.equal(res.status, 200);
     const userTurns = res.body.turns.filter((t) => t.role === "user");
-    assert.equal(userTurns.length, 0, "echoes of the instruction must not read as operator turns");
+    assert.equal(userTurns.length, 1, "only the operator's real follow-up survives");
+    assert.equal(userTurns[0].text, "a real operator follow-up");
     assert.ok(res.body.turns.some((t) => t.role === "assistant"), "real turns survive the dedup");
   } finally {
     await api.close();

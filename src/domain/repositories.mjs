@@ -1304,6 +1304,9 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           // Tool calls are part of what happened and belong in the transcript,
           // but the raw arguments blob is not something a person reads.
           if (b?.type === "toolCall") return `[tool: ${b.name ?? "?"}]`;
+          // What a tool printed — flattened to its output so searches and
+          // clients without block support still see it (D48).
+          if (b?.type === "toolResult") return b.text ?? "";
           // Reasoning is kept in `blocks`, not inlined: it is often longer than
           // the answer and reads as noise in a conversation view.
           if (b?.type === "thinking") return "";

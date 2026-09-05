@@ -335,6 +335,51 @@ export function createSessionEventSink({ repos, events, runtime, scheduler, now 
     return true;
   }
 
+  /**
+   * Persists one finished tool call from the gateway's `agent` stream
+   * (stream:"tool", phase:"result") — the shape measured on the pinned
+   * 2026.7.1 gateway, not the `session.tool` family the newer protocol docs
+   * describe (D48). This is the transcript's shell-output channel: the
+   * assistant's own toolCall block says what the model asked to run, and this
+   * turn says what actually came back — exit codes, file writes, errors.
+   *
+   * Only phase:"result" is recorded: phase:"start" duplicates the toolCall
+   * block the assistant turn already carries, and phase:"update" partials are
+   * noise once the aggregated result exists.
+   */
+  async function recordToolResult(payload) {
+    const key = payload?.sessionKey ?? payload?.session?.key ?? null;
+    const data = payload?.data ?? {};
+    const execId =
+      (await repos.messages.executionForSessionKey(key)) ??
+      (await repos.messages.executionForSession(key)) ??
+      (await repos.messages.executionForSession(payload?.sessionId));
+    if (!execId) return false;
+    const details = data.result?.details ?? {};
+    const text = (data.result?.content ?? [])
+      .filter((b) => b?.type === "text")
+      .map((b) => b.text ?? "")
+      .join("\n");
+    await repos.messages.append(execId, {
+      // The gateway's own per-run seq keeps tool results ordered among
+      // themselves and distinct from transcript messageSeqs (roles differ, so
+      // the (execution, seq, role) key never collides).
+      seq: Number.isFinite(payload?.seq) ? payload.seq : now(),
+      role: "toolResult",
+      content: [{
+        type: "toolResult",
+        name: data.name ?? null,
+        meta: data.meta ?? null,
+        isError: Boolean(data.isError),
+        exitCode: Number.isFinite(details.exitCode) ? details.exitCode : null,
+        durationMs: Number.isFinite(details.durationMs) ? details.durationMs : null,
+        text,
+      }],
+      at: payload?.ts ?? now(),
+    });
+    return true;
+  }
+
   /** Wired to the adapter's onEvent. Never throws: see the adapter's guard. */
   async function handle(name, payload) {
     try {
@@ -343,6 +388,10 @@ export function createSessionEventSink({ repos, events, runtime, scheduler, now 
         return;
       }
       if (name === "session.tool") {
+        // Newer protocol versions name the tool lifecycle family
+        // `session.tool`; the pinned 2026.7.1 gateway uses agent-stream
+        // frames instead, but handling both costs nothing and survives an
+        // upgrade.
         const key = payload?.sessionKey ?? payload?.session?.key ?? null;
         const done = await recordMessage(key, payload);
         if (!done) await recordToolEvent(key, payload);
@@ -366,6 +415,10 @@ export function createSessionEventSink({ repos, events, runtime, scheduler, now 
         return;
       }
       if (name !== "agent") return;
+      if (payload?.stream === "tool") {
+        if (payload?.data?.phase === "result") await recordToolResult(payload);
+        return;
+      }
       if (payload?.stream !== "lifecycle") return;
       if (payload?.data?.phase !== "end") return;
       const result = await applyEnd(payload.runId, payload.data, payload);

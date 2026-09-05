@@ -2,7 +2,7 @@
 
 Ditinjau 2026-08-21; **diperbarui 2026-09-04** setelah migrasi state ke root `semanggios`, repair gateway, dan deploy `2026090401`. Aturan penilaian tidak berubah: sesuatu disebut siap kalau **terbukti hidup di cluster**, bukan kalau kodenya ada dan tesnya hijau. Unit test membuktikan logika, bukan kontrak dengan sistem lain. Sebagian besar temuan POC-3 dan POC-4 justru berupa selisih antara dokumen dan versi yang terpasang.
 
-**Keadaan saat ini:** `semanggi/agentos:2026090408`, `semanggi/work-controller:2026090405`, `semanggi/openclaw-gateway:2026083001`; klaster secara kontrak hanya melibatkan dua node — `kub01-01`/`kub01-02` berlabel `type=app` (semua placement `node.labels.type == app`), node lain tidak dilibatkan; 333 test controller lulus semua.
+**Keadaan saat ini:** `semanggi/agentos:2026090601`, `semanggi/work-controller:2026090405`, `semanggi/openclaw-gateway:2026083001`; klaster secara kontrak hanya melibatkan dua node — `kub01-01`/`kub01-02` berlabel `type=app` (semua placement `node.labels.type == app`), node lain tidak dilibatkan; 333 test controller lulus semua.
 
 ## Yang terbukti hidup
 

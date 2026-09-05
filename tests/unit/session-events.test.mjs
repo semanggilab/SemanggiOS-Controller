@@ -476,3 +476,100 @@ test("an unknown-shape session.tool frame is preserved raw, not dropped", async 
   assert.equal(blocks[0].toolName, "exec");
   assert.equal(blocks[0].payload.output, "file written", "the raw payload survives for the UI to render");
 });
+
+// ── Tool results from the agent stream (D48) ──────────────────────────────
+// Measured on the pinned 2026.7.1 gateway: tool lifecycles arrive as `agent`
+// events with stream:"tool" and phases start/update/result. The result phase
+// is the transcript's shell-output channel — what the user reads to know what
+// a command printed, whether a write landed, and which exit code came back.
+
+test("a tool result frame becomes a toolResult turn with output and exit code", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "t" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sentKey = `agent:doc-worker:${task.id}:r1`.toLowerCase();
+  await h.repos.executions.update(execution.id, { session_key: sentKey });
+
+  const sink = await sinkFor(h);
+  await sink.handle("agent", {
+    runId: execution.id,
+    stream: "tool",
+    sessionKey: sentKey,
+    seq: 9,
+    ts: 1788628344540,
+    data: {
+      phase: "result",
+      name: "exec",
+      toolCallId: "call_1",
+      meta: "list files in docs",
+      isError: false,
+      result: {
+        content: [{ type: "text", text: "brief.md\nplans.md" }],
+        details: { status: "completed", exitCode: 0, durationMs: 386 },
+      },
+    },
+  });
+
+  const rows = await h.repos.messages.listByExecution(execution.id);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].role, "toolResult");
+  assert.match(rows[0].content, /brief\.md/, "the flattened text carries the tool output");
+  const blocks = JSON.parse(rows[0].blocks);
+  assert.equal(blocks[0].type, "toolResult");
+  assert.equal(blocks[0].exitCode, 0);
+  assert.equal(blocks[0].meta, "list files in docs");
+});
+
+test("a failed tool result keeps its error flag", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "t" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sentKey = `agent:doc-worker:${task.id}:r1`.toLowerCase();
+  await h.repos.executions.update(execution.id, { session_key: sentKey });
+
+  const sink = await sinkFor(h);
+  await sink.handle("agent", {
+    runId: execution.id,
+    stream: "tool",
+    sessionKey: sentKey,
+    seq: 5,
+    data: {
+      phase: "result",
+      name: "exec",
+      isError: true,
+      result: {
+        content: [{ type: "text", text: "ls: cannot access: No such file or directory\n\n(Command exited with code 2)" }],
+        details: { exitCode: 2 },
+      },
+    },
+  });
+
+  const blocks = JSON.parse((await h.repos.messages.listByExecution(execution.id))[0].blocks);
+  assert.equal(blocks[0].isError, true, "a failed command must read as failed in the transcript");
+  assert.equal(blocks[0].exitCode, 2);
+});
+
+test("tool start/update frames and command_output deltas are not recorded", async () => {
+  // The assistant turn already carries the toolCall block; recording
+  // phase:"start" would show every tool twice, and partial deltas are noise
+  // once the aggregated result exists.
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "t" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sentKey = `agent:doc-worker:${task.id}:r1`.toLowerCase();
+  await h.repos.executions.update(execution.id, { session_key: sentKey });
+
+  const sink = await sinkFor(h);
+  await sink.handle("agent", { runId: execution.id, stream: "tool", sessionKey: sentKey, seq: 2, data: { phase: "start", name: "exec", args: { command: "ls" } } });
+  await sink.handle("agent", { runId: execution.id, stream: "tool", sessionKey: sentKey, seq: 5, data: { phase: "update", name: "exec", partialResult: {} } });
+  await sink.handle("agent", { runId: execution.id, stream: "command_output", sessionKey: sentKey, seq: 8, data: { phase: "delta", output: "partial" } });
+  await sink.handle("agent", { runId: execution.id, stream: "item", sessionKey: sentKey, seq: 3, data: { phase: "start", kind: "tool" } });
+
+  assert.equal((await h.repos.messages.listByExecution(execution.id)).length, 0);
+});

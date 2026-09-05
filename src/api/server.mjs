@@ -23,6 +23,7 @@ import {
 import { DEFAULT_BRAIN_MAP } from "../domain/brain-map.mjs";
 import { buildPlan } from "../domain/decompose.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
+import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
 import { readFileSync } from "node:fs";
@@ -1052,12 +1053,12 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         turns.push({ executionId: e.id, revision: e.revision_no, role: "operator", at: e.created_at, text: e.instruction, blocks: null });
       }
       for (const m of await repos.messages.listByExecution(e.id)) {
-        // The gateway echoes our own instruction back as `user` turns —
-        // wrapped in the execution preamble, and measured more than once per
-        // run. The operator's instruction is already rendered from
-        // executions.instruction, so any user turn containing it is an echo,
-        // not something the operator said again.
-        if (m.role === "user" && e.instruction && String(m.content).includes(String(e.instruction))) continue;
+        // The gateway echoes our own dispatch back as `user` turns — measured:
+        // the preamble wrapper arrives (sometimes more than once per run), and
+        // the echo carries only the preamble, not even the instruction text,
+        // so matching on the instruction cannot catch it. What an operator
+        // actually typed never starts with the preamble marker (D48).
+        if (m.role === "user" && isPreambleWrapped(m.content)) continue;
         let blocks = null;
         if (m.blocks) {
           try {

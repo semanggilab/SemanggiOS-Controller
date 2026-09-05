@@ -121,6 +121,32 @@ test("a finished task is deletable — the revision it could still get is what d
   assert.equal((await h.repos.tasks.delete(failed.id)).deleted, true);
 });
 
+test("blocked attempts in the history do not block deletion of a finished task", async () => {
+  // TASK-E28D15F3/TASK-BFA56024 shape: three attempts parked BLOCKED by the
+  // watchdog, the fourth completed the task. A BLOCKED execution is a parked
+  // attempt, not live work — treating it as live refused both deletions.
+  const h = await buildHarness();
+  const { project } = await seedBasics(h);
+  const task = await h.repos.tasks.create({ projectId: project.id, title: "done on the fourth try" });
+  for (const status of ["BLOCKED", "BLOCKED", "COMPLETE"]) {
+    const execution = await h.repos.executions.create({ taskId: task.id, instruction: "try" });
+    await h.repos.executions.setStatus(execution.id, status, { result: "r" });
+  }
+  await h.repos.tasks.setStatus(task.id, Status.QUEUED);
+  await h.repos.tasks.setStatus(task.id, Status.DISPATCHED);
+  await h.repos.tasks.setStatus(task.id, Status.COMPLETE);
+
+  const result = await h.repos.tasks.delete(task.id, { actor: "satria" });
+  assert.equal(result.deleted, true);
+  assert.equal(result.method, "soft", "the attempts are somebody's history, so the row stays");
+
+  // But an attempt that is genuinely live still refuses, whatever the task says.
+  const lying = await h.repos.tasks.create({ projectId: project.id, title: "disagrees with itself" });
+  const live = await h.repos.executions.create({ taskId: lying.id, instruction: "run" });
+  await h.repos.executions.setStatus(live.id, "RUNNING");
+  await assert.rejects(() => h.repos.tasks.delete(lying.id), /live execution/);
+});
+
 test("deletion refuses anything that is or could become live work", async () => {
   const h = await buildHarness();
   const { project } = await seedBasics(h);

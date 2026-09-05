@@ -749,12 +749,18 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           );
         }
         // Defence in depth: the status check above already rules out live work,
-        // but a PENDING/DISPATCHED/RUNNING execution under this task's name
-        // would mean the status and the execution disagree — and deleting on
-        // top of that disagreement would bury the evidence.
+        // but an execution actually PENDING/DISPATCHED/RUNNING under this
+        // task's name would mean the status and the execution disagree — and
+        // deleting on top of that disagreement would bury the evidence.
+        // BLOCKED executions are parked attempts, not live ones: the watchdog
+        // and the late-error path already gave up on them, and a task that
+        // reached a deletable status on a LATER attempt is proof they are
+        // history (TASK-E28D15F3/TASK-BFA56024 both completed on attempt #4
+        // behind three blocked attempts, and were refused here before this
+        // distinction existed).
         const live = await store.get(
-          `SELECT id FROM executions WHERE task_id = ? AND status NOT IN (?, ?, ?) LIMIT 1`,
-          [taskId, ExecutionStatus.COMPLETE, ExecutionStatus.FAILED, ExecutionStatus.CANCELLED],
+          `SELECT id FROM executions WHERE task_id = ? AND status IN (?, ?, ?) LIMIT 1`,
+          [taskId, ExecutionStatus.PENDING, ExecutionStatus.DISPATCHED, ExecutionStatus.RUNNING],
         );
         if (live) throw new Error(`task ${taskId} still has live execution ${live.id}; refuse to delete`);
 

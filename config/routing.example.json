@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Model routing policy (POC-4 §5.3). Two layers on purpose:",
+    "`catalog` maps a logical model name to a concrete provider/model/mode, so the",
+    "routing table stays readable and a provider swap is a one-line change.",
+    "`routes` is the operator-facing table: category -> tier -> ordered preference.",
+    "Order is preference. `fallback: none` means quota exhaustion parks the task",
+    "rather than reaching for a cheaper model (P4-03)."
+  ],
+  "catalog": {
+    "claude-opus-high": { "provider": "anthropic", "model": "claude-opus-5", "mode": "interactive" },
+    "sonnet-5-medium": { "provider": "anthropic", "model": "claude-sonnet-5", "mode": "interactive" },
+    "glm-5.2-high": { "provider": "zai", "model": "glm-5.2", "mode": "interactive" },
+    "glm-5.1-medium": { "provider": "zai", "model": "glm-5.1", "mode": "interactive" },
+    "glm-4.7": { "provider": "zai", "model": "glm-4.7", "mode": "interactive" },
+    "gemini-flash": { "provider": "google", "model": "gemini-flash", "mode": "interactive" },
+    "groq-qwen": { "provider": "groq", "model": "qwen", "mode": "interactive" },
+    "claude-code": { "provider": "claude-code", "model": "claude-code", "mode": "acp" },
+    "claude-code-batch": { "provider": "claude-code", "model": "claude-code", "mode": "batch" }
+  },
+  "routes": {
+    "architecture": {
+      "critical": { "preferred": ["claude-opus-high", "glm-5.2-high"], "fallback": "none" },
+      "normal": { "preferred": ["glm-5.2-high", "glm-5.1-medium"] }
+    },
+    "coding": {
+      "critical": { "preferred": ["claude-code"], "fallback": "none" },
+      "normal": { "preferred": ["claude-code", "glm-5.1-medium"] }
+    },
+    "documentation": {
+      "normal": { "preferred": ["glm-5.1-medium", "gemini-flash", "groq-qwen"] },
+      "low": { "preferred": ["gemini-flash", "groq-qwen"] }
+    },
+    "devops": {
+      "normal": { "preferred": ["sonnet-5-medium", "glm-5.1-medium"] },
+      "critical": { "preferred": ["sonnet-5-medium"], "fallback": "none" }
+    },
+    "review": {
+      "normal": { "preferred": ["claude-code-batch", "glm-5.1-medium"] }
+    }
+  },
+  "classMap": {
+    "L5": "critical",
+    "L4": "critical",
+    "L3": "normal",
+    "L2": "normal",
+    "L1": "low",
+    "L0": "low"
+  },
+  "defaultCategory": "documentation"
+}

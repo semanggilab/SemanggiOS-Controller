@@ -1,0 +1,80 @@
+// Composition root. Everything the controller needs is wired here so tests can
+// build the same object graph with a fake runtime and an in-memory database.
+import { openStore } from "./db/index.mjs";
+import { createEventLog } from "./domain/events.mjs";
+import { createRepositories } from "./domain/repositories.mjs";
+import { RoutingPolicy } from "./scheduler/routing.mjs";
+import { createAdmission } from "./scheduler/admission.mjs";
+import { createScheduler } from "./scheduler/scheduler.mjs";
+import { nullLogger } from "./domain/logger.mjs";
+import { createOperators } from "./domain/operators.mjs";
+import { createBrains, brainsFromRoutingConfig } from "./domain/brains.mjs";
+import { createBrainMap } from "./domain/brain-map.mjs";
+import { createThinkingLevels } from "./domain/thinking-levels.mjs";
+import { createGatewayModelsCache } from "./domain/gateway-models.mjs";
+import { shortId } from "./domain/repositories.mjs";
+
+export async function createController({
+  storeLocation = ":memory:",
+  routing = {},
+  // Resource catalogue (POC-4 §4). Seeding is idempotent and never clobbers a
+  // live availability signal: a 429 recorded at runtime is more current than a
+  // config file, so a restart must not reset a quota-exhausted model to
+  // AVAILABLE and start dispatching into a wall.
+  resources = [],
+  runtime,
+  config = {},
+  now = () => Date.now(),
+  log = nullLogger,
+} = {}) {
+  const store = openStore({ location: storeLocation });
+  const events = createEventLog(store, { now });
+  const repos = createRepositories(store, events, { now, log: log.child({ component: "repo" }) });
+  const operators = createOperators(store, { now });
+  const brains = createBrains(store, { now, shortId });
+  const brainMap = createBrainMap(store, { now });
+  const thinkingLevels = createThinkingLevels(store, { now });
+  const gatewayModels = createGatewayModelsCache(store, { now });
+  const policy = new RoutingPolicy(routing);
+
+  for (const r of resources) {
+    const existing = await repos.resources.get(r.provider, r.model);
+    if (existing) continue;
+    await repos.resources.upsert(r);
+  }
+
+  // Katalog routing di berkas adalah benih untuk tabel Brain, bukan
+  // penggantinya. Disemai sekali; sesudah itu operator yang memiliki isinya
+  // lewat halaman konfigurasi, dan berkas tidak lagi menimpanya. Kalau berkas
+  // tetap menang, setiap penyuntingan operator akan hilang pada restart
+  // berikutnya tanpa jejak.
+  const seeded = await brains.list();
+  if (seeded.length === 0) {
+    for (const seed of brainsFromRoutingConfig(routing)) {
+      try {
+        await brains.create(seed);
+      } catch (err) {
+        log.warn("brain.seed-failed", { brain: seed.name, error: String(err.message).slice(0, 160) });
+      }
+    }
+    log.info("brain.seeded", { count: (await brains.list()).length, source: "routing config" });
+  }
+
+  // Katalog thinking levels: sinkron sekali dari berkas seed di setiap start.
+  // Aman dijalankan berulang (upsert per baris) dan tidak menghapus apa pun,
+  // sehingga skrip probe yang menulis ulang berkas seed di antara restart
+  // selalu berhasil sampai ke DB tanpa langkah manual tambahan.
+  try {
+    const synced = await thinkingLevels.refresh();
+    log.info("thinking-levels.seeded", synced);
+  } catch (err) {
+    log.warn("thinking-levels.seed-failed", { error: String(err.message).slice(0, 160) });
+  }
+
+  // D42: admission resolves Brain names from the brains table (seeded above),
+  // so it is wired after seeding, with the catalog as fallback.
+  const admission = createAdmission({ repos, events, policy, brains, runtime, config, now, log: log.child({ component: "admission" }) });
+  const scheduler = createScheduler({ admission, repos, config: { log: log.child({ component: "scheduler" }), ...config }, now });
+
+  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, config, now, log, runtime };
+}

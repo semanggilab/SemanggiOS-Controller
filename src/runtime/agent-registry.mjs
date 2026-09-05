@@ -1,0 +1,164 @@
+// Resolving a routed model to a concrete OpenClaw agent.
+//
+// WHY THIS EXISTS
+//
+// There are two ways the routed model can become the model that actually runs,
+// and P4-03 — no silent downgrade — has to hold on both.
+//
+//   1. Model override at dispatch. Needs `operator.admin`; granted to the
+//      controller on 2026-08-21. The override *makes* the routed model run, so
+//      the agent's own configured model is irrelevant.
+//   2. No override. The model that runs is whatever the agent is configured
+//      with, so an agent offering something else must be refused.
+//
+// Case 2 is the dangerous one and is why this module exists. Routing picks
+// `glm-5.2-high`, dispatch goes to an agent configured `zai/glm-4.7`, the run
+// completes looking successful — having used a weaker model than the quality
+// class demanded. Nothing in the transport was catching that.
+//
+// So the caller passes `ignoreModel` to say which case it is, and when nothing
+// matches we refuse. Refusing parks the task as a resource problem an operator
+// can see and fix, which is the correct failure: the spec is explicit that
+// availability decides *dispatch or wait*, never *which model*.
+//
+// The scope is checked from the handshake rather than from configuration
+// (`hello.auth.scopes`), so a device demoted out of admin degrades into case 2
+// instead of sending overrides the gateway will reject.
+//
+// PROVISIONING STAYS A SCRIPT
+//
+// `agents.create` is admin-gated (`src/gateway/methods/core-descriptors.ts`),
+// and the controller now holds admin, so it *could* create agents at runtime.
+// It deliberately does not. Fleet shape is an operator decision with
+// consequences beyond one task, and a control plane that reshapes its own fleet
+// while scheduling is far harder to reason about after an incident. See
+// `scripts/provision-agents.mjs`.
+
+// OpenClaw clamps an unsupported reasoning effort down to the nearest level it
+// does support, silently:
+//
+//   src/auto-reply/thinking.ts  resolveSupportedThinkingLevelFromProfile()
+//     ranked.find((entry) => entry.id !== "off" && entry.rank <= requestedRank)
+//
+// So asking for "high" against a model whose profile stops at "low" runs at
+// "low" and reports success. That is the same class of failure as running the
+// wrong model — a "critical" route quietly served at reduced effort — so the
+// routed level is checked against what the agent actually advertises rather
+// than trusted to arrive intact.
+export class AgentUnavailableError extends Error {
+  constructor(message, { workspacePath, provider, model, available } = {}) {
+    super(message);
+    this.name = "AgentUnavailableError";
+    // Admission reads this to park the task rather than fail it.
+    this.retriable = true;
+    this.workspacePath = workspacePath;
+    this.provider = provider;
+    this.model = model;
+    this.available = available ?? [];
+  }
+}
+
+/** The gateway reports a configured model as a single "provider/model" string. */
+export function modelKey(provider, model) {
+  return `${provider}/${model}`;
+}
+
+/**
+ * `claude-code` runs are dispatched to an orchestrator agent that then drives
+ * the Claude harness over ACP (POC-3). The harness model is not the agent's
+ * model, so matching the agent on `claude-code/claude-code` would never
+ * succeed and would be meaningless if it did. Workspace still has to match.
+ */
+function isHarnessRouted(candidate) {
+  return candidate?.provider === "claude-code";
+}
+
+export function createAgentRegistry({ runtime, ttlMs = 30_000, now = () => Date.now() } = {}) {
+  if (!runtime) throw new Error("agent registry needs a gateway runtime");
+
+  let cache = null;
+  let cachedAt = 0;
+
+  async function list({ refresh = false } = {}) {
+    if (!refresh && cache && now() - cachedAt < ttlMs) return cache;
+    const payload = await runtime.request("agents.list", {});
+    const agents = Array.isArray(payload?.agents) ? payload.agents : [];
+    cache = agents.map((a) => ({
+      id: a.id,
+      name: a.name ?? a.id,
+      workspace: a.workspace ?? null,
+      // Shape measured on the wire: {"model":{"primary":"zai/glm-4.7"}}.
+      model: a.model?.primary ?? null,
+      // Also on the wire: thinkingLevels:[{id:"off"},{id:"low"}], thinkingDefault.
+      // The set is resolved per model, so a glm agent may offer only off/low
+      // while a Claude one offers up to high.
+      thinkingLevels: Array.isArray(a.thinkingLevels) ? a.thinkingLevels.map((t) => t.id ?? t) : null,
+      thinkingDefault: a.thinkingDefault ?? null,
+    }));
+    cachedAt = now();
+    return cache;
+  }
+
+  /**
+   * @returns {Promise<{id: string, model: string|null, workspace: string|null}|null>}
+   */
+  async function resolve({ workspacePath, candidate, preferAgentId = null, ignoreModel = false }, opts = {}) {
+    const agents = await list(opts);
+    // `ignoreModel` is set when the caller will override the model at dispatch
+    // (operator.admin). The routed model is then guaranteed by the override
+    // itself, so requiring the agent to also match would reject perfectly good
+    // agents and park work for nothing.
+    const wantModel = ignoreModel || isHarnessRouted(candidate) ? null : modelKey(candidate.provider, candidate.model);
+
+    // A preference-mode level is never sent to the gateway, so requiring the
+    // agent to advertise it would park work for a parameter nobody will use.
+    const wantThinking =
+      candidate?.thinking && (candidate?.effortMode ?? "guaranteed") === "guaranteed" ? candidate.thinking : null;
+
+    const matches = (a) => {
+      if (workspacePath && a.workspace !== workspacePath) return false;
+      if (wantModel && a.model !== wantModel) return false;
+      // Only checked when the agent tells us what it supports AND we are not
+      // overriding the model: with an override the advertised levels belong to
+      // the agent's own model, not the one that will run, so they say nothing.
+      if (wantThinking && !ignoreModel && a.thinkingLevels && !a.thinkingLevels.includes(wantThinking)) return false;
+      return true;
+    };
+
+    // An explicitly assigned worker agent wins when it satisfies the routing
+    // decision — a worker's agent_ref is an operator's deliberate pairing, and
+    // silently preferring some other equally-matching agent would make dispatch
+    // unpredictable.
+    if (preferAgentId) {
+      const preferred = agents.find((a) => a.id === preferAgentId);
+      if (preferred && matches(preferred)) return preferred;
+    }
+    return agents.find(matches) ?? null;
+  }
+
+  async function resolveOrThrow(args) {
+    // One retry against a fresh list: an operator provisioning an agent while
+    // the controller runs should not have to wait out the cache.
+    let found = await resolve(args);
+    if (!found) found = await resolve(args, { refresh: true });
+    if (found) return found;
+
+    const { workspacePath, candidate, ignoreModel } = args;
+    const agents = await list();
+    const inWorkspace = agents.filter((a) => !workspacePath || a.workspace === workspacePath);
+    const detail = inWorkspace.length
+      ? `agents in that workspace offer: ${[...new Set(inWorkspace.map((a) => a.model ?? "?"))].join(", ")}`
+      : `no agent is configured for workspace ${workspacePath}`;
+
+    const effort = candidate?.thinking ? ` at thinking="${candidate.thinking}"` : "";
+    const want = ignoreModel ? "any agent" : `an agent providing ${modelKey(candidate.provider, candidate.model)}${effort}`;
+    throw new AgentUnavailableError(
+      `no ${want} for ${workspacePath}; ` +
+        `${detail}. Provision one with scripts/provision-agents.mjs ` +
+        `rather than dispatching at a different model or reduced reasoning effort (P4-03).`,
+      { workspacePath, provider: candidate.provider, model: candidate.model, available: inWorkspace },
+    );
+  }
+
+  return { list, resolve, resolveOrThrow, invalidate: () => (cache = null) };
+}

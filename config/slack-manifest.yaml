@@ -1,0 +1,44 @@
+# Manifest aplikasi Slack untuk Semanggi.
+#
+# Tempelkan di https://api.slack.com/apps → Create New App → From an app manifest.
+# Ganti REPLACE-ME dengan hostname publik controller (lihat docs/slack-setup.md
+# soal cara mengeksposnya — sekarang controller sengaja tidak mem-publish port).
+#
+# Catatan cakupan yang disengaja:
+#   * TIDAK ada `chat:write.public` dan tidak ada `channels:history`. Aplikasi ini
+#     tidak membaca percakapan; ia hanya menjawab perintah yang ditujukan
+#     kepadanya. Izin membaca seluruh riwayat kanal jauh lebih besar dari yang
+#     dibutuhkan, dan permukaan yang bisa menghentikan pekerjaan sebaiknya
+#     meminta seminimal mungkin.
+#   * TIDAK ada Events API. Semua yang dibutuhkan datang lewat slash command dan
+#     interaktivitas, keduanya request-response dan bertanda tangan.
+display_information:
+  name: Semanggi
+  description: Kontrol antrean kerja agen — buat, pantau, hentikan, ganti model.
+  background_color: "#1f6f43"
+
+features:
+  bot_user:
+    display_name: Semanggi
+    always_online: false
+  slash_commands:
+    - command: /semanggi
+      url: https://REPLACE-ME/api/work/slack/command
+      description: Perintah controller (task, WORK, PREPARE, TASK, queue, status, stop, model, run)
+      usage_hint: "task <apa> | WORK: <apa> (dekomposisi fase) | PREPARE: <panduan> (1 task analyst → plans+tasks) | TASK: <apa> (1 task langsung) | queue | status TASK-XXXX | stop TASK-XXXX | model TASK-XXXX glm-5.2 high | run TASK-XXXX"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      # Cukup untuk mengirim notifikasi approval ke kanal tempat bot diundang.
+      - chat:write
+      - commands
+
+settings:
+  interactivity:
+    is_enabled: true
+    request_url: https://REPLACE-ME/api/work/slack/interactive
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

@@ -1,0 +1,226 @@
+{
+  "_comment": [
+    "Model routing policy (POC-4 §5.3). `catalog` memetakan nama logis ke",
+    "provider/model/mode/thinking; `routes` adalah tabel operator: kategori -> tier",
+    "-> urutan preferensi. Urutan = preferensi. `fallback: none` berarti kuota habis",
+    "memarkir task, bukan turun ke model lebih murah.",
+    "",
+    "REVISI 2026-08-21 — semua level di bawah DIUKUR dari agents.list, bukan diasumsikan:",
+    "    zai/glm-5.1                  -> off, low",
+    "    zai/glm-5.2                  -> off, low, high, max",
+    "    zai/glm-5.3                  -> off, low",
+    "    groq/qwen/qwen3.6-27b        -> off, minimal, low, medium, high",
+    "    google/gemini-3.1-flash-lite -> off, minimal, low, medium, adaptive, high",
+    "",
+    "Dua hal yang mengejutkan dan mengubah rencana:",
+    "  1. Permintaan semula 'medium dan high untuk glm' tidak bisa dipenuhi. Plugin",
+    "     zai punya isGlm52ModelId() yang hanya cocok glm-5.2*, jadi 5.1 dan 5.3",
+    "     jatuh ke profil generik (off/low). Justru Gemini dan Qwen yang menyediakan",
+    "     medium dan high.",
+    "     tier terpisah akan menjanjikan perbedaan yang tidak ada.",
+    "",
+    "OpenClaw menurunkan level tak didukung ke tetangga terdekat secara diam-diam",
+    "(resolveSupportedThinkingLevelFromProfile), jadi adapter menolak agen yang tidak",
+    "bisa mencapai level yang disebut di sini alih-alih menerima penurunan (P4-03).",
+    "  2. Bahkan pada glm-5.2, plugin memetakan low/medium/high ke reasoning_effort",
+    "     'high' yang sama di kabel; hanya 'max' yang berbeda. glm-5.2-low tetap",
+    "     disediakan atas permintaan operator — berguna sebagai label niat dan",
+    "     sebagai titik pisah kalau pemetaan plugin diperbaiki di versi berikutnya —",
+    "     tetapi jangan berharap ia lebih murah dari glm-5.2-high hari ini."
+  ],
+  "catalog": {
+    "glm-5.2-max": {
+      "provider": "zai",
+      "model": "glm-5.2",
+      "mode": "interactive",
+      "thinking": "max",
+      "effortMode": "guaranteed",
+      "effortEvidence": "terukur off 137 -> low 217 -> max 284 token keluaran (n=3), monoton"
+    },
+    "glm-5.2-high": {
+      "provider": "zai",
+      "model": "glm-5.2",
+      "mode": "interactive",
+      "thinking": "high",
+      "effortMode": "guaranteed",
+      "effortEvidence": "sama seperti glm-5.2-max: skala effort zai/glm-5.2 terbukti berlaku"
+    },
+    "glm-5.2-low": {
+      "provider": "zai",
+      "model": "glm-5.2",
+      "mode": "interactive",
+      "thinking": "low",
+      "effortMode": "guaranteed",
+      "effortEvidence": "sama seperti glm-5.2-max"
+    },
+    "glm-5.3-on": {
+      "provider": "zai",
+      "model": "glm-5.3",
+      "mode": "interactive",
+      "thinking": "low",
+      "effortMode": "guaranteed",
+      "effortEvidence": "hanya off/low yang diiklankan; dikirim, belum terukur bertingkat"
+    },
+    "glm-5.1-on": {
+      "provider": "zai",
+      "model": "glm-5.1",
+      "mode": "interactive",
+      "thinking": "low",
+      "effortMode": "guaranteed",
+      "effortEvidence": "hanya off/low yang diiklankan; dikirim, belum terukur bertingkat"
+    },
+    "gemini-flash-high": {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite",
+      "mode": "interactive",
+      "thinking": "high",
+      "effortMode": "preference",
+      "effortEvidence": "diterima semua level, TIDAK diterapkan: off 533 vs high 316 token (n=3, sebaran 9-479)"
+    },
+    "gemini-flash-medium": {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite",
+      "mode": "interactive",
+      "thinking": "medium",
+      "effortMode": "preference",
+      "effortEvidence": "sama seperti gemini-flash-high"
+    },
+    "qwen-high": {
+      "provider": "groq",
+      "model": "qwen/qwen3.6-27b",
+      "mode": "interactive",
+      "effortMode": "preference",
+      "effortEvidence": "minimal/medium/high DITERIMA RPC lalu run menggantung sampai watchdog; hanya off/low yang selesai"
+    },
+    "qwen-medium": {
+      "provider": "groq",
+      "model": "qwen/qwen3.6-27b",
+      "mode": "interactive",
+      "effortMode": "preference",
+      "effortEvidence": "sama seperti qwen-high"
+    },
+    "_acp_note": "provider claude-code + mode acp/batch adalah satu-satunya jalur harness (assertDispatchPathAllowed). acpAgent menyebut agen acpx, dan itulah yang memaku model harness.",
+    "claude-opus-high": {
+      "provider": "claude-code",
+      "model": "claude-code",
+      "mode": "acp",
+      "acpAgent": "claude-opus",
+      "effortMode": "preference",
+      "effortEvidence": "effort dipaku di semanggi-acp-claude-opus (--effort high), bukan lewat `thinking`"
+    },
+    "claude-sonnet": {
+      "provider": "claude-code",
+      "model": "claude-code",
+      "mode": "acp",
+      "acpAgent": "claude-sonnet",
+      "effortMode": "preference",
+      "effortEvidence": "effort mengikuti default Claude Code; wrapper tidak menyetelnya"
+    },
+    "claude-code-batch": {
+      "provider": "claude-code",
+      "model": "claude-code",
+      "mode": "batch",
+      "acpAgent": "claude-sonnet",
+      "effortMode": "preference",
+      "effortEvidence": "sama seperti claude-sonnet"
+    },
+    "_groq_note": "Sengaja TANPA level thinking. Diukur: gateway memvalidasi `thinking` terhadap zai/glm-4.7 — model default — bukan terhadap model agen, sehingga setiap level bertingkat pada groq ditolak: 'Thinking level \"medium\" is not supported for zai/glm-4.7'. Agennya sendiri mengiklankan off/minimal/low/medium/high, jadi iklan itu tidak bisa dipercaya untuk provider ini. Lihat D21."
+  },
+  "routes": {
+    "architecture": {
+      "critical": {
+        "preferred": [
+          "claude-opus-high",
+          "glm-5.2-max"
+        ],
+        "fallback": "none"
+      },
+      "normal": {
+        "preferred": [
+          "glm-5.2-high",
+          "glm-5.3-on"
+        ]
+      }
+    },
+    "coding": {
+      "critical": {
+        "preferred": [
+          "claude-opus-high"
+        ],
+        "fallback": "none"
+      },
+      "normal": {
+        "preferred": [
+          "claude-sonnet",
+          "glm-5.2-high"
+        ]
+      }
+    },
+    "documentation": {
+      "normal": {
+        "preferred": [
+          "glm-5.2-low",
+          "glm-5.3-on",
+          "gemini-flash-medium",
+          "qwen-medium"
+        ]
+      },
+      "low": {
+        "preferred": [
+          "gemini-flash-medium",
+          "qwen-medium",
+          "glm-5.1-on"
+        ]
+      }
+    },
+    "devops": {
+      "critical": {
+        "preferred": [
+          "claude-sonnet"
+        ],
+        "fallback": "none"
+      },
+      "normal": {
+        "preferred": [
+          "claude-sonnet",
+          "glm-5.2-high"
+        ]
+      }
+    },
+    "analysis": {
+      "critical": {
+        "preferred": [
+          "glm-5.2-max",
+          "gemini-flash-high"
+        ],
+        "fallback": "none"
+      },
+      "normal": {
+        "preferred": [
+          "gemini-flash-high",
+          "qwen-high",
+          "glm-5.2-high"
+        ]
+      }
+    },
+    "review": {
+      "normal": {
+        "preferred": [
+          "claude-code-batch",
+          "qwen-high",
+          "glm-5.3-on"
+        ]
+      }
+    }
+  },
+  "classMap": {
+    "L5": "critical",
+    "L4": "critical",
+    "L3": "normal",
+    "L2": "normal",
+    "L1": "low",
+    "L0": "low"
+  },
+  "defaultCategory": "documentation",
+  "_effort_note": "effortMode membedakan level yang TERUKUR mengubah perilaku (guaranteed, dikirim sebagai parameter `thinking`) dari yang hanya niat (preference, TIDAK dikirim). Dua sebab berbeda menghasilkan preference: provider menerima level lalu mengabaikannya (gemini), atau menerimanya lalu menggantung (groq/qwen minimal|medium|high). Untuk jalur ACP, effort dipaku lewat perintah wrapper per-model dan tidak pernah lewat dispatch. Diukur 2026-08-30 terhadap gateway 2026.7.1."
+}

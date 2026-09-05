@@ -1,0 +1,296 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Semanggi Work Controller API",
+    "version": "0.1.0",
+    "description": "Private admission-control API (POC-4 §7.1). Exposed only behind the edge proxy at /api/work/*. No response body ever contains secret material (P4-13)."
+  },
+  "servers": [{ "url": "http://semanggi-controller:8080" }],
+  "security": [{ "bearerAuth": [] }],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer", "description": "Swarm secret semanggi_controller_token" }
+    },
+    "schemas": {
+      "TaskStatus": {
+        "type": "string",
+        "enum": [
+          "CREATED", "QUEUED",
+          "WAIT_DEP", "WAIT_HUMAN", "WAIT_WORKSPACE", "WAIT_RESOURCE",
+          "WAIT_QUOTA", "WAIT_CONCURRENCY", "WAIT_WORKER", "WAIT_RUNTIME",
+          "DISPATCHED", "RUNNING", "COMPLETE", "BLOCKED", "FAILED", "RESUMABLE", "CANCELLED"
+        ],
+        "description": "Admission failure yields a WAIT_* state, never FAILED (spec induk §5.1)."
+      },
+      "Task": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "projectId": { "type": "string" },
+          "parentTaskId": { "type": ["string", "null"] },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "priority": { "type": "integer", "minimum": 0, "maximum": 4, "description": "P0 Emergency .. P4 Background" },
+          "effectivePriority": { "type": "integer", "description": "priority after any live expedite boost" },
+          "expedited": { "type": "boolean" },
+          "expediteUntil": { "type": ["integer", "null"] },
+          "qualityClass": { "type": "string", "enum": ["L0", "L1", "L2", "L3", "L4", "L5"] },
+          "status": { "$ref": "#/components/schemas/TaskStatus" },
+          "waitReason": { "type": ["string", "null"] },
+          "workerId": { "type": ["string", "null"] },
+          "sessionPolicy": { "type": "string", "enum": ["CONTINUE", "FORK", "FRESH"] },
+          "approvalLevel": { "type": "string", "enum": ["L0", "L1", "L2", "L3"] },
+          "workspacePath": { "type": ["string", "null"] },
+          "nextRetryAt": { "type": ["integer", "null"] },
+          "createdAt": { "type": "integer" },
+          "updatedAt": { "type": "integer" }
+        }
+      },
+      "Execution": {
+        "type": "object",
+        "description": "One attempt. Immutable once finalized.",
+        "properties": {
+          "id": { "type": "string" },
+          "taskId": { "type": "string" },
+          "revisionNo": { "type": "integer" },
+          "sessionMode": { "type": "string", "enum": ["CONTINUE", "FORK", "FRESH"] },
+          "sessionRef": { "type": ["string", "null"], "description": "OpenClaw session key" },
+          "runtimeRef": { "type": ["string", "null"], "description": "AgentOS dispatch id" },
+          "sandboxRef": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "mode": { "type": ["string", "null"], "enum": ["interactive", "batch", "acp", null] },
+          "tokensInput": { "type": "integer" },
+          "tokensOutput": { "type": "integer" },
+          "cost": { "type": "number" },
+          "costUnit": { "type": "string", "description": "tokens for subscription plans; USD only where metered" },
+          "status": { "type": "string" },
+          "result": { "type": ["string", "null"] },
+          "finalized": { "type": "boolean" }
+        }
+      },
+      "Approval": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "taskId": { "type": "string" },
+          "executionId": { "type": ["string", "null"] },
+          "level": { "type": "string", "enum": ["L0", "L1", "L2", "L3"] },
+          "question": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } },
+          "decision": { "type": ["string", "null"], "enum": ["APPROVE", "REJECT", "MODIFY", null] },
+          "note": { "type": ["string", "null"] },
+          "decidedBy": { "type": ["string", "null"] },
+          "decidedAt": { "type": ["integer", "null"] }
+        }
+      },
+      "Resource": {
+        "type": "object",
+        "properties": {
+          "provider": { "type": "string" },
+          "model": { "type": "string" },
+          "concurrencyLimit": { "type": "integer" },
+          "quotaPolicy": { "type": "object" },
+          "availability": { "type": "string", "enum": ["AVAILABLE", "QUOTA_EXHAUSTED", "UNAVAILABLE"] },
+          "creditClass": { "type": "string" },
+          "nextAvailableAt": { "type": ["integer", "null"] }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": { "error": { "type": "string" }, "detail": { "type": ["string", "null"] } }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "BadRequest": {
+        "description": "Invalid input; nothing was applied",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "Unknown resource",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  },
+  "paths": {
+    "/api/work/health": {
+      "get": {
+        "summary": "Liveness probe",
+        "description": "Unauthenticated by design: the Swarm healthcheck runs without a token and the payload carries no state.",
+        "security": [],
+        "responses": { "200": { "description": "ok" } }
+      }
+    },
+    "/api/work/tasks": {
+      "post": {
+        "summary": "Create a task",
+        "description": "Queues the task and triggers a scheduling pass, so the response already reflects the admission outcome.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["projectId", "title"],
+                "properties": {
+                  "projectId": { "type": "string" },
+                  "title": { "type": "string" },
+                  "description": { "type": "string" },
+                  "priority": { "type": "integer" },
+                  "qualityClass": { "type": "string" },
+                  "workerId": { "type": "string" },
+                  "sessionPolicy": { "type": "string" },
+                  "modelPolicy": {
+                    "type": "object",
+                    "properties": {
+                      "category": { "type": "string" },
+                      "class": { "type": "string" },
+                      "preferred": { "type": "array", "items": { "type": "string" } }
+                    }
+                  },
+                  "approvalLevel": { "type": "string" },
+                  "workspacePath": { "type": "string" },
+                  "dependsOn": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Created", "content": { "application/json": { "schema": { "type": "object", "properties": { "task": { "$ref": "#/components/schemas/Task" } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "get": {
+        "summary": "List tasks",
+        "parameters": [
+          { "name": "status", "in": "query", "schema": { "$ref": "#/components/schemas/TaskStatus" } },
+          { "name": "project", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Tasks" }, "401": { "$ref": "#/components/responses/Unauthorized" } }
+      }
+    },
+    "/api/work/tasks/{id}": {
+      "get": {
+        "summary": "Task detail with executions, approvals and dependencies",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": {
+            "description": "Detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "task": { "$ref": "#/components/schemas/Task" },
+                    "executions": { "type": "array", "items": { "$ref": "#/components/schemas/Execution" } },
+                    "approvals": { "type": "array", "items": { "$ref": "#/components/schemas/Approval" } },
+                    "dependencies": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/work/tasks/{id}/revisions": {
+      "post": {
+        "summary": "Create a revision",
+        "description": "Does not mutate history: previous executions stay frozen and a new one is created on the next dispatch.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["session_mode"],
+                "properties": {
+                  "session_mode": { "type": "string", "enum": ["CONTINUE", "FORK", "FRESH"] },
+                  "instruction": { "type": "string" },
+                  "actor": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Re-queued" }, "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/work/tasks/{id}/expedite": {
+      "post": {
+        "summary": "Temporarily boost a task",
+        "description": "TTL-bounded. The stored priority is never rewritten (P4-05).",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["ttl"], "properties": { "ttl": { "type": "integer", "description": "milliseconds" }, "actor": { "type": "string" } } } } }
+        },
+        "responses": { "200": { "description": "Boosted" }, "400": { "$ref": "#/components/responses/BadRequest" } }
+      }
+    },
+    "/api/work/tasks/{id}/cancel": {
+      "post": {
+        "summary": "Cancel a task",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Cancelled" }, "400": { "$ref": "#/components/responses/BadRequest" } }
+      }
+    },
+    "/api/work/approvals/{id}/decide": {
+      "post": {
+        "summary": "Close an approval",
+        "description": "decided_by is mandatory: an approval that cannot be attributed is not an approval. COMMENT is not accepted here.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["decision", "decided_by"], "properties": { "decision": { "type": "string", "enum": ["APPROVE", "REJECT", "MODIFY"] }, "decided_by": { "type": "string" }, "note": { "type": "string" } } } } }
+        },
+        "responses": { "200": { "description": "Decided" }, "400": { "$ref": "#/components/responses/BadRequest" } }
+      }
+    },
+    "/api/work/approvals/{id}/comment": {
+      "post": {
+        "summary": "Add a note without closing the approval",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Noted" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/work/queue": {
+      "get": {
+        "summary": "Queue snapshot with wait reasons and ETA",
+        "description": "etaAt is a forecast for planning only; it never feeds an admission decision.",
+        "responses": { "200": { "description": "Snapshot" } }
+      }
+    },
+    "/api/work/resources": {
+      "get": { "summary": "Provider quota and concurrency", "responses": { "200": { "description": "Resources" } } },
+      "post": {
+        "summary": "Register or update a resource",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Resource" } } } },
+        "responses": { "200": { "description": "Upserted" }, "400": { "$ref": "#/components/responses/BadRequest" } }
+      }
+    },
+    "/api/work/leases": { "get": { "summary": "Workspace leases", "responses": { "200": { "description": "Leases" } } } },
+    "/api/work/projects": {
+      "get": { "summary": "Projects", "responses": { "200": { "description": "Projects" } } },
+      "post": { "summary": "Create a project", "responses": { "200": { "description": "Created" } } }
+    },
+    "/api/work/workers": {
+      "get": { "summary": "Workers", "responses": { "200": { "description": "Workers" } } },
+      "post": { "summary": "Create a worker", "responses": { "200": { "description": "Created" } } }
+    },
+    "/api/work/stats": {
+      "get": {
+        "summary": "Observed cost and duration per model",
+        "description": "Input for the empirical routing evaluation (POC-4 §12.4).",
+        "responses": { "200": { "description": "Stats" } }
+      }
+    }
+  }
+}

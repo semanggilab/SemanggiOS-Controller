@@ -1,0 +1,70 @@
+{
+  "_comment": [
+    "Resource catalogue (POC-4 §4). Seeded at startup; the API can update any row",
+    "afterwards, and quota signals from live 429s overwrite next_available_at.",
+    "",
+    "Two credit classes, because they fail differently:",
+    "  metered      — pay per token; concurrency is the real constraint.",
+    "  subscription — a rolling plan window is the constraint. concurrency_limit",
+    "                 is a safety valve, not the quota. POC-3 E8 observed Claude",
+    "                 Pro answering rateLimitType=five_hour with an absolute",
+    "                 resetsAt, which is what next_available_at is filled from.",
+    "",
+    "claude-code is its own resource class per §4 and is reachable only through",
+    "the POC-3 ACP or batch path (enforced by assertDispatchPathAllowed).",
+    "glm-4.7 pensiun 2026-08-21; opus/sonnet lewat jalur ACP claude-code. Kunci Gemini dan Groq sudah masuk sebagai Swarm secret dengan file-source SecretRef dan terverifikasi menjawab, jadi keduanya AVAILABLE."
+  ],
+  "resources": [
+    {
+      "provider": "claude-code",
+      "model": "claude-code",
+      "creditClass": "subscription",
+      "windowKind": "five_hour",
+      "concurrencyLimit": 1,
+      "quotaPolicy": {
+        "unit": "tokens",
+        "_unit_note": "POC-3 E8: the CLI reports total_cost_usd (0.2385 for one batch run) but on a Pro plan that maps to no invoice — it is an API price estimate. Tokens against the plan window are what bind.",
+        "cacheReadCounts": true,
+        "_cache_note": "E8 measured input 8 / output 1303 / cache_read 92663 / cache_creation 31860 on a single batch run. Cache read was ~12,000x fresh input, so any model that counts only input+output understates cost by two orders of magnitude.",
+        "observedBatchRun": {
+          "tokensInput": 8,
+          "tokensOutput": 1303,
+          "tokensCacheRead": 92663,
+          "tokensCacheCreation": 31860,
+          "billableTokens": 125834,
+          "reportedUsd": 0.2385
+        }
+      }
+    },
+    {
+      "provider": "zai",
+      "model": "glm-5.1",
+      "creditClass": "metered",
+      "concurrencyLimit": 4
+    },
+    {
+      "provider": "zai",
+      "model": "glm-5.2",
+      "creditClass": "metered",
+      "concurrencyLimit": 2
+    },
+    {
+      "provider": "zai",
+      "model": "glm-5.3",
+      "creditClass": "metered",
+      "concurrencyLimit": 2
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite",
+      "creditClass": "metered",
+      "concurrencyLimit": 4
+    },
+    {
+      "provider": "groq",
+      "model": "qwen/qwen3.6-27b",
+      "creditClass": "metered",
+      "concurrencyLimit": 4
+    }
+  ]
+}

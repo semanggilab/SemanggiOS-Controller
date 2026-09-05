@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "Measured thinking/reasoning vocabulary per (provider, model), from live",
+    "probes against the gateway (2026.7.1) — see docs/decisions.md D31 and the",
+    "readiness report for the raw n=3 runs this is transcribed from.",
+    "",
+    "This file is NOT re-derived automatically: the gateway has no RPC that",
+    "answers 'what thinking levels does this model support' (config.schema.lookup",
+    "returns 'path not found' for it, and models.list only reports a boolean",
+    "`reasoning` flag). Getting this list means actually dispatching a run at",
+    "each level and reading what came back — expensive, and something you do",
+    "occasionally with a deliberate probe script, not on every page load.",
+    "",
+    "`effortMode` mirrors the Brain vocabulary: guaranteed = measured to change",
+    "output; preference = accepted but ignored, or actively unsafe to send.",
+    "Refreshing this catalog (POST /api/work/gateway/thinking-levels/refresh)",
+    "re-reads this file into the database; it does not re-run the probes."
+  ],
+  "models": [
+    {
+      "provider": "zai",
+      "model": "glm-5.1",
+      "levels": ["off", "low"],
+      "effortMode": "guaranteed",
+      "evidence": "only off/low ever advertised by agents.list for this model"
+    },
+    {
+      "provider": "zai",
+      "model": "glm-5.2",
+      "levels": ["off", "low", "high", "max"],
+      "effortMode": "guaranteed",
+      "evidence": "n=3: off 137 -> low 217 -> max 284 output tokens, monotonic"
+    },
+    {
+      "provider": "zai",
+      "model": "glm-5.3",
+      "levels": ["off", "low"],
+      "effortMode": "guaranteed",
+      "evidence": "only off/low ever advertised by agents.list for this model"
+    },
+    {
+      "provider": "zai",
+      "model": "glm-4.7",
+      "levels": ["off"],
+      "effortMode": "guaranteed",
+      "evidence": "onboarded on this cluster but not yet probed at non-off levels"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite",
+      "levels": ["off", "minimal", "low", "medium", "adaptive", "high"],
+      "effortMode": "preference",
+      "evidence": "n=3: off 533 vs high 316 output tokens, spread 9-479 — accepted, ignored"
+    },
+    {
+      "provider": "groq",
+      "model": "qwen/qwen3.6-27b",
+      "levels": ["off", "minimal", "low", "medium", "high"],
+      "effortMode": "preference",
+      "evidence": "DANGEROUS: minimal/medium/high accepted at the RPC then the run hangs until the watchdog reclaims it. Only off/low ever complete."
+    }
+  ]
+}

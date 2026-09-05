@@ -1,0 +1,15 @@
+{
+  "name": "semanggi-work-controller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Semanggi Work Controller — admission control plane over AgentOS/OpenClaw (POC-4).",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node --test \"tests/unit/*.test.mjs\"",
+    "start": "node src/main.mjs"
+  },
+  "dependencies": {}
+}

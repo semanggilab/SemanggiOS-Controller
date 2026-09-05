@@ -1,0 +1,360 @@
+// Brain: kombinasi (provider, model, thinking, effortMode) yang diberi nama.
+//
+// Katalog routing selama ini adalah daftar internal di `config/routing.json`.
+// Mengangkatnya jadi konsep bernama membuat dua hal mungkin yang sebelumnya
+// tidak: operator bisa mengkonfigurasinya lewat halaman, dan role AgentOS bisa
+// dipetakan kepadanya.
+//
+// KENAPA BRAIN MELEKAT PADA AGEN, BUKAN PADA DISPATCH
+//
+// Terukur pada gateway 2026.7.1 dengan device ber-scope operator.admin:
+//
+//   agents.create { model: [...] }  →  at /model: must be string
+//   agent { agentId: "…glm-5-1", model: "zai/glm-5.2" }
+//                                  →  Model override "zai/glm-5.2" is not
+//                                     allowed for agent "semanggi-glm-5-1"
+//
+// Satu agen membawa tepat satu model, dan gateway menolak menjalankan model di
+// luar itu — bahkan untuk admin. Jadi Brain TIDAK bisa dipasangkan ke agen mana
+// pun saat dispatch. Pooler memilih agen yang sudah membawa Brain yang tepat;
+// ia tidak pernah mengonfigurasi ulang agen (D35).
+/** Level yang menghubungkan profil project dengan kandidat Brain. */
+export const Level = Object.freeze({ LOW: "low", NORMAL: "normal", CRITICAL: "critical" });
+
+/**
+ * Profil project AgentOS → level default.
+ *
+ * Ini hanya DEFAULT. Pemetaan per role (§4.0 spec) menimpanya, dan override per
+ * task menimpa keduanya — kebutuhan project berubah di tengah jalan, dan
+ * konfigurasi global tidak boleh mengunci itu.
+ */
+export const PROFILE_TO_LEVEL = Object.freeze({
+  balanced: Level.NORMAL,
+  fast: Level.LOW,
+  quality: Level.CRITICAL,
+});
+
+export function levelForProfile(profile) {
+  return PROFILE_TO_LEVEL[String(profile ?? "").toLowerCase()] ?? Level.NORMAL;
+}
+
+/**
+ * Pemetaan bawaan (template × AgentOS profile × role) → level.
+ *
+ * AgentOS Level (fast/balanced/quality) adalah sumbu eksplisit: project
+ * (software, fast) dan (software, quality) adalah dua project yang BERBEDA
+ * kebutuhannya, jadi default role yang sama boleh berbeda tergantung Level —
+ * bukan cuma override admin yang berbeda. `null` = "ikut profil project"
+ * (levelForProfile). Seluruh kombinasi ditetapkan eksplisit supaya tidak ada
+ * role yang levelnya ditebak saat runtime (spec induk §4.0).
+ *
+ * Aturan penurunannya (empat golongan role, spec §4.0):
+ *   penentu arah  (analyst, architect, strategist)  → selalu critical
+ *   produksi      (builder, researcher, writer)     → normal, naik di quality
+ *   penilai       (reviewer, learner, analyst riset) → naik satu tingkat
+ *   verifikasi    (tester, browser)                 → ikut profil
+ */
+export const PROFILES = Object.freeze(["fast", "balanced", "quality"]);
+
+export const DEFAULT_ROLE_LEVELS = Object.freeze({
+  software: Object.freeze({
+    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL }),
+    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL }),
+    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL }),
+  }),
+  frontend: Object.freeze({
+    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL, browser: Level.LOW }),
+    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL, browser: Level.NORMAL }),
+    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL, browser: Level.CRITICAL }),
+  }),
+  backend: Object.freeze({
+    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL }),
+    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL }),
+    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL }),
+  }),
+  research: Object.freeze({
+    fast: Object.freeze({ researcher: Level.NORMAL, writer: Level.NORMAL, reviewer: Level.NORMAL, analyst: Level.NORMAL }),
+    balanced: Object.freeze({ researcher: Level.NORMAL, writer: Level.NORMAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
+    quality: Object.freeze({ researcher: Level.CRITICAL, writer: Level.CRITICAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
+  }),
+  content: Object.freeze({
+    fast: Object.freeze({ strategist: Level.CRITICAL, writer: Level.NORMAL, reviewer: Level.NORMAL, analyst: Level.NORMAL }),
+    balanced: Object.freeze({ strategist: Level.CRITICAL, writer: Level.NORMAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
+    quality: Object.freeze({ strategist: Level.CRITICAL, writer: Level.CRITICAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
+  }),
+});
+
+/**
+ * Daftar role sebuah template, apa pun profilenya.
+ *
+ * Himpunan role per template identik di semua profile (hanya levelnya yang
+ * berbeda), tapi union tetap dihitung supaya menambah role pada satu profile
+ * di kemudian hari tidak membuat role itu hilang dari halaman.
+ */
+export function rolesForTemplate(template) {
+  const byProfile = DEFAULT_ROLE_LEVELS[String(template ?? "").toLowerCase()] ?? {};
+  const roles = new Set();
+  for (const mapping of Object.values(byProfile)) for (const role of Object.keys(mapping)) roles.add(role);
+  return [...roles];
+}
+
+/**
+ * Role yang TIDAK disediakan template AgentOS mana pun.
+ *
+ * Diperiksa langsung di `workspace-presets.ts`: sepuluh role tersedia
+ * (Builder, Reviewer, Tester, Learner, Browser Agent, Research Lead, Archivist,
+ * Strategist, Writer, Analyst) dan **tidak ada Architect**. Kata "architect"
+ * muncul tepat sekali di seluruh berkas itu — di dalam *deskripsi* Learner pada
+ * template backend, bukan sebagai role.
+ *
+ * Itu bukan kelalaian AgentOS melainkan asumsi templatenya: `docs/architecture.md`
+ * yang di-scaffold berjudul "Current shape · Dependencies · Risks" — deskriptif
+ * atas yang sudah ada, bukan preskriptif atas yang akan dibangun. Template itu
+ * untuk memelihara sistem, bukan merancangnya.
+ *
+ * Skill Builder bahkan menjauhkannya dari pekerjaan desain secara eksplisit:
+ * *"Prefer direct code or artifact changes over speculative planning."*
+ *
+ * `role` di AgentOS bertipe `string` bebas (bukan union), jadi operator boleh
+ * menambahkan Architect sendiri lewat UI dengan preset `worker`. Tabel di atas
+ * sudah menyiapkan levelnya supaya begitu role itu ada, ia langsung dirutekan
+ * ke Brain critical — kesalahan desain adalah yang paling mahal dibatalkan.
+ */
+export const ROLES_NOT_IN_AGENTOS = Object.freeze(["architect"]);
+
+/**
+ * Level efektif untuk sebuah (template, role, profile, project).
+ *
+ * Urutan resolusi — yang lebih spesifik menang:
+ *   1. override MILIK PROJECT (modal Project Role Level menyimpan snapshot
+ *      penuh; begitu disimpan, project itu tidak lagi mengikuti global)
+ *   2. override admin global untuk (template, profile, role)
+ *   3. default bawaan (template, profile, role) — tabel di atas
+ *   4. level profil project (levelForProfile) untuk role yang null
+ */
+export function resolveLevel({ template, role, profile, overrides = {}, projectOverrides = {} } = {}) {
+  const key = String(role ?? "").toLowerCase();
+  const fromProject = projectOverrides?.[key];
+  if (fromProject) return fromProject;
+  const fromOperator = overrides?.[key];
+  if (fromOperator) return fromOperator;
+  const fromTemplate = DEFAULT_ROLE_LEVELS[String(template ?? "").toLowerCase()]?.[String(profile ?? "").toLowerCase()]?.[key];
+  return fromTemplate ?? levelForProfile(profile);
+}
+
+const slug = (s) => String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+export function createBrains(store, { now, shortId }) {
+  /** Bentuk yang dipakai routing dan registry agen. */
+  const present = (row) => ({
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    provider: row.provider,
+    model: row.model,
+    thinking: row.thinking,
+    effortMode: row.effort_mode,
+    effortEvidence: row.effort_evidence,
+    mode: row.mode,
+    acpAgent: row.acp_agent,
+    level: row.level,
+    category: row.category,
+    enabled: Boolean(row.enabled),
+  });
+
+  const brains = {
+    async create({
+      name,
+      description = "",
+      provider,
+      model,
+      thinking = null,
+      // Default `guaranteed`: entri yang belum dikarakterisasi adalah klaim yang
+      // harus diuji, bukan alasan menahan parameter (D31).
+      effortMode = "guaranteed",
+      effortEvidence = null,
+      mode = "interactive",
+      acpAgent = null,
+      level = Level.NORMAL,
+      category = null,
+      enabled = true,
+    }) {
+      if (!name) throw new Error("brain needs a name");
+      if (!provider || !model) throw new Error("brain needs provider and model");
+      if (!["guaranteed", "preference"].includes(effortMode)) {
+        throw new Error(`effortMode must be guaranteed or preference, got "${effortMode}"`);
+      }
+      // Sebuah klaim tanpa alasan tercatat tidak bisa ditinjau ulang saat
+      // provider berubah — dan justru itulah yang paling sering terjadi.
+      if (effortMode === "preference" && !effortEvidence) {
+        throw new Error(`brain "${name}" is marked preference but carries no effortEvidence`);
+      }
+      if (!Object.values(Level).includes(level)) {
+        throw new Error(`level must be one of ${Object.values(Level).join("|")}, got "${level}"`);
+      }
+      const id = shortId("BRN");
+      await store.run(
+        `INSERT INTO brains (id, name, description, provider, model, thinking, effort_mode,
+                             effort_evidence, mode, acp_agent, level, category, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, slug(name), description, provider, model, thinking, effortMode, effortEvidence,
+         mode, acpAgent, level, category, enabled ? 1 : 0, now(), now()],
+      );
+      return brains.get(id);
+    },
+
+    /** Menerima id maupun nama — operator menyebut nama, kode menyebut id. */
+    async get(idOrName) {
+      const row =
+        (await store.get(`SELECT * FROM brains WHERE id = ?`, [idOrName])) ??
+        (await store.get(`SELECT * FROM brains WHERE name = ?`, [slug(idOrName)]));
+      return row ? present(row) : null;
+    },
+
+    async list({ level, category, enabledOnly = false } = {}) {
+      const where = [];
+      const params = [];
+      if (level) { where.push("level = ?"); params.push(level); }
+      if (category) { where.push("category = ?"); params.push(category); }
+      if (enabledOnly) where.push("enabled = 1");
+      const rows = await store.all(
+        `SELECT * FROM brains ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY level, name`,
+        params,
+      );
+      return rows.map(present);
+    },
+
+    async update(id, patch = {}) {
+      const before = await brains.get(id);
+      if (!before) throw new Error(`unknown brain ${id}`);
+      const sets = [];
+      const params = [];
+      const put = (col, val) => { sets.push(`${col} = ?`); params.push(val); };
+
+      if (patch.description !== undefined) put("description", patch.description);
+      if (patch.thinking !== undefined) put("thinking", patch.thinking);
+      if (patch.level !== undefined) {
+        if (!Object.values(Level).includes(patch.level)) throw new Error(`invalid level "${patch.level}"`);
+        put("level", patch.level);
+      }
+      if (patch.category !== undefined) put("category", patch.category);
+      if (patch.enabled !== undefined) put("enabled", patch.enabled ? 1 : 0);
+      if (patch.effortMode !== undefined) {
+        if (!["guaranteed", "preference"].includes(patch.effortMode)) {
+          throw new Error(`effortMode must be guaranteed or preference`);
+        }
+        const evidence = patch.effortEvidence ?? before.effortEvidence;
+        if (patch.effortMode === "preference" && !evidence) {
+          throw new Error("marking a brain as preference requires effortEvidence");
+        }
+        put("effort_mode", patch.effortMode);
+      }
+      if (patch.effortEvidence !== undefined) put("effort_evidence", patch.effortEvidence);
+
+      // Jalur harness ACP: `acpAgent` menyebut agen acpx yang memaku model
+      // harness (routing.json "_acp_note"). Ia hanya masuk akal untuk
+      // provider claude-code — provider lain dicapai lewat cocok model, jadi
+      // acpAgent di sana adalah konfigurasi yang tidak akan pernah dipakai.
+      // Provider sendiri tidak bisa diubah (lihat di bawah), maka pemeriksaan
+      // ini memakai baris yang ada.
+      if (patch.mode !== undefined) {
+        if (!["interactive", "acp", "batch"].includes(patch.mode)) {
+          throw new Error(`mode must be interactive, acp or batch, got "${patch.mode}"`);
+        }
+        put("mode", patch.mode);
+      }
+      if (patch.acpAgent !== undefined) {
+        const agent = patch.acpAgent === null ? null : String(patch.acpAgent).trim();
+        if (agent) {
+          if (before.provider !== "claude-code") {
+            throw new Error(`acpAgent only applies to claude-code brains, not provider "${before.provider}"`);
+          }
+          put("acp_agent", agent);
+        } else {
+          put("acp_agent", null);
+        }
+      }
+
+      // Provider dan model TIDAK bisa diubah. Mengubahnya berarti Brain ini
+      // menunjuk agen yang berbeda, dan setiap agen yang sudah dibuat untuknya
+      // menjadi salah tanpa ada yang tahu. Buat Brain baru.
+      if (patch.provider !== undefined || patch.model !== undefined) {
+        throw new Error(
+          "provider and model are immutable: an agent is provisioned per (project, role, brain), " +
+            "so changing them would silently orphan every agent already created for this brain",
+        );
+      }
+      if (!sets.length) return before;
+      put("updated_at", now());
+      params.push(id);
+      await store.run(`UPDATE brains SET ${sets.join(", ")} WHERE id = ?`, params);
+      return brains.get(id);
+    },
+
+    /**
+     * Kandidat untuk sebuah level, yang aktif saja.
+     *
+     * Tanpa `category`, SELURUH brain pada level itu adalah kandidat. Versi
+     * pertama menulis `category IS NULL OR category = ?` dengan parameter null —
+     * dan di SQL `category = NULL` tidak pernah benar, sehingga setiap brain
+     * yang punya kategori tersaring habis dan daftarnya selalu kosong.
+     * Kategori adalah penyempit opsional, bukan syarat.
+     */
+    async candidatesFor({ level, category = null }) {
+      const rows = category
+        ? await store.all(
+            `SELECT * FROM brains WHERE enabled = 1 AND level = ?
+               AND (category = ? OR category IS NULL) ORDER BY name`,
+            [level, category],
+          )
+        : await store.all(`SELECT * FROM brains WHERE enabled = 1 AND level = ? ORDER BY name`, [level]);
+      return rows.map(present);
+    },
+  };
+
+  return brains;
+}
+
+/**
+ * Mengubah katalog routing lama menjadi Brain.
+ *
+ * Dipakai sekali saat migrasi, dan idempoten supaya bisa dijalankan ulang.
+ * Level diturunkan dari `routes`: sebuah entri katalog yang muncul di
+ * `routes.<kategori>.critical` adalah Brain level critical.
+ */
+export function brainsFromRoutingConfig(routing = {}) {
+  const catalog = routing.catalog ?? {};
+  const levelOf = new Map();
+  for (const [category, classes] of Object.entries(routing.routes ?? {})) {
+    for (const [routeClass, route] of Object.entries(classes ?? {})) {
+      const names = [...(route.preferred ?? []), ...(Array.isArray(route.fallback) ? route.fallback : [])];
+      for (const n of names) {
+        // Level tertinggi menang: sebuah Brain yang dipakai di jalur critical
+        // adalah Brain critical, meski ia juga muncul di jalur normal.
+        const rank = { low: 0, normal: 1, critical: 2 };
+        const prev = levelOf.get(n);
+        if (!prev || rank[routeClass] > rank[prev.level]) levelOf.set(n, { level: routeClass, category });
+      }
+    }
+  }
+
+  const out = [];
+  for (const [name, entry] of Object.entries(catalog)) {
+    if (name.startsWith("_") || !entry || typeof entry !== "object") continue;
+    const placed = levelOf.get(name);
+    out.push({
+      name,
+      description: entry.effortEvidence ? `Diukur: ${String(entry.effortEvidence).slice(0, 160)}` : "",
+      provider: entry.provider,
+      model: entry.model,
+      thinking: entry.thinking ?? null,
+      effortMode: entry.effortMode ?? "guaranteed",
+      effortEvidence: entry.effortEvidence ?? null,
+      mode: entry.mode ?? "interactive",
+      acpAgent: entry.acpAgent ?? null,
+      level: placed?.level ?? Level.NORMAL,
+      category: placed?.category ?? null,
+    });
+  }
+  return out;
+}

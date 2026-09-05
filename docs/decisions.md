@@ -1,0 +1,1514 @@
+# Architecture decisions — POC-4 dan fase UI
+
+Each entry records a choice the spec left open, or a place where implementation forced a decision. POC-4 §9 requires the storage choice to be recorded in the implementation PR; the rest are here for the same reason.
+
+**Cakupan:** D1–D35 adalah POC-4 (controller, scheduler, routing, Slack, Brain). D36–D41 adalah fase UI — halaman Semanggi di dalam AgentOS, setelan project, probe level empiris, transkrip yang lengkap, dan jalur build image.
+
+**Cara membaca:** judul yang ~~dicoret~~ adalah keputusan yang **sudah tidak berlaku** — isinya sengaja dipertahankan karena alasan sebuah keputusan gugur seringkali lebih berguna daripada keputusan penggantinya. Judul tanpa coretan berlaku sampai ada entri yang membatalkannya secara eksplisit.
+
+| Keputusan | Digantikan oleh | Kenapa |
+|---|---|---|
+| ~~D12-original~~ (write path lewat loopback forwarder) | D12, D13 | Loopback forwarder memalsukan pemeriksaan asal; dispatch pindah ke Gateway WS langsung |
+| ~~D8~~ (kontrak dispatch AgentOS sengaja tidak diimplementasikan) | D12, D13 | Jalur itu tidak lagi ditunggu — dispatch tidak pernah lewat AgentOS |
+| ~~D17~~ sebagian ("Gemini tidak melapor usage") | D19 | Gemini melapor; permintaannya yang tidak pernah mengirim `stream_options.include_usage` |
+| ~~D30~~ sebagian (dua janji upgrade 7.1) | D34 | `workspaceDir` dan `agentRuntime.acp.agent` terbukti tidak ada di 7.1 |
+
+## D1 — SQLite now, Postgres-portable by construction
+
+§3 allows "PostgreSQL (atau SQLite untuk lab)". SQLite via Node's built-in `node:sqlite` was chosen for the lab stack:
+
+- The controller is `replicas: 1` by mandate, so there is exactly one writer. The main reason to reach for Postgres — concurrent writers — does not apply.
+- Adding a Postgres service means another Swarm service, another NFS volume, and another secret, on a cluster whose manager node had 5.6 GB free during POC-3.
+- `node:sqlite` is in the standard library, so the controller has **zero runtime dependencies**. For a service that holds scheduling state and an audit trail, that is a meaningful reduction in supply-chain surface.
+
+Portability was paid for up front rather than promised: the store interface in `src/db/index.mjs` is **async** even though the SQLite driver is synchronous, and every query uses positional `?` placeholders in one adapter. Swapping in Postgres means writing one driver, not editing call sites.
+
+Known cost: `node:sqlite` is flagged experimental on Node 22 (stable on 24, which the gateway image already ships). Revisit before production.
+
+## D2 — Nine waiting states, not three
+
+Spec induk §5.1 names `WAIT_RESOURCE | WAIT_DEP | WAIT_HUMAN`. POC-4 §5.1 defines nine admission checks and P4-02 requires each blocker to be distinguishable. Implementing only three states would make P4-02 untestable and would leave an operator staring at `WAIT_RESOURCE` with no way to tell "no policy" from "quota exhausted" from "provider saturated".
+
+The waiting states are therefore the pipeline's nine. The invariant both specs actually share — *a blocked admission is `WAIT_*`, never `FAILED`* — is enforced in the transition table: there is no edge from `QUEUED` or any `WAIT_*` state to `FAILED`.
+
+## D3 — Rejected approval yields BLOCKED, not FAILED or CANCELLED
+
+§6 says an operator may APPROVE / REJECT / MODIFY / COMMENT. A rejection means the work is intact but must not proceed — that is `BLOCKED`, which already has the recovery path the spec wants (`BLOCKED → RESUMABLE → QUEUED` via a revision). `FAILED` would misreport a deliberate human decision as a malfunction.
+
+`COMMENT` was made a separate endpoint that does **not** close the approval. A comment is a question or a note; treating it as a decision would resume a task nobody actually approved.
+
+`decided_by` is mandatory. An approval that cannot be attributed is not an approval.
+
+## D4 — Expedite is a TTL boost with a tie-break, never a priority rewrite
+
+P4-05 requires the boost to lapse. Priority is left untouched and only the selector reads `expedite_until`, so expiry needs no cleanup job — the boost simply stops applying.
+
+The boost is two priority levels. That can land on a tie with an existing task at the same effective priority, which would make an operator's expedite invisible. So a *live* expedite also wins the tie-break ahead of FIFO. An operator who expedites a task expects it to move.
+
+## D5 — Weighted fair queueing by virtual finish time, with P0 as the one exception
+
+§5.2 requires weighted fairness combined with priority and forbids starving low-weight projects. Implemented as classic WFQ: the next project served is the one whose next dispatch lands earliest on the weighted timeline. A weight-5 project gets ~5× the throughput of a weight-1 project, and the weight-1 project is always served because its virtual time stops advancing while it waits.
+
+P0 Emergency bypasses fairness entirely. That is a deliberate hole in the fairness guarantee: "Emergency" that queues behind fair-share accounting is not an emergency. It is bounded by P0 being operator-assigned.
+
+Fairness counters are derived from the execution table inside a rolling window, not held in memory, so a restarted controller resumes the same fairness position (P4-04 + P4-11).
+
+## D6 — Lease is peeked at step 3 and taken at step 9
+
+§5.1 puts the workspace lease check at step 3, before quota and concurrency. Taking the lease there would let a task hold a workspace while it waits on quota five steps later, blocking every other task on that path for no benefit. So step 3 *peeks* and step 9 *acquires*; losing an acquisition race falls back to `WAIT_WORKSPACE`.
+
+Expired leases are reclaimed on acquisition, and the previous owner's execution is marked `BLOCKED` (§5.5) rather than silently overwritten.
+
+## D7 — Immutability enforced by the database
+
+P4-01 requires an append-only EventLog and immutable executions. Both are enforced by SQL triggers, so a bug in application code — or a future maintainer with a repository method — cannot violate them. Finalization stamps `finalized_at`; from then on every UPDATE to that row aborts.
+
+Audit payloads are passed through a redactor before insertion. An audit trail that can absorb a token is a secret leak with good intentions.
+
+## ~~D8 — The AgentOS dispatch contract is left unimplemented on purpose~~ *(tidak lagi berlaku — D12/D13)*
+
+§11 butir 1 requires the assignment/work-item API to be verified against AgentOS 0.7.6 before code is written against it, and POC-1 §17 forbids speculative configuration. Rather than invent a plausible endpoint, `createAgentOSRuntime` requires the path and payload builder to be configured and throws `RuntimeContractUnverifiedError` naming the checklist item otherwise.
+
+This is the difference between "not built yet" and "built wrong and passing tests against my own invention".
+
+**Kenapa gugur:** kontrak itu tidak lagi ditunggu. Dispatch tidak pernah lewat AgentOS sama sekali (D12), melainkan langsung ke Gateway WS (D13). `createAgentOSRuntime` tetap ada sebagai pembaca `/api/snapshot` untuk reconciler — **baca saja**. Prinsip yang melahirkannya tetap berlaku dan justru terbukti berulang kali sesudahnya (D34, D38, D41): jangan menulis kode terhadap kontrak yang belum diverifikasi dengan mengirim permintaan.
+
+## D9 — JSON routing policy instead of YAML
+
+§9 shows `quota.yaml`. JSON is used instead so the controller keeps zero dependencies (Node cannot parse YAML natively, and a YAML parser is a dependency for a config file read once at boot). The structure is identical and converts mechanically. `tests/unit/routing-config.test.mjs` validates the shipped example, so a broken policy fails at `npm test` rather than as an unexplained `WAIT_RESOURCE` in production.
+
+## D10 — Dependency edges are a table
+
+§4 lists a dependency *check* but no dependency storage. Modelled as a relational edge table rather than a JSON blob on the task, so the admission query stays relational and a dependency cycle is visible to the database.
+
+## D11 — Retrofit of POC-2/POC-3 findings (2026-08-19)
+
+Phases 1–3 were written against assumptions the cluster later contradicted. Four changes, each traceable to a measurement:
+
+**Cache tokens are first-class.** POC-3 E8 measured one batch run at 8 fresh input tokens against 92,663 cache reads. `Execution` gained `tokens_cache_read` and `tokens_cache_creation`, and `billableTokens()` includes them. A model counting only input+output was wrong by ~95×. `recordUsage()` normalises both observed shapes — the batch JSON (`input_tokens`/`cache_read_input_tokens`) and the ACP `usage_update` (`used`/`size`/`cost`) — so nothing downstream needs to know which path ran.
+
+**`session_ref` means the harness session, not an OpenClaw key.** `sessions_spawn resumeSessionId` cannot work on the acpx backend, so CONTINUE/FORK resume through ACP `session/load` and the controller is what remembers which session to continue. `executions.create` inherits the most recent non-null `session_ref` for CONTINUE/FORK; FRESH takes whatever the runtime reports for the new session. Dispatch no longer overwrites an inherited ref — doing so would silently turn a resume into a fresh run, the exact false positive POC-3 E3 caught.
+
+**Quota is a scheduling fact, not an error.** `applyQuotaSignal()` turns a 429 into `QUOTA_EXHAUSTED` with the provider's absolute `resetsAt`, the window kind (`five_hour`), and the verbatim message for audit. Dispatch failures carrying a quota signal park the task on `WAIT_QUOTA` with a real ETA instead of `WAIT_RUNTIME`. `credit_class: subscription` now means "a rolling plan window is the constraint", with concurrency as a safety valve rather than the quota.
+
+**`RUNNING → WAIT_HUMAN` is legal.** The permission interposer holds a tool call mid-turn, so a live run can be waiting on a person. Approval returns it to `RUNNING`; rejection moves it to `BLOCKED`. Re-admitting the task would be wrong — there is nothing new to dispatch.
+
+## D12 — CORRECTED: a loopback forwarder does NOT unlock the AgentOS write path
+
+**The first version of this decision was wrong, and the integration test caught it.** It is left here rather than deleted because the mistake is instructive.
+
+The reasoning was: writes need a loopback origin, so forward a local port to the AgentOS service and speak to `127.0.0.1`. Unit tests passed. Against the real AgentOS it failed with a *different* error than the one seen in §11:
+
+```
+403 {"error":"Unsafe remote mutation blocked. Forwarded non-local clients
+     cannot use AgentOS write APIs.","code":"unsafe-forwarded-client"}
+```
+
+Reading the guard settles it. There are two gates in sequence:
+
+```js
+if (observedHosts.find(notLocal))           → needs AGENTOS_TRUSTED_OPERATOR_ORIGINS (exact HTTPS origin)
+if (xForwardedFor.split(",").find(notLocal)) → "unsafe-forwarded-client"
+```
+
+A TCP forwarder fixes the Host and Origin headers but cannot change the socket peer, and AgentOS derives `x-forwarded-for` from it. So the request still arrives as a remote client. **Loopback has to be real, not simulated** — the POC-1 proxy works because it runs *inside* the AgentOS container, where the peer genuinely is 127.0.0.1.
+
+Confirmed by diagnosis: sending `x-forwarded-for: 127.0.0.1` explicitly makes the login return 200. That is not adopted. It defeats precisely the control that exists to stop remote writes, and a control plane whose write path depends on misreporting its own identity is not one worth building.
+
+### Options, for an operator decision
+
+| Option | Cost | Notes |
+|---|---|---|
+| **Gateway WS instead of AgentOS HTTP** | Medium | Spec §7.2 already permits it ("AgentOS API **atau** Gateway WS dengan token"). The Gateway is built for token auth from other services and POC-1/2 proved it works. Trade-off: dispatch no longer flows through AgentOS |
+| TLS + `AGENTOS_TRUSTED_OPERATOR_ORIGINS` | High | The officially supported remote path. Needs a certificate, an exact host match, and `x-forwarded-proto: https` from a real terminator |
+| Upstream request to AgentOS | Unknown | A service-token write path. `agentos_api_token` looks intended for this but instance protection and the origin guard override it |
+| Spoof `x-forwarded-for` | Low | **Not recommended.** Works, and defeats the control |
+
+Until this is decided, `src/runtime/agentos.mjs` remains correct for everything it can do — health, authenticated reads, snapshot, quota parsing — and dispatch is honestly blocked rather than quietly relying on a bypass.
+
+## ~~D12-original — The AgentOS write path goes through a loopback forwarder~~ *(tidak lagi berlaku — D12, D13)*
+
+POC-4 §11 verified from a separate service on the overlay: `GET /api/operations` returns 200, `POST /api/mission` returns **403** — *"Unsafe remote mutation blocked. Use same-origin localhost or configure an exact HTTPS origin"*. Safe methods bypass the origin guard; writes do not.
+
+The alternative is TLS plus `AGENTOS_TRUSTED_OPERATOR_ORIGINS` with an exact host match, for traffic that never leaves the overlay. Instead the controller forwards a loopback port to the AgentOS service — the same pattern POC-1 already uses for AgentOS → Gateway, so this is an established shape rather than a new one. The port binds to `127.0.0.1` only, because it grants operator-scope access.
+
+Auth is three layers, all verified: session login (`POST /api/auth/login` → `agentos_instance_session` cookie), then that cookie plus `Authorization: Bearer` and `x-agentos-api-token` on every call. A bare token is refused with `401 instance-auth-required`.
+
+## D13 — Gateway WS as the dispatch transport (RESOLVED)
+
+Spec §7.2 permits Gateway WS as the dispatch transport, and D12 made it the recommended one. Implemented in `src/runtime/gateway-ws.mjs` and taken to the live gateway. Three things were learned that no amount of reading would have settled:
+
+**1. A root-level `nonce` is rejected.** The first live handshake returned
+`INVALID_REQUEST "unexpected property 'nonce'"`. `ConnectParamsSchema` is a closed object and the connect-challenge nonce belongs inside `device`, which a token-auth client does not send. Removed.
+
+**2. The run method is not `agent.run` on the pinned version.** The 2026.8.1 source calls it `agent.run`; the pinned 2026.6.11 gateway advertises a bare **`agent`** among its 191 methods and no `agent.run` at all. The adapter now negotiates from `hello.features.methods` — newest name first, falling back — and refuses to connect if neither exists. Hardcoding either name would have failed silently against the other version, which is exactly the class of mistake the earlier POC-3 archaeology was about.
+
+**3. Token auth grants role but not scopes.** Handshake succeeds (protocol 4), `hello.auth` reports `{"role":"operator","scopes":[]}`, and dispatch is refused with `missing scope: operator.write`. Requesting `operator.admin` changes nothing: scopes come from **device auth** (`deviceAuthScope`), not from the shared token.
+
+This is the same wall POC-1 hit with AgentOS, and it was solved the same way there: a paired device identity. `docs/poc2-evidence.md` records it — identity files copied into the AgentOS runtime produced `authStatus.native.ok=true` with full operator scopes.
+
+So the controller needs to pair as a device: generate an Ed25519 identity, sign the connect challenge nonce, and have an operator approve the pairing once. That is a deliberate trust decision — the controller becomes a recognised operator device — and it needs a human, so it is the natural stopping point rather than something to improvise.
+
+**Status: RESOLVED 2026-08-21.** The operator approved the pairing, and the thing pairing blocked has now been demonstrated. With the device identity at `/opt/semanggi/volumes/shared/service/semanggios/controller/device-identity.json`, the handshake returns
+
+```
+{"role":"operator","scopes":["operator.read","operator.write"],"deviceToken":"wTHM…Cnmw"}
+```
+
+and three real dispatches ran to completion on the cluster. Gateway log, unedited:
+
+```
+16:34:32 [provider-transport-fetch] response provider=zai model=glm-4.7 status=200 elapsedMs=94144
+16:34:32 D13-OK
+16:34:32 [agent] run D13-LIVE-1787304777268#1 ended with stopReason=stop
+```
+
+`D13-OK` was the exact string the instruction asked for, so this is the model executing the prompt — not merely a queue accepting a frame.
+
+**Idempotency confirmed by the gateway, not just by us.** Re-sending the same `idempotencyKey` returned the *same* `runId` with `status:"in_flight"` instead of `"accepted"`. P4-11's guarantee is therefore enforced on both sides.
+
+## D14 — The `agent` params are narrower than the newer schema, in two ways that matter
+
+D13 negotiated the *method* name correctly but still sent the newer schema's *fields*. The first live dispatch failed with `unexpected property 'cwd'`. Rather than guess again, the accepted field set was measured directly against the pinned gateway by probing one field at a time under a single shared `idempotencyKey` — idempotency means the probes validate without each one becoming a billed model turn.
+
+Accepted: `message`, `agentId`, `idempotencyKey` (**required**), `sessionKey`, `label`, `deliver`, `timeout`, `thinking`.
+
+Two rejections carry design weight:
+
+**1. `cwd` and `workspaceDir` are refused outright.** The workspace is a property of the *agent*, not of the dispatch. The controller therefore cannot aim a task at an arbitrary directory through this method; a per-task workspace requires creating a workspace+agent pair, which is exactly what POC-2 did. `workspacePath` stays in the dispatch handoff for the AgentOS adapter and for the approval bridge, but the Gateway adapter ignores it.
+
+**2. `provider`/`model` return "provider/model overrides are not authorized" under `operator.write`.** This one contradicts a design assumption: §5.3 routing picks a *model* per task, but this transport cannot apply that choice — the agent's configured model wins. Three ways out, none free: escalate to `operator.admin` (a broader trust grant than dispatch needs), pre-create one agent per model and let routing select the *agent* (more config, but the scope stays narrow), or accept per-agent models and drop per-task model routing. Recommended: the second. Flagged rather than silently worked around; `allowModelOverride` defaults to `false` so the intent stays visible in code.
+
+**3. `agent.wait` is a live attach, not a result store.** Called after a run had already finished, it answered `{"status":"timeout","timeoutPhase":"gateway_draining"}` — the run had completed 5 minutes earlier with `stopReason=stop`. So completion cannot be read back from the gateway after the fact, which independently justifies the snapshot-polling reconciler: a controller that restarts mid-run must recover state from its own store plus a snapshot, never by asking the gateway what happened.
+
+### D14 addendum — what "one agent per model" actually costs, and what an upgrade would and would not fix
+
+Two questions came back on the recommendation, and both have measurable answers.
+
+**An agent is a config entry, not a running process.** `openclaw agents list` returns identity, workspace, agent dir, model and routing rules — declarative state, zero cost while idle. What *is* sticky is the **session sandbox**: one container per session key, created on first use and left running afterwards. Measured on the cluster:
+
+```
+openclaw-sbx-agent-poc2-e1-poc2-e1-worker-mai-4d63e385
+  Status: running   Age: 3d   Idle: 3m 53s
+  Session: agent:poc2-e1-poc2-e1-worker:main
+```
+
+So one-agent-per-model costs N config entries (free) plus up to N idle containers *once each has actually been used*, reclaimed by `openclaw sandbox prune`. The bound is the number of models — a handful — not the number of tasks. That is a far smaller footprint than the phrase "an agent per model" suggests.
+
+One caveat the same check surfaced: `poc3-e1-poc3-e1-worker` carries `sandbox: {"mode":"off"}`, which is why the D13 dispatches produced no sandbox at all. Correct for POC-3, where the ACP wrapper supplies its own Docker isolation — but it means the D13 runs say nothing about sandbox behaviour, and should not be cited as if they did.
+
+**Upgrading to 2026.8.1 fixes one of the two problems, not both.**
+
+*Workspace: fixed.* `AgentRunRequest` in the 2026.8.1 source declares both `cwd?: string` and `workspaceDir?: string`. The rejection really is a version gap.
+
+*Model override: not fixed.* The gate is authorization, not schema, and it lives in 2026.8.1 itself — `src/gateway/agent-turn/agent-request-preflight.ts:214`, reached from
+
+```ts
+function canClientUseModelOverride(client) {
+  return hasAdminScope(client) || client?.internal?.allowModelOverride === true;
+}
+// src/gateway/operator-scopes.ts: export const ADMIN_SCOPE = "operator.admin"
+```
+
+Upgrading changes nothing here. Only `operator.admin` opens it, and that grant is much broader than dispatch needs. The two problems are therefore independent and should be decided separately.
+
+*Upgrade risk is lower than expected on the wire, higher off it.* `PROTOCOL_VERSION = 4` and `MIN_CLIENT_PROTOCOL_VERSION = 4` in 2026.8.1, and the running 2026.6.11 gateway already reports protocol 4 — no wire break. The method rename `agent` → `agent.run` is already handled by the negotiation added in D13. The actual cost sits elsewhere: the runbook treats AgentOS and OpenClaw as a single compatibility change set, so an upgrade drags in the custom gateway image (`ARG OPENCLAW_IMAGE`), the ACP wrapper and interposer, and a re-run of the POC-1..3 evidence.
+
+## D15 — The controller has no completion signal, and that is what blocks P4-10
+
+Found by deploying the controller and running a real task end to end. The dispatch works:
+
+```
+22:57:21 [model-fetch] start  provider=zai model=glm-5.1
+22:57:27 [model-fetch] response status=200 elapsedMs=5851
+22:57:27 P410-FRESH-OK
+22:57:27 [agent] run TASK-097B0C51#8 ended with stopReason=stop
+```
+
+A task created through the controller API was routed, matched to an agent, dispatched over the Gateway WS and answered correctly by glm-5.1. What does **not** work is the other direction: the execution stays `DISPATCHED` forever, because nothing tells the controller the run ended.
+
+Three sources were considered and none of them closes it on the pinned version:
+
+| Source | Why not |
+|---|---|
+| `agent.wait` | A live attach, not a result store (D14). After the fact it answers `timeout/gateway_draining` for a run that finished cleanly. |
+| AgentOS `/api/snapshot` | Covers AgentOS dispatch records. Runs started directly on the Gateway do not appear there. |
+| Gateway events | `sessions.subscribe` / `sessions.messages.subscribe` exist and are `operator.read`. **Not yet wired.** |
+
+The consequence is not cosmetic. A task stuck in `DISPATCHED` cannot take a revision — `illegal task transition DISPATCHED -> QUEUED` — so **CONTINUE, FORK and FRESH cannot be exercised through the controller at all**. P4-10 is therefore blocked on this, not on session handling: the session plumbing itself was fixed and unit-tested (`sessionRef` now records the gateway's `sessionKey`, and an inherited ref still wins).
+
+### RESOLVED IN PRINCIPLE 2026-08-21 — `sessions.subscribe` carries everything needed
+
+Tested against the live gateway rather than assumed. One `sessions.subscribe` (no params; it answers `{"subscribed":true}`) is enough — `sessions.messages.subscribe` is a different thing and requires a `key`.
+
+The decisive frame, captured verbatim while a real run finished:
+
+```json
+{"type":"event","event":"agent","payload":{
+  "runId":"d15-1787330757967",
+  "stream":"lifecycle",
+  "data":{"phase":"end","startedAt":1787330758327,"endedAt":1787330764140,
+          "aborted":false,"stopReason":"stop"},
+  "sessionKey":"agent:semanggi-glm-5-1:d15",
+  "sessionId":"4ca451bf-9980-4691-ac50-783aefb99b78"}}
+```
+
+**`runId` is the `idempotencyKey` we sent, which is the execution id.** That is the missing link: the completion signal ties itself back to the execution without any correlation table.
+
+What the stream provides, measured:
+
+| Need | Where it comes from |
+|---|---|
+| Terminal signal | `agent` / `stream:"lifecycle"` / `data.phase:"end"`, with `stopReason` and `aborted` |
+| Which execution | `payload.runId` — equals our `idempotencyKey` |
+| Durable session identity | `payload.sessionId` (a real UUID; better than `sessionKey`, which is only our own naming) |
+| Start/end timing | `data.startedAt` / `data.endedAt` |
+| Token usage | `session.message` events carry `usage` alongside `provider` and `model` |
+| Progress, if wanted | `agent` / `stream:"assistant"` deltas and `chat` `state:"final"` |
+
+Also observed: `sessions.changed` fires on `phase:"start"` and `phase:"end"`, and `health`/`tick`/`presence` arrive continuously — useful as a liveness signal for the subscription itself.
+
+**Implementation shape.** Subscribe once after connect; on `phase:"end"` map `runId` → execution and drive it terminal from `stopReason` (`aborted:true` → CANCELLED, non-`stop` → FAILED, else COMPLETE); record usage from `session.message`; store `sessionId` as `session_ref`. Keep the snapshot reconciler as the slow path, because a subscription that drops between reconnects will miss events — the stream is the fast path, never the only path. The adapter now takes an `onEvent` hook for exactly this, and the listener is wrapped so a fault in it cannot tear down the socket.
+
+This must land before the Slack surface: an operator interface over a control plane that never sees work finish would be actively misleading.
+
+### D15 addendum — implemented, and one thing it exposed
+
+Shipped as `src/runtime/session-events.mjs`, wired in `main.mjs`, and verified on the cluster: a task created through the API now reaches `COMPLETE` on its own.
+
+```
+[session-events] subscribed to session events: {"subscribed":true}
+[session-events] run TASK-41497D65#1 -> COMPLETE
+```
+
+The subscription is re-established on a timer, not just at boot: the gateway forgets it when the socket drops, and a controller that subscribed once would look healthy while receiving nothing. The snapshot reconciler stays as the slow path, so every handler is safe to re-run — a replayed completion against a finalised execution is ignored, not an error.
+
+**What it exposed: FORK and FRESH were not branching.** With completion working, P4-10 could finally run, and all four revisions came back sharing one session id. The cause was ours: `sessionKey` was `agent:<agent>:<task>`, identical for every revision, and on this gateway the key *is* the conversation — there is no `sessionId` parameter to attach to. So the key now encodes lineage (`…:s<sessionRef>` when resuming, `…:r<revision>` otherwise), and FORK no longer inherits a ref.
+
+Re-run live, five revisions on one task:
+
+```
+FRESH    rev 1  -> 5fac2dcc-9389-4786-a5d5-fbc950949390
+CONTINUE rev 2  -> 5fac2dcc-…   (same)
+CONTINUE rev 3  -> 5fac2dcc-…   (same)
+FORK     rev 4  -> fde7eeb8-358f-473a-b175-810e47ddb6b9
+FRESH    rev 5  -> 58fe0666-b711-4506-bbcd-9dd5ef523aa7
+```
+
+**A limitation worth stating plainly: FORK starts an empty conversation, not a copy.** Nothing in this gateway version can clone a session, so "fork" means "new conversation, recorded as descending from the parent" — the parent's history does not come along. Calling that a fork without the caveat would overstate it. If branching with history matters, it needs either an upstream capability or an application-level replay of the parent transcript into the new session.
+
+**Still open: token usage is not being captured.** The completed executions show `tokens 0`. The `session.message` events carry `usage`, but evidently not in the shape or with the `runId` the sink expects. The plumbing (`recordUsage`, cache-aware `billableTokens`, cost in tokens) is tested and correct; the extraction is not yet matching the live payload. This makes cost accounting blind for gateway-dispatched runs and should be the next thing fixed.
+
+## D16 — Reasoning effort for the Claude harness is a different lever entirely
+
+The gateway's `thinking` parameter governs the OpenClaw agent. The Claude harness is a separate process behind ACP and never sees it, so `claude-opus-high` in the routing catalog was, until now, a name with nothing behind it.
+
+Measured inside the sandbox image:
+
+```
+--effort <level>   Effort level for the current session (low, medium, high, xhigh, max)
+```
+
+So opus and sonnet **do** support `medium` and `high` — the tiers the GLM models could not offer. The binary also contains an `"effort"` settings key, and the wrapper already writes `settings.json` into the harness `$HOME` for the Bash gate, so that is where effort now goes.
+
+acpx gives each ACP agent one `command` string and no per-agent environment or arguments, so the mechanism is one thin command per (model, effort) pair — `semanggi-acp-claude-opus` (high) and `-sonnet` (medium) — each setting `SEMANGGI_HARNESS_MODEL` and `SEMANGGI_HARNESS_EFFORT` before handing off to the single real wrapper, which keeps the sandbox, permission gate and mount contract in one place. Verified on the cluster; the wrapper writes:
+
+```json
+{ "effort": "high", "permissions": { "ask": ["Bash"], "defaultMode": "default" } }
+```
+
+**One more quiet-downgrade trap, closed.** An unrecognised effort is not an error — the CLI warns `Unknown --effort value 'x' — ignoring it and using the default effort` and continues. A typo would therefore reduce effort silently, so the wrapper validates the value against `low|medium|high|xhigh|max` and refuses to start otherwise.
+
+**Not yet proven:** that Claude Code honours the `effort` *settings key* as opposed to only the `--effort` flag. The key and `effortLevel` both appear in the binary, which is suggestive, not conclusive. What is confirmed is that the file is written correctly and the harness starts. Proving the effort actually applied needs a run whose output distinguishes the tiers, and that is worth doing before treating `claude-opus-high` as a quality guarantee.
+
+## D17 — Token accounting: two bugs, and one thing the providers simply do not tell us
+
+`tokens 0` on every completed execution turned out to be two mistakes of mine, both from writing the handler against an assumed payload rather than a measured one.
+
+**1. Wrong correlation key.** `session.message` carries **no `runId` at all** — it has `sessionKey`, `sessionId`, `messageId`, `messageSeq`. Usage was being filed under `payload.runId`, which was always `undefined`, so nothing was ever stored. Usage is now keyed by `sessionKey`, and the lifecycle `end` event (which carries both `runId` and `sessionKey`) closes the loop.
+
+**2. Wrong field names.** None of the Anthropic-style spellings appear on this wire:
+
+```json
+"usage": { "input": 10157, "output": 37, "totalTokens": 10322,
+           "cacheRead": 128, "cacheWrite": 0, "cost": { "total": 0.01236712 } }
+```
+
+(10157 + 37 + 128 = 10322, so `totalTokens` already includes cache reads.) The `input_tokens`/`cache_read_input_tokens` spellings are kept as a fallback because that is genuinely what `claude -p --output-format json` reports on the batch path — two real producers, two shapes.
+
+Verified live after the fix:
+
+```
+status: COMPLETE | model zai/glm-5.1
+tokens: in 8631  out 60  cacheRead 1664
+billable: 10355  | cost 0.010996 usd
+```
+
+**3. Not a bug: some providers report nothing.** `google/gemini-3.1-flash-lite` through the OpenAI-compatible path returns a real frame carrying zeros —
+`{"input":0,"output":0,"totalTokens":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}` — while `zai/glm-5.1` on the same socket reports real numbers. Recording those zeros would stamp the execution with a confident "0 tokens, $0.00", which reads as *this run was free* rather than *this provider does not tell us*. An all-zero frame is therefore ignored, leaving the fields at their defaults so the difference stays visible.
+
+The practical consequence: **quota and cost forecasting is accurate for zai, and blind for Gemini** (Groq untested). Any budgeting built on these numbers has to treat a zero as unknown, not as free. Fixing it properly means either a provider that reports usage or counting tokens ourselves at the adapter.
+
+**Cost unit follows the credit class.** For metered providers the provider's own `cost.total` is recorded in USD; for a subscription plan it is ignored and cost stays in tokens, because POC-3 E8 established that a Pro plan's USD figure corresponds to no invoice. Tokens remain what the quota window counts either way.
+
+## D18 — Reasoning effort for opus/sonnet: the flag approach is the only one available
+
+Asked directly: can the controller send effort per dispatch, or is `-opus-high` → (model opus, effort high via settings) the mechanism?
+
+**The flag approach is the mechanism, and it is not a workaround — on this version it is the only path.** Three things were tested:
+
+| Attempt | Result |
+|---|---|
+| `thinking` on the dispatch | Reaches the **OpenClaw agent**, never the harness. The harness is a separate process behind ACP. |
+| `agents.create` / `agents.update` with `agentRuntime` | `INVALID_REQUEST "unexpected property 'agentRuntime'"` |
+| `config set agents.list[N].agentRuntime` | `Config validation failed: Unrecognized key: "agentRuntime"` |
+
+`AgentRuntimeAcpConfig` with `acp.agent` exists in the 2026.8.1 source, which is why it looked available — it is simply not in 2026.6.11. So per-agent harness selection is a version away, not a scope or API problem.
+
+What works today: one thin command per (model, effort) pair, each setting `SEMANGGI_HARNESS_MODEL` and `SEMANGGI_HARNESS_EFFORT` before handing off to the single real wrapper, which writes them into the harness `settings.json`. Verified: the wrapper produces `{"effort":"high", "permissions":{...}}`.
+
+**The honest caveat about controller control.** The controller picks a *logical model* (`claude-opus-high`), and the catalog names an `acpAgent` for it — but on this gateway nothing binds that name to the dispatch. Which ACP agent actually runs is decided by `acp.defaultAgent` (global) or by the orchestrator naming it when it spawns the session, which is instruction-level and unenforceable. So `acpAgent` in the catalog is **declared intent, not enforced routing**, and it should be read that way until the gateway is upgraded. Enforcing it is exactly what `agentRuntime.acp.agent` would give us.
+
+## D19 — Mengapa GLM butuh plugin, Gemini dan Groq tidak
+
+Pertanyaan operator, dan menjawabnya membalik satu kesimpulan D17.
+
+**Provider generik vs provider berplugin.** OpenClaw punya transport `openai-completions` bawaan. Apa pun yang bicara dialek itu cukup didaftarkan sebagai entri konfigurasi:
+
+```jsonc
+"models": { "providers": { "groq": { "baseUrl": "https://api.groq.com/openai/v1", "apiKey": {...} } } }
+```
+
+Itulah yang dipakai Gemini (lewat endpoint `/v1beta/openai`) dan Groq. Tidak ada plugin, dan keduanya berjalan.
+
+**Yang disumbang plugin zai** (diperiksa di `dist/index.js` yang terpasang):
+
+| Sumbangan | Bukti |
+|---|---|
+| Mendaftarkan `zai` sebagai provider dikenal | satu `registerProvider` |
+| Katalog model + metadata | `glm-4.7`, `glm-4.7-flash`, `glm-4.7-flashx`, `glm-5`, `glm-5.2` beserta `contextWindow` |
+| Parameter khas GLM | `reasoning_effort`, plus `mapThinkingLevelToZaiReasoningEffort()` |
+
+Yang **tidak** disumbangnya: parsing usage (kata "usage" hanya muncul sekali di seluruh bundle). Itu milik inti.
+
+**Konsekuensi yang berlawanan dengan dugaan.** Karena katalog plugin berhenti di `glm-5.2`, model `glm-5.1` dan `glm-5.3` tidak dikenalinya dan jatuh ke profil generik `off/low`. Sementara Gemini dan Qwen — yang justru *tanpa* plugin — mendapat profil dasar penuh `off/minimal/low/medium/adaptive/high`. Jadi di sini plugin **mempersempit**, bukan memperkaya: ia membatasi level ke yang bisa dipetakan ke `reasoning_effort` GLM.
+
+### Koreksi terhadap D17: Gemini bukan tidak melapor — permintaannya yang tidak dikirim
+
+D17 menyimpulkan "provider ini tidak memberi tahu". Salah. Diuji langsung ke endpoint:
+
+```
+Gemini non-stream : "usage":{"completion_tokens":4,"prompt_tokens":2,"total_tokens":6}   ← ada
+Gemini stream     : chunk terakhir hanya `data: [DONE]`                                   ← tidak ada
+Gemini stream + stream_options.include_usage : "usage":{...}                              ← ADA
+Groq  stream      : usage disertakan apa adanya                                           ← ada
+```
+
+Gateway memakai streaming. Dan di dalam dist-nya:
+
+```js
+if (compat.supportsUsageInStreaming) params.stream_options = { include_usage: true };
+```
+
+`supportsUsageInStreaming` ditentukan heuristik `provider-model-compat`, yang mematikannya untuk endpoint kustom non-OpenAI — persis kategori `google` kita. Jadi OpenClaw memang **tidak pernah meminta** usage-nya.
+
+Bisa dikonfigurasi, dan sudah diperbaiki:
+
+```jsonc
+"models": { "providers": { "google": { "models": [
+  { "id": "gemini-3.1-flash-lite", "name": "Gemini 3.1 Flash Lite",
+    "compat": { "supportsUsageInStreaming": true } } ] } } }
+```
+
+Terbukti hidup sesudahnya: `google/gemini-3.1-flash-lite … in 10804 out 12 billable 10816`. (Cost tetap 0 karena lapisan compat Gemini hanya mengembalikan jumlah token, bukan angka biaya — dan token yang menjadi dasar kuota, jadi itu memadai.)
+
+**Groq tidak perlu flag ini** — streamnya sudah menyertakan usage. Saya sempat menambahkannya juga, dan itu **merusak**: mendeklarasikan entri model eksplisit menggantikan metadata auto-deteksi, sehingga level thinking `sem-qwen` menyusut dari `off/minimal/low/medium/high` menjadi `["off"]`. Task `qwen-medium` lalu ditolak — yang benar menurut P4-03, tetapi penyebabnya adalah konfigurasi saya sendiri. Entri Groq dikembalikan. Pelajarannya: **entri model eksplisit itu pengganti, bukan tambahan** — deklarasikan hanya bila memang perlu, dan periksa ulang level thinking sesudahnya.
+
+## D20 — Dispatch yang ditolak gateway setelah lease diambil menyumbat antrean
+
+Ditemukan sebagai akibat kesalahan di atas. Ketika run ditolak (`UNAVAILABLE: Model override … is not allowed`), eksekusi tetap `DISPATCHED` dan **lease workspace-nya tertahan**, sehingga task berikutnya di project itu parkir `WAIT_WORKSPACE` selamanya.
+
+Sebabnya struktural: sejak D15, status terminal datang dari event `agent` lifecycle `end`. Run yang tidak pernah benar-benar mulai tidak pernah mengirim event itu. Reconciler yang seharusnya menjadi jalur lambat digerakkan oleh `/api/snapshot` AgentOS — yang **tidak melihat run Gateway sama sekali** (D15). Jadi saat ini tidak ada jalur waktu-habis untuk eksekusi `DISPATCHED` yang macet.
+
+Yang dibutuhkan, dan belum ada:
+
+1. **Timeout dispatch.** Eksekusi yang `DISPATCHED` lebih lama dari ambang tanpa event apa pun harus dijadikan `BLOCKED` dan lease-nya dilepas. Reconciler sudah punya konsep `staleAfterMs`; ia hanya perlu sumber yang melihat run Gateway.
+2. **Perlakukan penolakan sinkron sebagai kegagalan dispatch.** Error respons pada `agent` seharusnya langsung melepas lease alih-alih menunggu event yang tidak akan datang.
+
+Sampai itu ada, satu dispatch yang ditolak membekukan seluruh project. Ini prioritas tertinggi berikutnya — di atas Slack dan UI.
+
+## D20 addendum — terpasang, dan asal-usulnya ternyata lebih dalam
+
+Watchdog dispatch terpasang di `scheduler.mjs` dan terbukti bekerja di cluster: dua task yang menggantung berpindah ke `BLOCKED` dan lease-nya dilepas, `leases: []` tercapai.
+
+Dua hal yang ditemukan saat memasangnya, keduanya mengoreksi diagnosis awal:
+
+**1. Penolakan sinkron sudah benar sejak awal.** Dugaan pertama menyalahkan jalur itu; ternyata `admission` memang sudah melepas lease dan menandai eksekusi `FAILED`. Perilaku itu tetap dikunci dengan tes karena load-bearing, tetapi ia bukan penyebabnya.
+
+**2. Kondisi sapuan lease yang pertama salah.** Versi awal melepas lease bila eksekusi pemiliknya `finalized_at`-nya terisi. Tetapi `BLOCKED` **sengaja bukan status terminal** — ia tetap bisa dilanjutkan — sehingga field itu tidak pernah distempel, dan sapuan berjalan melewati eksekusi BLOCKED yang masih memegang lease. Terlihat langsung di cluster. Kondisinya sekarang "tidak sedang berjalan" (bukan DISPATCHED/RUNNING), yang sesuai dengan alasan lease itu ada: mencegah dua eksekusi RUNNING berbagi path (P4-07).
+
+## D21 — Gateway menjawab satu permintaan dua kali, dan itu sumber kebuntuan D20
+
+Ini akar yang sebenarnya, ditemukan setelah dispatch qwen berulang kali menggantung meski routing-nya benar.
+
+Log dispatch yang ditambahkan membuktikan controller memilih dengan tepat:
+
+```
+[dispatch] task=TASK-7E7E201F routed=groq/qwen/qwen3.6-27b@medium -> agent=sem-qwen (groq/qwen/qwen3.6-27b) exact
+```
+
+Tanpa override, agen benar. Namun gateway menolak:
+
+```
+res ✗ agent errorCode=UNAVAILABLE
+  Thinking level "medium" is not supported for zai/glm-4.7. Use one of: off, on.
+```
+
+Dua temuan terpisah di sini.
+
+**a. Gateway menjawab dua kali.** Klien kita menerima `{"status":"accepted"}` — probe pun mencetak "HASIL: accepted" — sementara gateway mencatat `res ✗` untuk `runId` yang sama. Promise sudah diselesaikan oleh frame pertama, jadi frame kedua jatuh ke lantai. Eksekusi lalu duduk `DISPATCHED` tanpa ada yang akan menyelesaikannya. **Itulah asal kebuntuan D20**, dan itu juga sebabnya probe manual saya tampak "berhasil" padahal tidak: saya mempercayai frame pertama.
+
+Adapter kini memunculkan frame kedua sebagai event `gateway.late-error` alih-alih membuangnya. Promise yang sudah selesai tidak bisa dibatalkan, jadi watchdog tetap menjadi jaring pengaman — tetapi kegagalannya tidak lagi tak terlihat.
+
+**b. `thinking` divalidasi terhadap model yang salah.** Errornya menyebut `zai/glm-4.7` — model default — padahal dispatch menyebut `sem-qwen` yang bermodel `groq/qwen/qwen3.6-27b`. Jadi untuk provider groq, gateway tidak dapat menyelesaikan profil thinking model tersebut dan jatuh ke default. Akibatnya **level thinking bertingkat pada groq selalu ditolak**, meskipun `agents.list` mengiklankan `off/minimal/low/medium/high` untuk agen itu.
+
+Konsekuensi yang jujur: **iklan `thinkingLevels` tidak bisa dipercaya untuk provider tanpa plugin.** Katalog karena itu tidak lagi menyebut level untuk qwen. Setelah itu, dispatch berhasil:
+
+```
+TASK-5F2F664B  COMPLETE | groq/qwen/qwen3.6-27b | in 10408 out 6 | billable 10414
+```
+
+Gemini belum diuji dengan `thinking` eksplisit lewat controller; kalau nanti gagal dengan pesan yang sama, penyebabnya sama dan penanganannya sama.
+
+## D22 — Lease baca/tulis: workspace tidak perlu bergiliran untuk pekerjaan yang hanya membaca
+
+Pertanyaan operator: kalau satu workspace per project, apakah task dokumentasi harus mengantre di belakang task coding?
+
+Jawabannya: hanya kalau ia menulis. Lease itu melindungi **tulisan bersamaan** ke satu pohon, bukan keberadaan task. Sebelumnya setiap dispatch mengambil lease eksklusif tanpa peduli jenisnya, jadi satu project menjadi serial sepenuhnya.
+
+Sekarang:
+
+| Mode | Aturan |
+|---|---|
+| `write` | eksklusif — ditolak selama ada lease hidup apa pun |
+| `read` | berbagi — ditolak hanya selama ada **penulis** hidup |
+
+`workspace_mode` default **`write`**. Berbagi harus diminta, tidak boleh didapat karena kelalaian — dan saya sengaja tidak menebak kategori mana yang aman (dokumentasi sering menulis, analisis sering tidak). Itu keputusan per task, bukan per nama kategori.
+
+Perubahan yang menyertainya, karena keduanya salah begitu satu path bisa dipegang beberapa pemegang:
+- Primary key lease menjadi `(workspace_path, execution_id)`, dengan migrasi eksplisit untuk DB yang sudah ada — `CREATE TABLE IF NOT EXISTS` tidak mengubah tabel yang sudah jadi, jadi tanpa migrasi perubahan ini tidak berlaku di satu pun deployment yang benar-benar berjalan.
+- `release(path)` dulu menghapus **semua** baris path itu. Dengan pembaca bersama, itu mengusir pekerjaan yang belum selesai. Sekarang ia melepas satu pemegang, dan menolak menebak bila ada beberapa pemegang tanpa `executionId`.
+
+P4-07 tidak berubah: dua penulis tetap tidak pernah RUNNING bersamaan.
+
+## D23 — Empat celah dari tinjauan adversarial
+
+Empat hal yang tidak ditemukan oleh pengujian normal karena semuanya gagal **dengan diam**.
+
+### 1. Lease tidak pernah diperpanjang — **paling berbahaya**
+
+`leases.heartbeat` ada di repository sejak awal dan **tidak pernah dipanggil dari mana pun**. Dengan TTL lease 15 menit dan timeout dispatch 30 menit, setiap run yang lebih lama dari 15 menit — hal biasa untuk model penalaran yang mengerjakan sesuatu yang nyata — kehilangan workspace-nya **saat masih berjalan**. Task berikutnya lalu mereklamasi path itu, menandai eksekusi yang masih hidup sebagai BLOCKED, dan mulai menulis ke pohon yang sama.
+
+Itu persis kerusakan tulis-bersamaan yang menjadi alasan P4-07 ada, dan nilai default membuatnya menjadi kasus normal, bukan kasus tepi.
+
+Sekarang setiap pass scheduler memperpanjang lease milik eksekusi yang benar-benar masih DISPATCHED/RUNNING — dan hanya itu, sehingga eksekusi mati tidak bisa menahan path. `main.mjs` juga memperingatkan bila TTL terlalu rapat terhadap interval pass.
+
+### 2. Path workspace bisa keluar dari pohon
+
+`/opt/semanggi/../../etc` diterima. Kontrak mount adalah host == container, jadi path yang menembus mengarahkan agen sungguhan ke direktori sungguhan di luar root kanonik. Path relatif juga diterima, dan itu menghasilkan agen yang bekerja di tempat yang tidak ada. Keduanya kini ditolak, dengan `SEMANGGI_WORKSPACE_ROOT` opsional untuk memaku prefiks yang diizinkan.
+
+### 3. Instruksi tanpa batas ukuran
+
+Deskripsi 2 MB diterima dan akan dikirim ke provider apa adanya — denial-of-wallet dengan satu permintaan. Batas 64 KB sekarang berlaku, dan **menolak** alih-alih memotong: memotong berarti mengirim setengah instruksi lalu menagihnya.
+
+### 4. Bentuk usage tak dikenal disimpan sebagai nol
+
+`recordUsage` menerima bentuk apa pun dan menulis nol untuk field yang tidak dikenalinya. Itu persis kegagalan yang menyembunyikan D17 selama satu siklus penuh, karena "0 token" terbaca sebagai fakta, bukan sebagai "tidak ada yang memberi tahu kami". Sekarang ia mengerti **kedua** ejaan produsen (batch dan gateway) dan menolak bentuk yang benar-benar asing.
+
+## D24 — Logging terstruktur, dan celah yang langsung ditemukannya
+
+Satu baris JSON per peristiwa, dari `admission`, `scheduler`, `repo`, `gateway`, dan `session-events`. Setiap baris membawa `task` dan `exec`, dan keduanya adalah id yang sama yang muncul di gateway (`runId` = `idempotencyKey` = id eksekusi; `label` = id task) dan di nama kontainer sandbox. Jadi `grep TASK-XXXX` melintasi ketiga lapisan merekonstruksi hidup satu task.
+
+Yang tercatat: model dan effort yang **benar-benar** dipakai, agen yang dipilih dan lewat jalur mana (exact/override), project dan workspace yang dibuat, setiap perubahan status task beserta alasannya, parkir karena kuota beserta waktu resetnya, lease diambil/ditolak/yatim, dan timeout dispatch. Redaksi kredensial sama ketatnya dengan EventLog, ditambah pemotongan string panjang.
+
+**Dan dalam satu menit setelah dinyalakan, log itu menemukan celah kelima:** satu task berada di **eksekusi ke-582**, berputar `QUEUED → WAIT_RESOURCE` setiap 30 detik selamanya, menulis satu baris eksekusi immutable setiap kali dan mengaduk lease setiap kali.
+
+Penyebabnya: `next_retry_at` **ditulis tetapi tidak pernah dibaca** — field itu tampak seperti rencana sementara scheduler mencoba ulang di setiap pass. Sekarang backoff eksponensial berlaku (30 detik → 15 menit), dijadwalkan dari kegagalan terkini, dan scheduler benar-benar mematuhinya. Terukur setelah deploy: dari tiap 30 detik menjadi **satu percobaan per dua menit** dan terus melebar.
+
+Backoff sengaja hanya berlaku untuk percobaan **otomatis**. Keputusan manusia, revisi, atau lease yang dibebaskan langsung menghapusnya — membuat operator menunggu backoff yang bukan urusannya akan terbaca seperti keputusannya diabaikan.
+
+## D25 — Lease dipegang sepanjang eksekusi, bukan hanya saat menulis
+
+Pertanyaan operator, dan jawabannya tegas dari kode: lease diambil di `admission` tepat sebelum dispatch, dan hanya dilepas saat run berakhir (event `end`), saat dispatch gagal, atau saat watchdog mereklamasinya.
+
+Jadi untuk dua task `write` pada satu workspace: **task A berjalan sampai selesai, baru task B mulai.** Bukan "keduanya jalan lalu bergiliran saat menulis".
+
+Alasannya bukan kemalasan desain melainkan batas informasi: controller tidak melihat operasi tulis satu per satu. Agen menulis di dalam sandbox/sesinya sendiri, dan satu-satunya batas yang terlihat controller adalah dispatch dan akhir run. Mengunci di antara keduanya berarti mengunci seluruhnya.
+
+Konsekuensi yang harus diterima dengan mata terbuka: run 10 menit memblokir run 10 detik. Yang meringankan:
+
+- Task yang hanya membaca memakai `workspaceMode: "read"` dan berjalan bersamaan (D22).
+- Task yang benar-benar butuh isolasi bisa menetapkan `workspace_path` sendiri dan tidak bersaing sama sekali.
+
+**Apakah penguncian halus mungkin?** Secara teknis ada jalannya, dan jujur saja bukan jalan yang mudah: interposer izin sudah melihat setiap tool call, termasuk `kind: "edit"`. Ia bisa mengambil dan melepas kunci di sekitar setiap tulisan. Tetapi itu memindahkan kunci ke jalur panas per-tool-call, memperkenalkan risiko deadlock antara dua agen yang saling menunggu, dan membuat kegagalan jauh lebih sulit ditelusuri. Saya tidak menyarankannya kecuali serialisasi terbukti menjadi hambatan nyata dalam pemakaian sehari-hari — dan itu baru bisa dinilai setelah sistem dipakai.
+
+## D26 — Menyetop task, mengganti model, lalu menjalankannya lagi
+
+Awalnya saya salah membaca permintaan operator sebagai "menyetok" (menumpuk pekerjaan untuk nanti) dan membangun `hold: true`. Yang dimaksud adalah **menyetop**: menghentikan task yang sedang berjalan, mengganti model dan effort, lalu menjalankannya kembali. Itu hal yang berbeda, dan sebelumnya **tidak ada jalannya sama sekali**:
+
+- `PATCH` menolak task yang sedang `DISPATCHED`/`RUNNING`.
+- `cancel` membawa ke `CANCELLED`, dan di state machine `CANCELLED: []` — buntu, sengaja. Itu benar untuk "tinggalkan ini", salah untuk "jeda dulu".
+
+Jalur yang benar ternyata sudah ada di state machine dan belum dipakai: `BLOCKED → RESUMABLE → QUEUED`. Jadi `POST /api/work/tasks/{id}/stop` menghentikan run di gateway lalu memarkir task di `BLOCKED`, dan `createRevision` merutekan lewat `RESUMABLE` supaya jeda itu tetap terlihat di riwayat, bukan seolah tidak pernah berhenti.
+
+**Kontrak abort, diukur:** `sessions.abort` menerima `key` (sessionKey) dan menjawab `{ok, abortedRunId, status}`, dengan `status:"no-active-run"` bila tidak ada yang dihentikan. Perbedaan itu dipertahankan apa adanya di respons API — task yang ditandai berhenti sementara run-nya masih jalan adalah kebohongan yang akan ditindaklanjuti operator.
+
+### Urutan yang salah menghabiskan satu run untuk ditemukan
+
+Percobaan pertama gagal `500`. Sebabnya halus: **abort yang kita minta sendiri kembali sebagai event.** Gateway mengirim lifecycle `end` dengan `aborted: true`, sink membacanya — dengan benar — sebagai pembatalan, memindahkan task ke `CANCELLED` yang buntu, lalu handler stop gagal karena mencoba memarkir task yang sudah mati.
+
+Perbaikannya urutan, memakai jaminan yang sudah ada: **finalisasi eksekusi lebih dulu, baru abort.** Sink melewati eksekusi yang sudah final, jadi event abort mendarat tanpa efek dan niat operator — jeda, bukan buang — yang bertahan.
+
+Terbukti hidup pada run yang benar-benar sedang berjalan:
+
+```
+1) dibuat TASK-27768FEB status DISPATCHED
+2) sedang berjalan: DISPATCHED | session agent:semanggi-glm-5-1:task-27768feb:r1
+3) STOP 200 {"wasLive":true,"abortedAtGateway":true,"gatewayStatus":"aborted"} -> BLOCKED
+4) ganti model: 200 {"preferred":["glm-5.2-max"]}
+5) jalankan lagi: 200 -> DISPATCHED
+6) hasil: COMPLETE | zai/glm-5.2 | billable 10366
+riwayat: 1:CANCELLED 2:COMPLETE
+```
+
+Riwayat eksekusinya jujur: percobaan pertama tercatat CANCELLED (memang dihentikan), yang kedua COMPLETE pada model baru.
+
+## D26b — Kontrol manual atas model dan effort
+
+Pertanyaan kedua: bisakah operator menentukan sendiri model dan effort, atau menyetok task lalu menggantinya sebelum dijalankan?
+
+Sebagian sudah bisa sejak awal, sebagian tidak — dan yang tidak itu ketahuan saat mencobanya di cluster: PATCH ditolak `400` karena scheduler sudah men-dispatch task itu **sebelum operator sempat mengubah apa pun**. Menyetok pekerjaan memang belum mungkin.
+
+Yang ada sekarang:
+
+| Kebutuhan | Cara |
+|---|---|
+| Pilih model + effort saat membuat | `modelPolicy: { preferred: ["glm-5.2-max"] }` — mengalahkan tabel kategori |
+| Menyetok tanpa menjalankan | `hold: true` → task berhenti di `CREATED` dan scheduler tidak pernah mengambilnya |
+| Ubah rencana sebelum jalan | `PATCH /api/work/tasks/{id}` — `modelPolicy`, `priority`, `qualityClass`, `workspaceMode` |
+| Lepaskan ke antrean | `POST /api/work/tasks/{id}/start` |
+| Jalankan ulang di model lain | `POST /api/work/tasks/{id}/revisions` dengan `modelPolicy` — satu panggilan |
+| Lihat pilihan sebelum menjalankan | `POST /api/work/routing/preview` — kandidat terurut beserta ketersediaannya |
+
+`PATCH` **ditolak** saat task sedang `DISPATCHED`/`RUNNING`. Mengubah routing run yang sedang terbang akan membuat catatan tidak sesuai dengan yang benar-benar berjalan, dan baris eksekusi memang immutable justru karena itu.
+
+Terbukti hidup, satu task, dua model berurutan:
+
+```
+dibuat TASK-FD79D928 status: CREATED model: {"preferred":["glm-5.1-on"]}
+PATCH 200 -> {"preferred":["glm-5.2-max"]}
+lepaskan ke antrean: 200
+hasil: COMPLETE | zai/glm-5.2 | billable 10344
+
+revisi 200 (modelPolicy: glm-5.1-on)
+hasil: COMPLETE | zai/glm-5.1 | billable 10338
+```
+
+Dan log routing membuktikan effort ikut terbawa, bukan sekadar model:
+
+```
+routedModel=glm-5.2 routedEffort=max  -> agent=semanggi-glm-5-2 efforts=[off,low,high,max] via=exact
+routedModel=glm-5.1 routedEffort=low  -> agent=semanggi-glm-5-1 efforts=[off,low]          via=exact
+```
+
+## D27 — Aplikasi Slack: tanda tangan wajib, identitas per orang, konfirmasi sebelum menghentikan
+
+Tiga pilihan Anda — **Slack dulu**, **token per operator**, **kontrol penuh** — saling mengikat, dan kombinasinya menentukan hampir seluruh bentuk implementasi ini.
+
+**Kontrol penuh membuat verifikasi tanda tangan menjadi syarat, bukan pelengkap.** Endpoint Slack bisa membuat, menghentikan, dan mengganti model task. Tanpa verifikasi, siapa pun yang bisa melakukan POST ke URL itu bisa menyamar sebagai operator mana pun dan melakukan semuanya — dan model identitas per operator berubah jadi hiasan. Karena itu:
+
+- HMAC-SHA256 atas **byte mentah** badan request (`v0:<ts>:<raw>`). Rute Slack membaca body-nya sendiri; mem-parsing lalu menyusun ulang form akan mengubah byte dan menggagalkan semua tanda tangan.
+- Jendela lima menit dengan selisih **absolut** — request dari masa depan sama mencurigakannya dengan yang basi.
+- Tanpa rahasia terkonfigurasi, semua request ditolak. Gagal tertutup adalah satu-satunya default yang jujur untuk permukaan yang bisa menghentikan pekerjaan.
+
+**Identitas datang dari Slack user id, dan tidak ada pendaftaran otomatis.** Slack menandatangani `user_id`, jadi itulah yang dipercaya — bukan `decided_by` dari badan request. Operator yang belum terdaftar **ditolak**, bukan diperlakukan sebagai "aplikasi Slack". Kalau pendaftaran otomatis diizinkan, siapa pun di workspace bisa memberi dirinya identitas dengan mengetik satu kata, dan jejak audit berhenti menunjuk orang.
+
+**Verba yang menghentikan pekerjaan selalu bertanya lebih dulu.** Kanal Slack adalah tempat orang mengetik cepat, kadang di jendela yang salah. Pertanyaannya membacakan kembali task yang persis akan dihentikan beserta statusnya, jadi `yes` hanya bisa mengiyakan hal yang barusan disebutkan. Konfirmasi disimpan di memori, milik satu orang, kedaluwarsa dua menit — konfirmasi yang selamat dari restart adalah konfirmasi yang tidak diingat siapa pun.
+
+`ok` sengaja diperlakukan berbeda dari `yes`: ia menjawab pertanyaan yang menggantung bila ada, dan selebihnya kembali menjadi kata yang router baca sebagai `approve`. Jadi satu kata tidak bisa sekaligus mengonfirmasi penghentian dan menyetujui sesuatu yang lain.
+
+**`model` bekerja dengan nama katalog, dan ambiguitas ditolak.** `glm-5.2 high` → `glm-5.2-high`. `glm-5.2` saja **ditolak** karena katalog menyediakan `high` dan `max`; memilihkan salah satunya berarti operator meminta model lalu mendapat level effort yang tidak pernah ia sebut — kelas kejutan yang sama dengan silent downgrade yang dilarang P4-03. Nama yang tidak ada ditolak seketika beserta daftar pilihan, bukan diterima lalu memarkir task di `WAIT_RESOURCE`.
+
+### Celah yang ditemukan justru saat pembuktian hidup
+
+Task pertama yang dibuat dari Slack masuk antrean dengan rapi lalu **duduk selamanya di `WAIT_WORKER`** dengan alasan `no worker assigned`. Ternyata admission hanya **memeriksa** penugasan worker, tidak pernah **membuatnya** — dan setiap permukaan lain mengirim `workerId` di badan request, sementara Slack tidak punya tempat untuk mengetiknya. Dari sisi operator, itu terbaca sebagai sistem yang diam-diam mengabaikannya.
+
+Sekarang Slack memilih worker paling ringan yang punya akses ke project itu, dan bila tidak ada satu pun yang aktif ia **menolak mengantrekan** alih-alih memarkir pekerjaan yang tidak akan pernah bergerak.
+
+### Terbukti hidup di cluster
+
+Image `2026082208`, 16 pemeriksaan dijalankan dari dalam container terhadap HTTP sungguhan, semuanya lulus:
+
+```
+PASS  a wrongly signed request is refused                          — status 401
+PASS  a stale timestamp is refused                                 — status 401
+PASS  a correctly signed request is served                         — status 200
+PASS  an unregistered Slack user is refused despite a valid signature
+PASS  a task is created from Slack   — Queued `TASK-DAC41B62` … _(Slack Probe)_
+PASS  the task got a worker          — DISPATCHED worker=WRK-79E86D0B
+PASS  stop asks for confirmation first
+PASS  nothing changed while the question was outstanding           — DISPATCHED
+PASS  confirming stops it            — the run was aborted at the gateway
+PASS  the task is BLOCKED, not CANCELLED
+PASS  an unknown model is refused with the real choices
+PASS  the model is changed           — zai/glm-5.1 at low (`glm-5.1-on`)
+PASS  it runs again
+```
+
+Dan lingkaran penuhnya selesai sendiri sesudahnya:
+
+```
+DISPATCHED -> BLOCKED   actor="Slack Probe" reason="stopped from Slack"
+slack.task-stopped      wasLive=true abortedAtGateway=true
+slack.model-changed     catalog=glm-5.1-on
+BLOCKED -> RESUMABLE -> QUEUED -> DISPATCHED
+run.ended               zai/glm-5.1 stopReason=stop durationMs=8105 -> COMPLETE
+```
+
+Perhatikan `actor` di setiap baris: bukan "slack", bukan "controller", melainkan nama orangnya.
+
+### Yang belum
+
+Socket Mode belum diimplementasikan, jadi Slack tetap butuh URL yang bisa dijangkau internet. Controller sengaja tidak mem-publish port, jadi jalur yang disarankan adalah reverse proxy yang hanya meneruskan dua path Slack. Kalau paparan publik jadi masalah, Socket Mode adalah langkah berikutnya yang benar — bukan membuka lebih banyak port.
+
+## D28 — AgentOS memelihara cermin agent sendiri, dan cermin itu sudah basi
+
+Pertanyaannya: kalau UI Semanggi memotong AgentOS dan langsung ke OpenClaw, apakah agent-nya sama?
+
+**Secara desain: ya.** `lib/agentos/control-plane.ts` mendelegasikan CRUD agent ke `lib/openclaw/application/agent-service`, yang menulis lewat RPC gateway (`config.patch`/`apply`/`set`, dengan fallback CLI). AgentOS bukan registry terpisah — ia UI manajemen di atas registry OpenClaw. Keduanya menunjuk gateway yang sama (`openclaw-gateway:18789`).
+
+**Secara nyata: tidak.** Diukur dengan login sebagai admin lalu memanggil API AgentOS dari dalam containernya:
+
+```
+login: 200
+/api/agents → HTTP 200, 15 agent
+agent semanggi terlihat: 0
+```
+
+Lima belas agent lama POC-2/POC-3. Nol agent Semanggi — padahal config gateway memuat 24 agent, sembilan di antaranya milik controller (`semanggi-glm-5-1`, `sem-gemini`, `sem-qwen`, `sem-glm-5-3`, dan empat agent per-task).
+
+Penyebabnya: AgentOS memelihara cermin lokal di `agentos/runtime/openclaw/openclaw.json`, dan itulah yang dibaca UI-nya. Controller menulis agent langsung ke gateway — melewati AgentOS — sehingga cermin itu tidak pernah tahu. Cermin itu juga sudah melenceng di tempat lain: lima agent yang ada di kedua file menyimpan model berbeda (`glm-4.7` vs `glm-4.7-flash`), dan cermin punya entri hantu `main`.
+
+**Konsekuensi untuk UI operator.** Halaman Agents AgentOS akan menampilkan daftar yang sepenuhnya berbeda dari yang menjalankan pekerjaan, tanpa tanda apa pun bahwa ia basi. UI Semanggi karena itu **membaca agent dari controller** (live dari `agents.list` gateway), bukan dari snapshot AgentOS, dan melabelinya eksplisit agar perbedaannya terlihat disengaja.
+
+Tiga kata yang jangan tertukar: **Agent** (entitas runtime di gateway), **worker profile** (metadata yang menempel pada agent, milik AgentOS), dan **Worker** (baris `WRK-…` milik controller: akses project dan batas konkurensi, tidak ada di OpenClaw).
+
+## D29 — `available: []` bukan soal model, dan tiga task tersangkut karena rencana, bukan kegagalan
+
+Log `resource.no-agent … model=glm-5.2 available=[]` saya baca keliru. `available` adalah daftar agent yang **terikat pada workspace yang sama**, bukan daftar model. Pesan lengkapnya:
+
+```
+TASK-6C8F61E3 | WAIT_RESOURCE
+   task ws : …/workspaces/semanggi/executions/T1/executions/TASK-6C8F61E3
+   proj ws : …/workspaces/semanggi/executions/T1
+   alasan  : no any agent for …/executions/T1/executions/TASK-6C8F61E3
+```
+
+Task itu punya workspace per-task bersarang; semua agent terikat satu tingkat di atasnya. Modelnya tidak pernah jadi soal — `no any agent` berarti pencarian bahkan tidak menyaring model.
+
+Ketiga task tersangkut ternyata **kesalahan rencana, bukan kegagalan**, dan tidak satu pun bisa diperbaiki lewat endpoint mana pun:
+
+| Task | Sebab | Perbaikan |
+|---|---|---|
+| `TASK-6C8F61E3` | workspace per-task tanpa agent | arahkan ke workspace yang punya agent |
+| `TASK-18877228` | worker tanpa akses project | pindahkan ke worker yang punya akses |
+| `TASK-41ABFDE6` | sisa probe Slack | dibatalkan |
+
+Karena tidak ada jalurnya, satu-satunya cara keluar adalah `UPDATE tasks SET …` dengan tangan — dan itu justru perbaikan yang tidak bisa ditanggung sistem yang jejak auditnya append-only: baris yang disunting tangan membuat log menceritakan sejarah yang tidak pernah terjadi. Jadi `PATCH /api/work/tasks/{id}` diperluas dengan `workspacePath` dan `workerId`, keduanya menerima `null` (workspace kembali ikut project, worker dilepas).
+
+`workerId` **menolak di muka** worker yang tidak punya akses ke project task, alih-alih membiarkan admission memarkirnya di `WAIT_WORKER` dengan alasan yang sama beberapa detik kemudian. Operatornya sedang berdiri di situ; memberitahunya sekarang lebih murah daripada menunggu yang harus ia diagnosis sendiri.
+
+### Celah yang ditemukan saat memperbaiki
+
+Perbaikan pertama tampak tidak berpengaruh. Penyebabnya: **perubahan rencana tidak mengatur ulang backoff**. Terukur di cluster — workspace sudah dibetulkan, tapi task masih menyimpan 658 detik di penghitungnya dan `wait_reason` lama masih terpampang.
+
+Premis backoff (D24) adalah "tidak ada yang berubah, jangan diketuk terus". Manusia yang menyunting rencana adalah persis keadaan itu berubah. Jadi `updatePlan` sekarang menghapus `next_retry_at` dan `wait_reason` — alasan lama menggambarkan keputusan di bawah rencana yang sudah tidak ada, dan membiarkannya di layar adalah kebohongan kecil yang tidak bisa dibedakan operator dari yang sungguhan. Rute `PATCH` juga membangunkan scheduler.
+
+Terbukti hidup, image `2026083002`:
+
+```
+sebelum : WAIT_RESOURCE | retry 658s lagi
+PATCH 200
+seketika: WAIT_RESOURCE | retry (dihapus) | alasan (dihapus)
++5s     : DISPATCHED
+run.ended  zai/glm-5.2  stopReason=stop  durationMs=6304  -> COMPLETE
+```
+
+Antrean tunggu sekarang kosong.
+
+## D30 — Upgrade ke 2026.7.1: berhasil, tetapi dua janji utamanya tidak terbukti
+
+Upgrade dijalankan 2026-08-30. Gateway `semanggi/openclaw-gateway:2026083001` di atas `ghcr.io/openclaw/openclaw:2026.7.1`.
+
+**Yang selamat tanpa cedera:** pairing device controller (`operator.admin`), `secrets audit: clean`, kesembilan agen Semanggi, plugin `acpx` dan `zai` yang keduanya masih pin 6.11 dan tetap termuat, dan `sessions.subscribe` yang langsung tersambung kembali. Backup 6,8 MB (state kritis tanpa `npm`) diverifikasi `integrity_check: ok` sebelum apa pun disentuh — 3,1 GB dari 3,2 GB itu ternyata plugin npm yang bisa dipasang ulang.
+
+**Yang tidak terbukti — dan ini membantah rekomendasi saya sendiri di `upgrade-openclaw.md`:**
+
+| Janji dokumen upgrade | Kenyataan di 7.1 |
+|---|---|
+| `workspaceDir` per dispatch | `unexpected property 'workspaceDir'` — **tetap ditolak** |
+| `agentRuntime.acp.agent` menegakkan pilihan harness | `unexpected property 'agentRuntime'` — **tetap ditolak** |
+
+Dokumen itu menyimpulkan keduanya tersedia dari **jumlah berkas di `dist` yang menyebut namanya** (369 → 384 dan 56 → 93). Di dokumen yang sama saya menulis bahwa jumlah berkas bukan bukti — dan peringatan itu ternyata berlaku untuk rekomendasi saya sendiri. Satu-satunya bukti adalah mengirim parameternya dan melihat jawabannya. **D14 dan D18 karena itu tetap berlaku utuh:** workspace tetap properti agen, dan `acpAgent` di katalog tetap niat yang dideklarasikan, bukan routing yang ditegakkan.
+
+**Perubahan skema yang senyap:** `deliver` kini wajib **boolean**; 6.11 menerima string. Adapter kita kebetulan sudah mengirim `deliver: false`, jadi jalur dispatch selamat — tetapi klien mana pun yang mengirim `"none"` akan patah tanpa peringatan.
+
+**Yang justru didapat, dan tidak ada di daftar harapan:** 218 metode (dari 191), termasuk `sessions.messages.subscribe`, `sessions.compaction.branch` (kandidat solusi untuk "FORK tidak membawa riwayat"), `agents.update`, dan `agents.workspace.list`. Doctor juga memasang `@openclaw/groq-provider` sendiri.
+
+**Gerbang izin gagal, tetapi bukan karena upgrade.** `permission-bridge-verify.sh` FAIL di kasus 1. Ditelusuri sampai kredensial harness: `api_error_status: 429`, `"You've hit your session limit · resets 12:30pm (UTC)"`. Kuota langganan Claude, bukan regresi 7.1. **Harus diuji ulang setelah kuota pulih** — sampai itu, status jalur ACP di 7.1 belum diketahui.
+
+## D31 — Effort: terbukti berlaku untuk GLM, terbukti hiasan untuk Gemini, berbahaya untuk Qwen
+
+Pertanyaannya bukan "apakah gateway menerima `thinking`" — ia menerima. Pertanyaannya apakah level itu **mengubah perilaku**. Satu-satunya bukti adalah perilaku: prompt sama, model sama, hanya level berbeda.
+
+Sampel tunggal ternyata **menyesatkan**. Percobaan pertama membaca glm-5.2 sebagai `low ≡ high ≡ max` (247/242/241 token). Diulang n=3, gambarannya terbalik:
+
+```
+semanggi-glm-5-2   off  rata-rata 137  (106–194)
+                   low            217  (179–247)
+                   max            284  (247–322)
+```
+
+Monoton naik. **Effort GLM-5.2 nyata dan bertingkat.**
+
+```
+sem-gemini         off  rata-rata 533  (386–673)
+                   high           316  (9–479)
+```
+
+Terbalik, sebaran raksasa, satu run nyaris kosong. **Gemini menerima setiap level dan menerapkan tidak satu pun.** Menjawab pertanyaan yang tertunda sejak D21: Gemini **tidak menolak** `thinking` seperti groq dulu — ia menerimanya diam-diam, yang lebih buruk karena tidak meninggalkan jejak.
+
+Qwen lebih tajam lagi: `off` dan `low` selesai normal, sedangkan **`minimal`, `medium`, dan `high` diterima RPC lalu tidak pernah selesai** — run menggantung sampai watchdog memungutnya.
+
+### `effortMode`: jaminan atau preferensi
+
+Katalog kini membedakan keduanya, dan controller memperlakukannya berbeda:
+
+- **`guaranteed`** — level dikirim sebagai parameter `thinking`, dan registry menuntut agen mengiklankannya (P4-03 tetap berlaku).
+- **`preference`** — level **tidak pernah dikirim**. Ia niat yang tercatat, bukan jaminan. Registry berhenti menuntut agen mengiklankannya, karena memarkir pekerjaan demi parameter yang tidak dipakai siapa pun adalah kerugian tanpa manfaat.
+
+Default `guaranteed`, karena entri yang belum dikarakterisasi adalah klaim yang harus diuji, bukan alasan menahan parameter. Setiap `effortMode` wajib disertai `effortEvidence` — klaim tanpa alasan tercatat tidak bisa ditinjau ulang saat provider berubah. Jalur ACP semuanya `preference`: effort di sana dipaku lewat perintah wrapper per-model, tidak pernah lewat dispatch.
+
+Terbukti hidup — pratinjau routing kini menyebutkan keduanya:
+
+```
+PREFERENSI  google/gemini-3.1-flash-lite @ high  (gemini-flash-high)
+            bukti: diterima semua level, TIDAK diterapkan: off 533 vs high 316 (n=3)
+jaminan     zai/glm-5.2 @ high  (glm-5.2-high)
+```
+
+## D32 — Agen Semanggi kini terlihat di AgentOS, dan dua penulis itu nyata
+
+**Perbaikannya satu env var.** `local-gateway-probe.ts` menunjukkan AgentOS menghormati `OPENCLAW_CONFIG_PATH` dan jatuh ke `<stateDir>/openclaw.json` bila tak disetel — dan kita tidak pernah menyetelnya, jadi ia membaca cermin basi miliknya sendiri (D28). Setelah `OPENCLAW_CONFIG_PATH` diarahkan ke config gateway dan direktorinya di-mount: **24 agen, kesembilan agen Semanggi terlihat.** Desain Semanggi tidak berubah sama sekali.
+
+### Inkompatibilitas yang ditemukan
+
+Mencoba membuat agen lewat API AgentOS mengungkap tiga hal sekaligus:
+
+1. **AgentOS menulis `openclaw.json` LANGSUNG**, bukan lewat RPC gateway. Mount read-only memblokirnya dengan `EROFS ... openclaw.json.lock`. Jadi dua control plane memang menulis satu berkas dengan cara berbeda. Mount dikembalikan read-write: read-only membuat agen Semanggi terlihat tetapi melumpuhkan seluruh manajemen agen di AgentOS — harga yang terlalu mahal.
+2. **Model yang diminta diabaikan.** Saya minta `zai/glm-5.2`; yang tertulis `zai/glm-4.7-flash`. AgentOS memakai bentuk field yang berbeda (`workspaceId`, bukan path; dan `modelId`, bukan `model`).
+3. **Pembuatannya bisa setengah jadi.** Entri config tertulis lengkap, lalu scaffolding filesystem gagal (`EACCES` saat `mkdir .openclaw/tools`). Hasilnya agen yang ada di berkas selamanya, ditampilkan AgentOS sebagai agen sungguhan, dan **tidak pernah bisa dijalankan**.
+
+### Penandanya diukur, bukan dilabeli
+
+Kuncinya: agen setengah jadi itu **tidak pernah muncul di `agents.list` gateway**. Jadi pembedanya tidak perlu label yang bisa lupa dipasang:
+
+```
+ada di openclaw.json  →  AgentOS menampilkannya
+ada di agents.list    →  gateway benar-benar akan menjalankannya
+```
+
+`GET /api/work/agents` menggabungkan keduanya dan mengklasifikasikan tiap agen: `operable` / `config-only` / `live-only`, plus `origin` (`semanggi` bila agentDir di state dir, `agentos` bila di `.openclaw/agents/` dalam workspace) dan daftar entri katalog yang bisa merutekan ke sana. Terbukti hidup:
+
+```
+{"total":25,"operable":5,"configOnly":1,"bySemanggi":9,"byAgentOs":16,"unroutable":19}
+CONFIG-ONLY compat-probe-agentos   zai/glm-4.7-flash   asal=agentos
+            listed in openclaw.json but not advertised by the gateway — half-created
+```
+
+Karena registry Semanggi sudah hanya memakai `agents.list`, ia **sudah kebal** terhadap agen setengah jadi. Yang baru adalah operator bisa melihatnya.
+
+## D33 — Empat tambahan UI operator, dan transkrip yang akhirnya punya dua sisi
+
+`GET /api/work/projects/summary` mengelompokkan hitungan per **fase**, bukan per status: tujuh belas status membuat tabel yang tidak dibaca siapa pun. `needsAttention` (WAIT_HUMAN + BLOCKED + FAILED) dipisahkan karena hanya itu yang bisa diselesaikan manusia; tujuh status `WAIT_*` lain selesai sendiri.
+
+`GET /api/work/events` akhirnya membuat event log bisa dibaca. Ia jadi jejak audit sejak commit pertama dan tidak ada yang bisa membacanya — "apa yang terjadi pada task ini" hanya terjawab lewat log Docker.
+
+`GET /api/work/models` mengembalikan katalog beserta `effortMode`, supaya UI menawarkan pilihan alih-alih teks bebas. Teks bebas adalah input yang salah untuk pilihan model: nama tanpa agen memarkir task di `WAIT_RESOURCE`, dan `glm-5.2` saja ambigu.
+
+**Transkrip.** `executions.result` ternyata hanya menyimpan `stopReason`; balasan model **tidak pernah disimpan**. Halaman percakapan tanpa itu hanya menampilkan sisi operator — dan separuh percakapan lebih menyesatkan daripada tidak ada, karena ia tampak lengkap.
+
+Bentuk payload diukur lebih dulu, tidak ditebak — pelajaran D17:
+
+```
+message.role     "user" | "assistant"
+message.content  STRING untuk pengguna, ARRAY blok untuk asisten
+blok             {type:"thinking"} | {type:"text"} | {type:"toolCall"}
+```
+
+Tabel `execution_messages` menyimpan teks yang sudah diratakan plus blok mentah (dibatasi 32 KB — satu giliran bertele-tele tidak boleh membengkakkan DB di NFS). Penalaran disimpan di `blocks` tetapi tidak diinlinekan ke teks: ia sering lebih panjang dari jawabannya. Korelasi lewat `session_ref`, bukan `runId` — `session.message` tidak membawa `runId` sama sekali.
+
+Terbukti hidup:
+
+```
+[operator]  Jawab persis dengan kalimat ini dan tidak lebih: SISI MODEL TEREKAM.
+[assistant] SISI MODEL TEREKAM.
+kedua sisi terekam: YA
+```
+
+## D34 — `workspaceDir` dan `agentRuntime.acp.agent` tidak ada di 7.1, dan itu sekarang terbukti habis-habisan
+
+Upgrade dituntaskan: gateway **2026.7.1**, plugin **acpx 2026.7.1** dan **zai 2026.7.1** (dari 6.11), plus `groq-provider 2026.7.1` yang dipasang doctor sendiri.
+
+Sebelum menyimpulkan, kedua parameter dicari di **setiap permukaan** yang ada:
+
+| Permukaan | `workspaceDir` / `workspace` | `agentRuntime` |
+|---|---|---|
+| `agent` (dispatch) | ditolak | ditolak |
+| `sessions.create` | ditolak | ditolak |
+| `sessions.patch` | ditolak | ditolak |
+| `agents.create` | **diterima** (`workspace`) | ditolak |
+| `agents.update` | **diterima** (`workspace`) | ditolak |
+| berkas config | (properti agen) | **gateway menolak boot**: `Unrecognized key: "agentRuntime"` |
+| `sessions.pluginPatch` | — | `unknown plugin session extension: acpx/acpx` |
+
+Bukti terkuat justru yang terakhir dan yang di berkas config. Menaruh `agentRuntime` di entri agen membuat gateway **gagal start** — jadi field yang muncul di `agents.list` sebagai `{"id":"auto","source":"implicit"}` itu **turunan yang hanya bisa dibaca**, bukan sesuatu yang bisa disetel. Dan `sessions.pluginPatch` memang menyediakan mekanisme konfigurasi plugin per-sesi, tetapi **acpx tidak mendaftarkan namespace apa pun** di sana.
+
+Kesimpulannya bukan "belum ketemu", melainkan **tidak ada**. Naik ke 7.1 di setiap komponen tidak mengubahnya. **D14 dan D18 tetap berlaku**, sekarang dengan bukti menyeluruh alih-alih dugaan.
+
+### Yang bisa dilakukan sebagai gantinya
+
+**Untuk workspace.** `agents.update` menerima `workspace`, jadi agen bisa diarahkan ulang tanpa dibuat baru. Tetapi mengarahkan ulang agen yang mungkin sedang dipakai task lain adalah balapan yang tidak dijaga apa pun — lease kita per-workspace, bukan per-agen. Jadi yang diadopsi adalah sisi lain dari masalah: **`agents.delete` sekarang berfungsi**, dan `scripts/reap-agents.mjs` memungut agen yang workspace-nya sudah lenyap. Sprawl agen adalah ongkos sesungguhnya dari workspace-sebagai-properti-agen; sekarang ongkos itu bisa dibayar berkala alih-alih menumpuk.
+
+Kriterianya sengaja satu saja: workspace-nya tidak ada lagi di disk. Menebak "sudah selesai" dari nama atau umur akan salah pada task yang berjalan lama. Skrip ini juga operator tool, bukan runtime — menghapus agen butuh `operator.admin`, dan controller sengaja hanya memegang `operator.write` supaya bisa menjalankan pekerjaan tetapi tidak membentuk ulang armadanya (D14).
+
+**Untuk pemilihan harness.** Mekanismenya tetap satu-satunya yang ada: satu perintah tipis per (model, effort) di `plugins.entries.acpx.config.agents.*` plus `acp.allowedAgents`. Pilihannya global lewat `acp.defaultAgent`, bukan per task. Katalog sudah jujur soal ini — seluruh entri ACP bertanda `effortMode: "preference"` sejak D31.
+
+### `deliver` wajib boolean
+
+2026.6.11 menerima string `"none"`; 2026.7.1 menolak apa pun yang bukan boolean dengan `at /deliver: must be boolean`, dan dispatch gagal total. Kita kebetulan sudah benar — itu keberuntungan, bukan rancangan — jadi **tipenya kini diuji**, bukan diserahkan pada orang berikutnya yang menyunting objek params.
+
+### Metode 7.1 yang diadopsi dan yang ditolak
+
+Diadopsi: `agents.delete` (pemungutan), `agents.update` (workspace/model/name, terbukti), `agents.list` sebagai sumber kebenaran operabilitas (D32).
+
+**Belum diadopsi, dengan alasan:** `sessions.compaction.branch` menuntut `checkpointId` sedangkan sesi kita punya `checkpoints: []` — ia butuh `sessions.compact` dijalankan lebih dulu. Ini kandidat nyata untuk menutup "FORK tidak membawa riwayat", tetapi mengubah perilaku sesi dan layak jadi pekerjaan tersendiri, bukan tempelan pada upgrade.
+
+**Ditolak:** memakai model `claude-cli/*` langsung alih-alih jalur ACP. Itu akan membuat pemilihan harness jadi pemilihan model dan langsung menyelesaikan D18 — tetapi interposer izin duduk di jalur ACP, jadi menempuhnya berarti **melewati gerbang L3 sepenuhnya**. Kemudahan tidak sebanding dengan mematikan gerbang izin.
+
+### Gerbang izin: masih terhalang, dan sebabnya berubah
+
+Percobaan pertama gagal dengan `429 — You've hit your session limit`. Diulang kemudian: `"Not logged in · Please run /login"`. Jadi token OAuth langganan itu **sudah tidak sah**, bukan sekadar kehabisan kuota. Ini tindakan operator: `claude setup-token` lalu perbarui secret `claude_code_oauth`. Sampai itu dilakukan, **status jalur ACP di 7.1 tidak diketahui**, dan kegagalan gerbang izin bersifat senyap — jadi ini bukan hal yang aman untuk ditunda diam-diam.
+
+## D35 — Semanggi di atas AgentOS: Brain, level, dan preamble
+
+Keputusan operator: AgentOS memiliki **bentuk** pekerjaan (project, tim, skill, tools, template, preset, scaffold memory); Semanggi memiliki **penjadwalan** pekerjaan (task, Brain, quota, lease, prioritas, atribusi). Workspace Semanggi menjadi subdirektori workspace AgentOS.
+
+### Pengukuran yang membentuk rancangannya
+
+Satu uji mengubah bentuk seluruh "Brain Pooler", dan ia juga **mengoreksi D14**:
+
+```text
+agents.create { model: ["glm-5.1","glm-5.2"] }   → at /model: must be string
+agent { agentId: "…glm-5-1", model: "zai/glm-5.2" }
+                                                 → Model override "zai/glm-5.2" is
+                                                   not allowed for agent "…glm-5-1"
+```
+
+Satu agen membawa **tepat satu model**, dan gateway menolak menjalankan model di luar itu **bahkan dengan `operator.admin`**. D14 dulu menyiratkan override membuat model yang dirutekan pasti berjalan; ternyata hanya di dalam himpunan model agen.
+
+Akibatnya: Brain **tidak bisa** dipasangkan ke agen mana pun saat dispatch. Pooler MUST **memilih** agen yang sudah membawa Brain yang tepat, bukan **mengonfigurasi ulang** agen. Mengubah model agen sebelum dispatch (`agents.update`, terbukti bisa) ditolak sebagai jalur: ia balapan antar-task, menulis config di NFS tiap run, dan menciptakan jendela di mana agen menjalankan model yang bukan miliknya menurut siapa pun.
+
+### Yang dibangun
+
+**Brain** = (provider, model, thinking, effortMode, bukti) yang diberi nama, kini tabel dan bukan lagi daftar di berkas. Katalog `routing.json` menjadi **benih**, disemai sekali; sesudah itu operator memiliki isinya. Kalau berkas tetap menang, setiap penyuntingan operator akan hilang pada restart tanpa jejak.
+
+Dua invarian dijaga di tingkat basis data:
+
+- `effortMode: preference` **wajib** menyertakan `effortEvidence`. Klaim tanpa alasan tercatat tidak bisa ditinjau ulang saat provider berubah.
+- `provider` dan `model` **tidak bisa diubah**. Agen di-provision per (project, role, brain); mengubahnya membuat setiap agen yang sudah ada menunjuk model yang salah tanpa ada yang tahu. Buat Brain baru.
+
+**Level** menghubungkan profil project dengan Brain, dan ternyata sudah ada sebagai `routeClass`:
+
+```text
+modelProfile  →  level default    balanced→normal · fast→low · quality→critical
+template×role →  level override   Learner/Reviewer lazim naik satu tingkat
+task          →  level override   tetap tersedia, kebutuhan berubah di tengah jalan
+```
+
+Pemetaan per role tidak bisa diturunkan otomatis dari profil: pekerjaan Learner dan Reviewer adalah menilai dan memadatkan, dan itu yang paling rugi bila effort dipangkas. `null` pada tabel bawaan ditulis eksplisit supaya terlihat role itu sudah dipertimbangkan, bukan terlewat.
+
+**Preamble instruksi** membawa hal yang berbahaya kalau basi:
+
+```text
+Brain: glm-5.2-low (zai/glm-5.2)
+Reasoning effort: low (aktif)          ← atau: DIMINTA TETAPI TIDAK AKTIF
+Tulis hasil ke: deliverables/TASK-91/
+Mode workspace: WRITE (memegang lease eksklusif)
+```
+
+Ia diturunkan dari objek yang sama dengan keputusan routing, jadi tidak bisa berbeda dari kenyataan — alasan bagian ini **tidak** dititipkan ke berkas skill. Kalimat effort untuk Brain preferensi eksplisit: *"jangan mengandalkan penalaran panjang yang tidak akan terjadi"*. Tanpa itu agen menyusun rencana yang bersandar pada penalaran yang tidak pernah ada, lalu menghasilkan pekerjaan dangkal tanpa ada yang tahu sebabnya.
+
+### Terbukti hidup (image `2026083101`)
+
+```text
+12 brain tersemai dari katalog, level dan effortMode terbawa
+  critical  glm-5-2-max        zai/glm-5.2   @max    jaminan
+  critical  gemini-flash-high  google/…      @high   PREFERENSI
+  low       glm-5-1-on         zai/glm-5.1   @low    jaminan
+
+software/balanced · builder → normal   (project profile)
+software/balanced · learner → critical (template default)
+frontend/fast     · learner → normal   (template default)
+research/balanced · reviewer→ critical (template default)
+
+[assistant] ## Konteks eksekusi (Semanggi)      ← agen menggemakan preamble
+```
+
+### Bug yang ditemukan saat pembuktian
+
+`candidatesFor` memakai `category IS NULL OR category = ?` dengan parameter null. Di SQL `category = NULL` **tidak pernah benar**, sehingga setiap Brain berkategori tersaring habis dan daftar kandidat selalu kosong. Kategori adalah penyempit opsional, bukan syarat — diperbaiki dan diuji.
+
+### Tata letak workspace juga berubah (spec §6.1)
+
+Tiga bagian rancangan lama menyerah pada kenyataan AgentOS:
+
+| Lama | Sekarang | Sebab |
+|---|---|---|
+| `source/` | repo **di root** | AgentOS meng-klon ke root lalu melapisi dokumen |
+| `artifacts/` | `deliverables/<TASK-ID>/` | `AGENTS.md` bawaan **sudah** menyuruh agen ke sana |
+| `executions/<task-id>/` sebagai workspace | hilang; root = project | menghapus sebab kegagalan D29 |
+
+Dan §9 (memory) ternyata **bukan** gap: OpenClaw punya bootstrap dua tingkat — tujuh berkas root disuntik tiap run dengan anggaran karakter, `memory/` dan `docs/` dibaca sesuai kebutuhan. Aturannya: **Tingkat 1 memuat penunjuk dan invarian, bukan isi.**
+
+## D36 — UI Semanggi hidup di dalam AgentOS, lewat fork dan dua tambalan nav
+
+Halaman Semanggi (Summary, Control, dan grup settings Brain/Role Map/Brain Map)
+kini menjadi bagian dari AgentOS itu sendiri, bukan aplikasi terpisah yang
+menumpang di sebelahnya.
+
+**Jalur build: fork, bukan patch di Dockerfile.** AgentOS dulu dibangun dari
+commit hulu yang dipin plus satu `sed`. Untuk 2.151 baris halaman baru, `sed`
+bukan alat yang jujur. Fork ada di `/root/agentos-fork` (branch `semanggi`,
+`origin` tetap menunjuk hulu supaya rebase adalah operasi git biasa), dan
+Dockerfile menerimanya sebagai build context `agentos-src`. Konsekuensi yang
+dicatat sengaja: prefiks Dockerfile agentos dan browser-worker **tidak lagi
+identik**, jadi cache lapisan install tidak bisa dibagi — browser-worker tidak
+butuh halaman ini dan tidak ada gunanya menyeret fork ke sana.
+
+**Hanya 51 baris hulu yang disentuh.** Seluruh kode Semanggi adalah berkas baru
+(`app/summary`, `app/control`, `app/api/semanggi`, `components/semanggi`,
+`lib/semanggi`). Dua berkas AgentOS ditambal hanya untuk mendaftarkan menu, dan
+`apply.sh` melakukannya lewat jangkar teks yang **gagal keras** kalau tidak
+ditemukan — hulu yang bergeser harus ditinjau, bukan ditambal paksa. Terverifikasi
+`tsc --noEmit` bersih sebelum build.
+
+**Section sidebar bernama Operator tidak ada.** Permintaan menyebut "antara
+Overview dan Operator"; yang benar-benar ada di AgentOS adalah
+`overview / operations / system`. Semanggi diselipkan antara Overview dan
+Operations.
+
+**Proxy, bukan panggilan langsung.** `/api/semanggi/[...path]` meneruskan ke
+controller dengan token dari secret di sisi server, dan hanya untuk jalur yang
+ada di daftar putih. Tiga alasan, yang ketiga menentukan: token tidak pernah
+sampai ke peramban; controller tidak perlu dipublikasikan; dan penjaga
+`instance-protection` AgentOS memblokir mutasi yang tidak terbukti se-origin,
+sehingga panggilan langsung dari peramban ke host lain tidak akan pernah lolos.
+
+**Atribusi: batas yang diketahui, bukan kelalaian.** Satu token bersama berarti
+setiap aksi dari halaman ini tercatat atas satu identitas. Header
+`x-semanggi-actor` membawa nama pengguna AgentOS agar linimasa tetap menyebut
+seseorang, tetapi nama itu berasal dari sesi peramban, bukan dari kredensial —
+ia label, bukan bukti. §8.4 belum terpenuhi lewat permukaan ini; Slack tetap
+satu-satunya jalur yang atribusinya bisa dipercaya.
+
+**Dekomposisi WORK bersifat struktural, bukan semantik.** Permintaan dipecah
+menurut fase yang berlaku untuk pekerjaan jenis itu (analyst → architect →
+builder → reviewer/tester → learner), bukan menurut pemahaman atas kalimatnya.
+Teks permintaan dibawa **utuh** ke setiap fase. Alasannya: gateway 7.1 tidak
+punya metode penyelesaian model tanpa agen (218 metode, semuanya lewat agen),
+jadi planner berbasis model akan menjadi dispatch penuh dengan workspace dan
+lease sendiri — dan sebuah model yang salah membaca satu kalimat menghasilkan
+lima task salah yang sudah memakan worker. Planner semantik tetap terbuka
+sebagai pekerjaan berikutnya.
+
+**Dua aturan yang ditegakkan, bukan didokumentasikan.**
+
+1. *Rencana setengah jadi tidak pernah dibuat.* Brain tiap fase diselesaikan
+   sebelum satu task pun ditulis; kalau ada fase tanpa Brain, tidak ada yang
+   dibuat sama sekali. Terukur hidup: permintaan pertama ditolak dengan
+   *"3 fase belum punya Brain: builder (normal), tester (normal), learner
+   (critical)"* — dan diagnosisnya benar, katalog benih memang tidak punya satu
+   pun Brain berkategori `coding`.
+2. *Pemaku Brain tidak bisa menjadi jalan belakang untuk menurunkan level.*
+   Terukur hidup: `glm-5-1-on` (low) dipaku pada reviewer yang butuh `normal`;
+   pemaku diabaikan, kandidat level dipakai, dan alasannya dilaporkan di
+   rencana alih-alih dibuang diam-diam.
+
+**Bug yang ditemukan sambil jalan: `PUT` tidak pernah membaca body.** `handle`
+hanya mem-parse body untuk `POST` dan `PATCH`, sehingga
+`PUT /api/work/role-levels` — satu-satunya jalan menyetel level per role —
+menolak **setiap** panggilan dengan *"template, role and level are required"*.
+Route yang tidak bisa berhasil di input apa pun, dan tidak ada tes yang
+menyentuhnya dari ujung ke ujung. Diperbaiki beserta tes regresinya.
+
+**Distribusi image adalah celah operasional.** Tidak ada registry di cluster;
+image dibangun di kub01-01 dan Swarm sempat menjadwalkan controller di kub01-02
+yang tidak memilikinya (`Rejected`). Sementara ini image disalin dengan
+`docker save | ssh docker load`. Ini rapuh dan pantas diganti registry internal.
+
+## D37 — Template dan profile adalah setelan project, bukan parameter permintaan
+
+Halaman Control dulu memuat kartu "Context" berisi dropdown template dan
+profile, diisi ulang **setiap kali** seseorang mengirim permintaan WORK. Itu
+salah pada dua tingkat sekaligus.
+
+*Salah secara faktual:* keduanya bukan sifat permintaan, melainkan sifat
+project. Sebuah project tidak berubah dari `software` menjadi `research` karena
+permintaan berikutnya diketik orang lain.
+
+*Salah secara operasional:* bila dua orang mengirim permintaan ke project yang
+sama dengan setelan berbeda, dekomposisinya berbeda tanpa ada yang berniat
+mengubah kebijakan. Setelan per permintaan diam-diam menjadi kebijakan per
+pengetik.
+
+Karena itu `template` dan `profile` menjadi kolom pada `projects`, disetel di
+Settings → Project, dan kartu Context dihapus dari halaman Control. Yang
+tersisa dipilih per permintaan hanyalah **project mana** yang dituju.
+
+**`template` disimpan Semanggi sebagai penampung sementara, dan itu diakui.**
+Pemiliknya sebenarnya AgentOS (`project.json`), tetapi discovery belum ada
+(tugas #4). Sampai itu dibangun, kolom ini adalah salinan yang bisa basi — jadi
+panel Settings menampilkannya **tanpa bisa disunting**: mengedit nilai yang
+tidak dimiliki UI ini hanya akan membuat dua sumber kebenaran yang saling
+bertentangan tanpa ada yang tahu mana yang menang.
+
+Siapa pun boleh mengubah `profile`. Tidak ada gerbang peran karena tidak ada
+peran: satu token bersama berarti seluruh permukaan ini sudah satu identitas
+(D36), dan gerbang yang tidak bisa membedakan siapa pun bukan gerbang.
+
+## D38 — Level thinking MUST diukur per model, bukan dibaca dari iklan agen
+
+Dropdown level pada form Brain semula diisi dari `thinkingOptions` yang
+diiklankan `agents.list`. Iklan itu **tidak bisa dipercaya**, dan sebabnya sudah
+tercatat di D21: gateway memvalidasi `thinking` terhadap model *default*
+(`zai/glm-4.7`), bukan model agen. Akibatnya dua arah: level yang diiklankan
+bisa ditolak saat dispatch, dan level yang tidak diiklankan bisa diterima.
+
+Yang menggantikannya adalah probe empiris: **satu dispatch nyata per level
+kandidat**, dan yang selamat menjadi kosakata model itu. Tiga batas yang
+ditegakkan, masing-masing karena kejadian nyata:
+
+1. **Berlingkup satu model, bukan seluruh armada.** Tujuh level × N model adalah
+   tagihan yang tidak diminta siapa pun. Operator memilih modelnya di form, dan
+   probe hanya menyentuh itu (keputusan operator 2026-09-01).
+2. **Asinkron, dengan status yang bisa ditanyakan.** Tujuh dispatch bisa memakan
+   menit; satu permintaan HTTP yang menunggu selama itu akan mati di suatu
+   tempat di rantai proxy AgentOS dan operator tidak akan tahu apakah probenya
+   masih jalan. Server menjawab seketika, pekerjaannya di latar, UI menanyakan
+   statusnya dan menampilkan kemajuan per level.
+3. **Batas waktu per level ada di server.** Qwen terukur **menggantung** pada
+   sebagian level (D31); batas di sisi klien hanya menyembunyikan gantungnya.
+
+Model tanpa agen hidup ditolak dengan alasan itu, bukan dengan galat generik —
+probe menuntut agen, dan "tidak ada agen untuk model ini" adalah diagnosis yang
+langsung menuntun ke tindakan.
+
+Hasilnya disimpan (`thinking_levels`) beserta buktinya dan dipakai ulang, jadi
+biaya pengukuran dibayar sekali. Daftar model gateway juga dipersistensi
+(`gateway_models`) dengan alasan yang sama.
+
+## D39 — Halaman yang menumpang shell AgentOS, dan dua jebakan yang menyertainya
+
+Dua kelas kesalahan muncul berulang saat menempelkan halaman Semanggi ke dalam
+AgentOS. Keduanya tidak terlihat di `tsc` dan hanya muncul saat halaman dibuka.
+
+**1. Prop fungsi tidak boleh menyeberangi batas server → client.** `app/summary/
+page.tsx` adalah Server Component. Melewatkan callback ke komponen di bawahnya
+membuat React gagal saat serialisasi RSC, dan halamannya kosong. Perbaikannya
+struktural, bukan tambalan: satu shell client per halaman
+(`summary-shell.tsx`, `control-shell.tsx`) menjadi satu-satunya tempat callback
+dibuat.
+
+**2. Kelas Tailwind milik hulu menang atas kelas kita bila urutannya kalah.**
+Panel Semanggi di halaman Settings sempat menyempit karena kelas grid hulu;
+`min-w-0` tidak cukup dan `w-full` yang menyelesaikannya. Pelajaran yang lebih
+umum: menumpang shell orang lain berarti mewarisi kaskade CSS-nya, dan itu MUST
+diuji dengan membuka halamannya, bukan disimpulkan dari markup.
+
+**Komponen Semanggi karena itu meniru bahasa visual AgentOS tanpa mengimpor
+komponennya.** Ongkosnya duplikasi kelas Tailwind; yang dibeli adalah rebase
+yang tetap murah — hulu bebas mengubah komponennya sendiri tanpa menyeret UI
+kita ikut rusak.
+
+## D40 — Transkrip tanpa penalaran dan tool call adalah transkrip yang menyesatkan
+
+D33 menyimpan balasan model sehingga transkrip punya dua sisi. Yang tersimpan
+adalah teks yang **sudah diratakan**, dan perataan itu sengaja membuang blok
+`thinking` — penalaran kerap lebih panjang dari jawabannya dan membanjiri
+tampilan percakapan.
+
+Keputusan itu benar untuk aliran percakapan dan salah untuk pemeriksaan. Ketika
+sebuah task menghasilkan sesuatu yang aneh, pertanyaan operator justru
+*"kenapa ia memutuskan itu, dan perintah apa yang ia jalankan?"* — dan keduanya
+persis yang dibuang.
+
+Karena itu `execution_messages` menyimpan **dua** kolom: `content` yang
+diratakan dan `blocks` JSON mentah yang dibatasi ukurannya. Endpoint transkrip
+mengekspos keduanya; UI yang memutuskan menampilkan Response, Reasoning, atau
+Tool call. Blok bertipe asing ditampilkan apa adanya — blok yang hilang diam-diam
+mudah disalahartikan sebagai blok yang tidak pernah ada.
+
+Baris yang `blocks`-nya rusak merosot menjadi `null` dan `content`-nya tetap
+lewat, bukan menggagalkan seluruh transkrip. Satu baris hasil suntingan tangan
+tidak boleh membuat seluruh riwayat sebuah task tidak bisa dibaca.
+
+**Bug yang ikut ketahuan:** task berstatus `BLOCKED` tidak menawarkan jalan
+kembali di UI, padahal state machine mengizinkannya lewat revisi
+(`BLOCKED → RESUMABLE → QUEUED`). Gerbangnya salah — ia bertanya "apakah task
+sudah selesai", dan `CANCELLED` juga selesai. Sekarang gerbangnya menyebut
+status yang memang bisa direvisi, dan `CANCELLED` tetap jalan buntu.
+
+## D41 — Ada dua Dockerfile AgentOS, dan yang tampak benar adalah yang salah
+
+Build image AgentOS untuk Swarm sempat memakai `agentos-fork/Dockerfile.railway`.
+Ia **berhasil sepenuhnya**: `pnpm build` lulus, type-check bersih, image
+ter-ekspor, terdistribusi ke lima node. Lalu setiap task Swarm mati seketika
+dengan:
+
+```
+OPENCLAW_GATEWAY_TOKEN is required. Configure it with a generated Railway template secret.
+```
+
+Pesannya menunjuk ke secret, dan secret-nya memang ada — sebagai berkas di
+`/run/secrets/`, bukan sebagai env. Yang salah bukan konfigurasinya melainkan
+**entrypoint-nya**: `Dockerfile.railway` menanam entrypoint Railway, yang
+menuntut token sebagai env dan volume di `/data`. Keduanya milik platform lain.
+
+Image yang benar dibangun dari `semanggi-agent-platform/images/agentos/
+Dockerfile`, yang memasang `/usr/local/bin/semanggi-agentos-entrypoint` plus
+loopback proxy, dan menerima fork sebagai build context bernama `agentos-src`.
+
+Dua hal yang membuat ini mahal untuk didiagnosis, dan karena itu dicatat:
+
+- **Container yang sedang berjalan tidak bisa dipakai sebagai pembanding.**
+  `docker exec … env` menampilkan env yang dikonfigurasi, bukan env yang
+  di-`export` entrypoint sebelum ia `exec` ke proses berikutnya. Pemeriksaan
+  itu membuat image lama tampak sama-sama tidak punya token, dan mengaburkan
+  perbedaan yang sesungguhnya. Yang menjawabnya adalah
+  `docker inspect --format '{{json .Config.Entrypoint}}'` pada **container**,
+  bukan pada image — di situ terlihat entrypoint yang benar-benar dipakai.
+- **Swarm rollback otomatis menyembunyikan kegagalan.** `docker service update`
+  melaporkan *"converged"* setelah rollback, sehingga sekilas tampak berhasil.
+  Yang jujur adalah `docker service ps`, yang memperlihatkan task baru
+  `Failed` dan task lama kembali `Running`.
+
+Aturan yang diambil: **verifikasi entrypoint image sebelum deploy**, dan
+perlakukan "converged" sebagai klaim yang harus diperiksa, bukan sebagai bukti.
+
+**Disk node build adalah sumber daya habis.** Build pertama pada ronde ini gagal
+di tengah `apt-get` dengan `No space left on device`; node berada di 100% karena
+tujuh tag image lama menumpuk. Pembersihan MUST menjadi bagian prosedur build —
+dan MUST NOT menyentuh tag yang sedang dipakai service, karena itu satu-satunya
+jalan mundur.
+
+## D42 — Admission menyelesaikan nama Brain dari tabel brains, bukan dari ejaan katalog routing.json
+
+D35 memutuskan katalog `routing.json` menjadi **benih** tabel Brain: disemai
+sekali, sesudah itu operator memiliki isinya lewat halaman konfigurasi. Tapi
+keputusan itu hanya bermigrasi setengah jalan, dan proyek SDMK Kader
+(PRJ-F9D378E5) membayarnya sebagai "agen tidak routable".
+
+**Pengukuran di cluster.** Dua lapisan membaca katalog dengan ejaan yang
+berbeda, dan tidak ada yang menyadarinya sampai sebuah task nyata mencoba
+lewat:
+
+- Dekomposisi menulis `model_policy.preferred = [brain.name]`
+  (`server.mjs:1360`), dan `brains.create` men-slug nama
+  (`brains.mjs:slug`): entri katalog `glm-5.2-max` tersimpan sebagai Brain
+  `glm-5-2-max`.
+- Admission menatap nama itu di katalog `routing.json` lewat lookup string
+  persis `this.#catalog[logical]` (`routing.mjs:134`). Kunci katalog tetap
+  `glm-5.2-max`. Hasilnya setiap Brain yang lahir dari nama ber-titik —
+  semua Brain glm — kembali sebagai `unmapped model names` dan parkir di
+  `WAIT_RESOURCE`. Bahkan Brain yang disemai **dari** katalog itu sendiri
+  tidak pernah cocok dengan katalognya.
+
+Akibatnya persis yang D35 ingin hindari, tapi lewat pintu belakang: halaman
+Settings → Brain / Brain Map hanya berkuasa sampai *seleksi*; begitu sebuah
+Brain terpilih, admission menolaknya kecuali namanya kebetulan juga kunci
+katalog. Rekomendasi "update routing.json" adalah workaround yang cocok dengan
+kode saat itu, namun mengkhianati D35 — berkas jadi pemilik lagi, dan setiap
+penyuntingan operator kembali menuntut deploy.
+
+**Keputusan.** Admission menerima `brains` dan menyelesaikan
+`model_policy.preferred` dari tabel brains dulu (`admission.mjs:
+resolveModelCandidates`). Sebuah Brain aktif menjadi kandidat langsung dari
+barisnya — `provider`, `model`, `thinking`, `effortMode`, `mode`, `acpAgent`
+semua sudah ada di tabel. Katalog `routing.json` turun menjadi **fallback**
+untuk nama yang bukan Brain (mis. model eksplisit yang diketik di Slack), dan
+untuk Brain yang dimatikan tetapi namanya masih punya entri katalog — supaya
+mematikan Brain tidak mengubah rute menjadi jalan buntu.
+
+**Batas yang dipertahankan.** Ini tidak mengubah aturan P4-03: ketersediaan
+masih hanya memutuskan *dispatch atau tunggu*, tidak pernah memperlebar set
+kandidat. Brain yang tidak aktif tidak "digantikan" secara diam-diam; ia jatuh
+ke katalog atau parkir dengan alasan yang dinamai.
+
+**Koreksi fakta yang beredar.** Analisis "agen tidak routable" untuk SDMK
+Kader memuat tiga data yang sudah basi saat diverifikasi di cluster:
+`routing.json` ter-deploy justru punya `glm-5.2-*`/`glm-5.1-on`/`glm-5.3-on`;
+`sdmk-kader-builder` membawa `zai/glm-5.2` (bukan 5.1); dan keenam worker
+PRJ-F9D378E5 sudah ACTIVE. Blocker sesungguhnya adalah bug slug di atas,
+ditambah pin Brain Map yang tidak cocok dengan model agen yang
+di-provision.
+
+**Tes.** Empat regresi di `tests/unit/admission.test.mjs` (nama Brain ter-slug
+rutin dari tabel; Brain baru tanpa entri katalog tetap rutin; Brain mati jatuh
+ke katalog; nama yang bukan keduanya tetap parkir). Keempatnya gagal bila
+wiring `brains` ke admission dilepas — bukti mereka menangkap bugnya, bukan
+hanya menggambarkan niatnya.
+
+## D43 — Pencocokan worker pindah ke repository (`workers.match`), least-loaded
+
+D29 memberi Slack `pickWorker` sendiri: permukaan yang membuat task harus
+memilih worker atau menolak membuat (spec induk §2.4), sementara admission
+hanya memvalidasi penugasan dan tidak pernah membuatnya. Begitu permukaan
+pembuat task bertambah (UI Control), aturan itu berlipat: setiap permukaan
+menulis pencocokannya sendiri, dan dua salinan aturan yang sama pasti
+berbeda pada saat yang paling mahal.
+
+**Keputusan.** Pencocokan diangkat ke `workers.match({ projectId, role })`
+(`repositories.mjs`) dan Slack memakainya juga. Semantiknya: worker ACTIVE,
+boleh mengambil project itu (`project_access`), cocok role bila role
+ditanyakan; pemenang adalah yang **paling ringan bebanannya**
+(`DISPATCHED`+`RUNNING`), bukan yang pertama ditemukan — first-found membuat
+satu worker memikul semua task sementara yang lain menganggur, dan antrean
+tampak sibuk untuk alasan yang tidak nyata. Seri diputus dengan urut `id`
+supaya pilihan dapat direproduksi di tes maupun di log.
+
+## D44 — Sumbu profile di role_levels DICABUT lalu DIKEMBALIKAN dalam satu hari, dan dua migrasi yang menyertainya
+
+Sumbu profile (fast/balanced/quality) pernah dicabut dari `role_levels`
+bersama `project_role_levels`, dengan alasan "jumlah permukaan konfigurasi
+bertambah tanpa bukti operator memakai ketiganya". Alasan itu salah pada
+premisnya: **project yang dibuat AgentOS membawa pasangan (template,
+profile) yang berbeda kebutuhannya** — `(software, fast)` dan `(software,
+quality)` memang dua project berbeda, dan Role Map yang tidak bisa
+membedakannya menjawab pertanyaan yang tidak diajukan. Operator menolak
+pencabutannya pada hari yang sama; keduanya dikembalikan.
+
+Yang dikembalikan, lebih lengkap dari sebelumnya:
+
+- `DEFAULT_ROLE_LEVELS` bersarang **template → profile → role**, seluruh
+  kombinasi eksplisit sesuai spec induk §4.0 (empat golongan role:
+  penentu arah selalu critical; produksi normal dan naik di quality;
+  penilai naik satu tingkat; verifikasi ikut profil). Himpunan role per
+  template harus identik di semua profile — diuji, karena role yang hilang
+  pada satu profile adalah level yang ditebak saat runtime.
+- `project_role_levels` kembali sebagai **snapshot penuh milik project**:
+  begitu modal Project Role Level disimpan, resolusinya
+  `project override > global (template, profile, role) > default bawaan >
+  levelForProfile` — dan dekomposisi WORK project itu mengikuti snapshot
+  ini, bukan lagi global (ditegakkan di jalur `control/message`, bukan cuma
+  di pratinjau). Daftar role modal = role template ∪ role worker yang
+  melayani project ∪ role tersimpan — project nyata boleh punya role di
+  luar kosakata templatenya.
+
+**Dua bentuk database pernah hidup, dua-duanya harus konvergen.** Satu
+build ter-deploy membawa `role_levels (template, role)`; era sebelumnya
+`(template, profile, role)`. `CREATE TABLE IF NOT EXISTS` tidak bisa
+mengubah kunci tabel yang ada, jadi `#migrate()` di `db/index.mjs` kini
+shape-based dua arah: bentuk dua-kolom **diperluas** ke tiga profile dengan
+nilai yang sama (keputusan operator bertahan, grid jadi addressable penuh),
+bentuk tiga-profil yang sudah benar dibiarkan apa adanya. Tanpa ini,
+`INSERT … ON CONFLICT(template, profile, role)` gagal di prepare terhadap
+bentuk lama — kelas D36: route yang tidak bisa berhasil pada input apa pun.
+
+**Tes.** `tests/unit/role-levels-migration.test.mjs` (bentuk dua-kolom
+diperluas, pin brain_map lama mewarisi sel legal, idempoten untuk rolling
+restart), `tests/unit/project-role-levels.test.mjs` (role aktual modal,
+snapshot menang pada dekomposisi WORK, penolakan level yang tidak sah),
+`tests/unit/brains.test.mjs` (tabel §4.0 per golongan role, himpunan role
+seragam antar profile).
+
+## D45 — Brain Map per (template, role, level), dan penurunan yang terlihat
+
+Brain Map semula satu pemaku per `(template, role)` untuk semua level,
+dilindungi aturan "pemaku di bawah level kebutuhan diabaikan" (P4-03).
+Halamannya menjadi grid `(template × role × level)` dengan dropdown per sel
+— dan grid mengubah premis aturan itu: **memilih Brain untuk sel level
+tertentu adalah keputusan eksplisit operator, bukan default yang bocor.**
+Menolak pemaku di bawah level akan memalsukan grid (sel yang diisi lalu
+diam-diam tidak berjalan — kelas kesalahan `stale` D32), jadi aturannya
+berubah bentuk: pemaku **selalu dipakai**, dan Brain yang klasifikasinya di
+bawah level sel ditandai `belowLevel` di resolusi maupun halaman.
+Penurunan tetap tidak pernah diam-diam — ia menjadi terlihat.
+
+Lapisan resolusi kini tiga: pemaku operator > **default grid**
+(`DEFAULT_BRAIN_MAP`, nilai awal 2026-09-04 untuk semua template×role×level)
+> kandidat pertama level (katalog routing). Default grid hanya memakai
+Brain yang benar-benar hidup di instance — default tidak boleh menghidupkan
+kembali Brain yang operator matikan (diuji). Pin lama era tanpa-level
+diwariskan migrasi ke sel-sel yang legal baginya (level ≤ klasifikasi
+Brain-nya), persis sel yang dulu tidak diabaikan aturan lama.
+
+**Tes.** `tests/unit/brain-map.test.mjs` (pemaku per level tidak bocor ke
+sel sebelah; `belowLevel` terlihat; Brain mati ditolak saat disetel; sel
+kosong jatuh ke default lalu kandidat), plus lapisan default di
+`tests/unit/project-role-levels.test.mjs`.
+
+## D46 — Iterasi default lewat sumber di NFS; rebuild image hanya perintah eksplisit
+
+Loop lama membayar harga penuh Docker untuk setiap perubahan: build image di
+`Kubus01-01`, `docker save` ke tar, `scp` ke tiap node, `docker load`, lalu
+`service update --image`. Untuk control plane nol-dependensi dan halaman UI,
+harga itu tidak membeli apa-apa — tidak ada isolasi yang didapat dari image
+yang tidak sudah diberikan oleh NFS yang memang dipakai untuk state.
+
+Keputusan: service menjalankan kode dari dua direktori sumber di NFS —
+`agentos-src/` (standalone build AgentOS) dan `controller-src/` (sumber
+controller apa adanya) — dan iterasi menjadi **sunting → tes → sync →
+restart**. Rebuild image hanya terjadi atas perintah eksplisit, atau bila
+perubahan menyentuh entrypoint, Dockerfile, base image, atau dependensi
+sistem; hasilnya di-push ke registry.
+
+Konsekuensi yang dicatat sengaja:
+
+- **Controller langsung jalan dari sumber** karena nol dependensi runtime;
+  stack menimpa `command` ke `controller-src/src/main.mjs` dan env konfigurasi
+  menunjuk `controller-src/config/`. Skema dan thinking-levels aman karena
+  keduanya resolve relatif `import.meta.url`, bukan cwd.
+- **AgentOS tetap butuh build** — Next.js tidak dijalankan dari sumber mentah
+  di produksi. Yang pindah hanyalah *tempat* build: `pnpm build` di node build
+  (tanpa Docker), hasilnya dirakit persis seperti `images/agentos/Dockerfile`
+  (standalone + `.next/static` + `public` + `loopback-proxy.mjs`) lalu
+  di-swap atomik lewat rename di filesystem yang sama. Bentuk artefak kedua
+  jalur identik, jadi jalur cepat dan jalur image menjalankan bentuk yang sama.
+- **Gagal keras, bukan fallback.** Entrypoint yang menemukan
+  `SEMANGGI_AGENTOS_SRC_DIR` tanpa `server.js` berhenti dengan galat. Jatuh
+  ke salinan basi dalam image akan terlihat seperti kode baru yang hidup —
+  kelas kesalahan yang sama dengan D41.
+- **Swap atomik.** Skrip sync menyalin ke staging lalu `mv`; container yang
+  restart di tengah sync melihat pohon lama lengkap atau pohon baru lengkap,
+  tidak pernah campuran.
+- **Satu rebuild terakhir tetap diperlukan**: dukungan sumber NFS hidup di
+  entrypoint image AgentOS. Migrasi = isi kedua direktori → rebuild image
+  sekali → deploy stack baru. Setelah itu image menjadi baseline yang jarang
+  berubah.
+- **Placement disederhanakan menjadi satu label untuk semua service**:
+  `node.labels.type == app`, dan klaster secara kontrak hanya melibatkan dua
+  node — `kub01-01` dan `kub01-02`; node lain MUST NOT diberi label ini.
+  Label khusus (`semanggi_nfs`, `semanggi_docker_engine`) dihapus dari stack,
+  spec, dan tes kontrak: kelayakan NFS tetap diverifikasi terpisah lewat
+  kontrak path (AT-01, `nfs-path-contract.sh`), bukan lewat label placement.
+
+Alat: `scripts/sync-controller-src.sh`, `scripts/sync-agentos-src.sh`;
+kontrak volume baru dijaga `tests/stack-schema.sh`.
+
+## D47 — Penolakan lambat gateway dipetakan ke eksekusi; `reasoning` config adalah kontrak level thinking
+
+Insiden TASK-E28D15F3 / TASK-BFA56024 (2026-09-05): kedua task DISPATCHED,
+lalu 30 menit hening dengan token 0, lalu BLOCKED dengan pesan watchdog
+generik `no runtime event for 1806s after dispatch`. Resume mengulang siklus
+yang sama persis. Empat kali dispatch, empat kali pola yang sama.
+
+**Mekanisme yang sebenarnya.** Gateway menjawab dispatch **dua kali**: `res ✓`
+(diterima, ~120ms) lalu `res ✗` kedua dengan
+`UNAVAILABLE: Thinking level "max" is not supported for zai/glm-5.2. Use one
+of: off.` begitu run gagal start. Klien menyelesaikan promise pada frame
+pertama — benar, karena frame kedua memang tidak bisa membatalkan promise
+yang sudah settled (D20). Frame kedua menjadi event `gateway.late-error`…
+yang **tidak punya konsumen di mana pun**: komentar di `gateway-ws.mjs`
+mengklaim "the sink treats it like any other failure", tetapi tidak ada satu
+pun kode yang menangani event itu. Klaim tanpa implementasi — dan watchdog
+30 menit menjadi satu-satunya backstop, dengan pesan yang tidak menyebut
+penyebabnya.
+
+**Akar config.** `openclaw.json` mendeklarasikan `zai/glm-5.2` dengan
+`"reasoning": false`, sehingga gateway hanya menawarkan `off`. Brain
+`glm-5-2-max` justru membawa evidence probe `off 137 → low 217 → max 284
+token (n=3), monoton` — pengukuran nyata yang hanya mungkin bila config
+pernah `reasoning: true`. Mtime config adalah 2026-09-04 16:51 (hari migrasi
+state + repair gateway); penulisan ulang config hari itu mengembalikan
+`reasoning: false` dan diam-diam membatalkan hasil ukur semua Brain zai.
+Pelajaran yang mengikat: **kontrak level thinking adalah `reasoning` di
+config gateway**, bukan hasil probe yang tersimpan — probe mengukur apa yang
+diizinkan config pada saat itu, dan config bisa berubah tanpa memberi tahu
+siapa pun. Koreksi: `reasoning: true` untuk glm-5.2/glm-5.1, dan glm-5.3
+ditambahkan ke daftar model (Brain sudah memakainya tapi config tidak
+mengenalnya).
+
+**Perbaikan.** Dua lapis, keduanya dengan tes regresi:
+
+- `gateway-ws.mjs` mencatat `requestId → executionId` saat dispatch dikirim
+  (TTL 10 menit, bounded 200 entri), karena frame penolakan kedua tidak
+  membawa pengenal yang bisa dicocokkan sendiri. Event `gateway.late-error`
+  kini membawa `runId` eksekusi.
+- `session-events.mjs` menambah `applyLateError`: eksekusi yang masih
+  DISPATCHED divonis BLOCKED dengan alasan sebenarnya (`dispatch refused
+  after accept: …`), task BLOCKED, lease dilepas, scheduler dibangunkan —
+  bentuk verdict yang sama dengan watchdog, tetapi dalam milidetik. Eksekusi
+  yang sudah final atau RUNNING tidak boleh divonis oleh frame ini.
+
+**Batas yang tetap benar:** perbaikan config membuat dispatch mengalir lagi,
+tetapi bukti bahwa effort `max` benar-benar mengubah perilaku glm-5.2 adalah
+probe lama yang kondisi config-nya tidak bisa direkonstruksi penuh. Bila
+kualitas hasil mengecewakan, probe ulang terhadap config yang sekarang —
+jangan percaya evidence lama (aturan §4.1 poin 9).
+
+## D48 — Uji koneksi Brain jujur sampai run selesai; transkrip dikaitkan lewat kunci sesi yang dikirim
+
+Dua lubang dengan akar yang sama — *frame balasan pertama gateway diperlakukan
+sebagai kebenaran terakhir* — ditemukan pada hari yang sama (2026-09-05).
+
+**Lubang pertama: tombol Test berbohong.** Test koneksi Brain (`testAgent`)
+melaporkan `ok: true` begitu dispatch diterima, padahal gateway menjawab
+dispatch **dua kali**: `res ✓` lalu `res ✗` bila run gagal start (diukur:
+thinking level yang tidak didukung model). Akibatnya Settings → Brain
+menampilkan "OK · xxx ms" untuk `glm-5-2-max` yang setiap dispatch-nya
+ditolak — persis insiden D47, tetapi kali ini UI-nya ikut menjamin hal yang
+salah. Perbaikan: `ok` hanya untuk status selesai yang terukur (himpunan
+yang sama dengan probe, `COMPLETED_STATUSES`); timeout dilaporkan sebagai
+kemungkinan hang, `agent.wait` yang tak tersedia dilaporkan sebagai "tidak
+bisa dikonfirmasi", dan penolakan dilaporkan dengan pesan gateway apa
+adanya. Tes regresi di `gateway-ws.test.mjs`.
+
+**Lubang kedua: transkrip kosong untuk run yang benar-benar bekerja.**
+TASK-E28D15F3/TASK-BFA56024 selesai dengan token tercatat, tetapi transkrip
+keduanya hanya berisi instruksi operator. Pemisahan yang menjelaskan: usage
+dikunci di memori memakai **kunci sesi yang dibawa event** (jadi selamat),
+sedangkan korelasi pesan mencocokkan `executions.session_ref` — dan revisi
+CONTINUE mengirim kunci komposit `…:s<ref warisan>` yang **tidak pernah**
+disimpan sebagai session_ref. Setiap pesan di tengah run gagal dikaitkan dan
+dibuang. Perbaikan tiga lapis: kolom baru `executions.session_key` (migrasi
+idempoten; baris lama NULL dan jatuh ke jalur lama), handoff dispatch
+mengembalikan kunci yang dikirim, dan sink mengaitkan pesan lewat kunci itu
+dahulu — eksekusi yang belum final menang, karena revisi CONTINUE berbagi
+satu kunci percakapan. Tes regresi di `session-events.test.mjs` dan
+`session-key-migration.test.mjs`. UI tidak berubah bentuknya: `blocks`
+(thinking/text/toolCall) dan giliran toolResult memang sudah mengalir lewat
+endpoint transkrip — selama ini hanya tidak pernah terisi.
+
+**Batas yang disengaja:** transkrip merekam apa yang lewat event
+`session.message` (reasoning, jawaban, toolCall, toolResult), dibatasi
+`SEMANGGI_MAX_MESSAGE_BYTES` per giliran. Ia tidak merekam isi file yang
+diubah agen — itu jejak workspace, bukan percakapan — dan blok tak dikenal
+ditampilkan apa adanya, bukan disembunyikan.
+
+## Open questions for phase 4+
+
+1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.
+2. **Status reconciliation.** POC-2 E3/E7 found AgentOS dispatch records that stay `running` or report `timeout` after the work succeeded. The controller must not trust a single poll; reconciliation strategy is a phase-4 decision.
+3. **Fairness window length.** Currently 24 hours. Whether that matches how the team actually experiences fairness is an empirical question for the §12.4 evaluation.
+4. **`claude-code` concurrency.** Modelled as an ordinary resource, but a Pro subscription's real limit is a rolling usage window rather than a concurrency count. Needs POC-3 E8 numbers.

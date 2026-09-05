@@ -1739,6 +1739,34 @@ ketiga jalur dipusatkan di `blockLateError()` supaya mekanikanya tidak
 bercerai — celah sinyal D51 lahir persis dari salinan yang berdrift.
 
 
+## D53 — PREPARE "daftarkan…" mendaftarkan task dari docs/tasks.md; id task boleh disebut sebagai kode
+
+**Keputusan (2026-09-06).** PREPARE punya dua wujud: penyusunan dokumen
+rencana (D50) dan pendaftaran task dari `docs/tasks.md` — dideteksi dari
+verba "daftarkan" + rujukan `tasks.md` pada payload. Parser
+(`interface/tasks-md.mjs`) membaca format checklist yang diminta prompt
+"Create tasks" sendiri (`- [ ] **T-XX — Judul**` + baris metadata
+`**Role:** … · **Dep:** … · **Deskripsi:** …`, satu baris dipisah "·" —
+parser memeriksa ketiganya pada baris yang sama, bukan if/continue). Item
+`[x]` dilewati; dependensi antar temporary ID dipetakan ke id task nyata
+dengan acuan maju dibuang (checklist ditulis top-down).
+
+**Status default CREATED, bukan QUEUED.** Mendaftarkan 40+ task sekaligus
+langsung ke antrian berarti satu kesalahan baca dokumen langsung memakan
+worker seluruh project — alasan yang sama dekomposisi menahan fase
+lanjutannya. Frasa "langsung jalankan" (dilonggarkan ejaannya: pola
+`lan[a-z]*\s+(di)?jalan`) memindahkan semuanya ke QUEUED; admission tetap
+yang memutuskan — dependensi parkir di WAIT_DEP persis seperti hasil
+dekomposisi, jadi "langsung" tidak pernah berarti buta.
+
+**Id task boleh disebut `#4F59F63A` atau kode polos `4F59F63A`.**
+`normalizeTaskIds` di intent router menambah prefiks TASK- sebelum
+ekstraksi, sehingga semua handler menerima satu bentuk kanonik. Sengaja
+ketat — tepat 8 digit hex (bentuk `shortId("TASK")`), kode polos harus
+UPPERCASE ("deadbeef" lowercase tak terbedakan dari prosa) — karena pola
+yang lebih longgar akan memanen commit hash menjadi task id.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

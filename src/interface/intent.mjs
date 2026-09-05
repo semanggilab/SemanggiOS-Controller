@@ -41,6 +41,25 @@ export const Action = Object.freeze({
 
 const TASK_ID = /\b(TASK-[A-Z0-9]{4,})\b/i;
 
+/**
+ * Operators refer to tasks by code, not by full id: "#4F59F63A" or bare
+ * "4F59F63A". Both are normalized to TASK-4F59F63A before extraction so
+ * every downstream handler sees one canonical shape. Deliberately strict —
+ * exactly 8 hex digits, the shape shortId("TASK") produces — because a
+ * looser pattern would turn ordinary prose (commit hashes, ticket numbers
+ * from other systems) into task ids. Bare codes must be UPPERCASE: a
+ * lowercase 8-hex word ("deadbeef") is indistinguishable from prose.
+ */
+export function normalizeTaskIds(text) {
+  let s = String(text ?? "");
+  s = s.replace(/#([0-9A-Fa-f]{8})\b/g, (_m, code) => `TASK-${code.toUpperCase()}`);
+  // Canonicalize any casing of the full prefix first ("task-4f59f63a"), so
+  // the bare-code pass below can never double-prefix it.
+  s = s.replace(/\btask-([0-9A-Fa-f]{8})\b/gi, (_m, code) => `TASK-${code.toUpperCase()}`);
+  s = s.replace(/(?<!TASK-)\b([0-9A-F]{8})\b/g, "TASK-$1");
+  return s;
+}
+
 // An explicit verb is a command; everything else has to earn its classification.
 // Note `(\s|$)` rather than `\b`: \b matches before a hyphen, so "TASK-ABCD"
 // was being read as the verb "task" and queued as new work.
@@ -111,7 +130,11 @@ export function parseDuration(text) {
  *   intent CONFIRM means: ask the operator what they meant. Never act.
  */
 export function classify(raw) {
-  let text = String(raw ?? "").trim().replace(/^@\S+\s*/, "");
+  // Normalized BEFORE prefix stripping so a declared payload ("TASK: stop
+  // #4F59F63A") and a bare command ("status 4F59F63A") both reach the same
+  // canonical id — and so the `text` every handler receives already carries
+  // the full TASK- form.
+  let text = normalizeTaskIds(String(raw ?? "").trim().replace(/^@\S+\s*/, ""));
   if (!text) return { intent: Intent.CONFIRM, action: null, taskId: null, confidence: 0, text, reason: "empty message" };
 
   // Declared intent: strip the prefix and remember it. Everything after the

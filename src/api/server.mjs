@@ -21,8 +21,10 @@ import {
   resolveLevel,
 } from "../domain/brains.mjs";
 import { DEFAULT_BRAIN_MAP } from "../domain/brain-map.mjs";
-import { buildPlan } from "../domain/decompose.mjs";
+import { buildPlan, ROLE_CATEGORY } from "../domain/decompose.mjs";
+import { EventKind } from "../domain/events.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
+import { parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
 import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
@@ -1310,6 +1312,89 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     return { comment: { taskId: id, text, by, at: now() } };
   });
 
+  // --- register tasks from docs/tasks.md -------------------------------------
+  //
+  // Pendaftaran task dari dokumen checklist (PREPARE "daftarkan…"). Dokumen
+  // adalah sumbernya; controller hanya memindahkan apa yang tertulis ke
+  // basis data — judul, deskripsi, role, dependensi antar temporary ID.
+  //
+  // Status default CREATED (tertahan): mendaftarkan 40+ task sekaligus
+  // langsung ke antrian berarti satu kesalahan baca dokumen langsung
+  // memakan worker seluruh project — alasan yang sama dekomposisi menahan
+  // fase lanjutannya. Bila operator minta "langsung jalankan", semuanya
+  // QUEUED dan admission yang memutuskan siapa yang benar-benar jalan
+  // (dependensi parkir di WAIT_DEP persis seperti hasil dekomposisi).
+  async function registerTasksFromDoc({ projectId, text, actor }) {
+    const project = await repos.projects.get(projectId);
+    if (!project) throw badRequest(`unknown project ${projectId}`);
+    const root = project.workspace_path;
+    if (!root) {
+      return { ok: false, reason: "Project belum punya workspace — docs/tasks.md tidak bisa dibaca." };
+    }
+    let content;
+    try {
+      content = await readFile(`${root}/docs/tasks.md`, "utf8");
+    } catch {
+      return { ok: false, reason: "docs/tasks.md tidak ada — buat dulu lewat PREPARE “Create tasks”." };
+    }
+    const items = parseTasksMd(content).filter((t) => !t.done);
+    if (items.length === 0) {
+      return {
+        ok: false,
+        reason: "Tidak ada task yang bisa didaftarkan dari docs/tasks.md — semua sudah [x], atau format checklist tidak dikenali.",
+      };
+    }
+    // D43: setiap permukaan pembuat task match worker dengan cara yang sama.
+    const worker = await repos.workers.match({ projectId });
+    if (!worker) {
+      return {
+        ok: false,
+        reason:
+          "Tidak ada worker aktif yang boleh mengerjakan project ini — daftarkan worker dengan akses ke project tersebut lebih dulu.",
+      };
+    }
+    const immediate = wantsImmediateRun(text);
+    const idByLocal = new Map();
+    const registered = [];
+    for (const item of items) {
+      // Dependensi hanya ke task yang sudah terdaftar di atasnya — checklist
+      // ditulis top-down, jadi referensi maju (kalau ada) dibuang, bukan
+      // dibuat menggantung ke id yang tidak ada.
+      const dependsOn = item.deps.map((d) => idByLocal.get(d)).filter(Boolean);
+      const task = await repos.tasks.create({
+        projectId,
+        workerId: worker.id,
+        title: item.title.slice(0, 120),
+        description: item.description ?? item.title,
+        workspacePath: root,
+        modelPolicy: item.role && ROLE_CATEGORY[item.role] ? { category: ROLE_CATEGORY[item.role] } : {},
+        dependsOn,
+      });
+      idByLocal.set(item.localId, task.id);
+      await controller.events.append({
+        kind: EventKind.TASK_CREATED,
+        subjectType: "task",
+        subjectId: task.id,
+        actor,
+        payload: { source: "docs/tasks.md", localId: item.localId, role: item.role, dependsOn },
+      });
+      if (immediate) {
+        await repos.tasks.setStatus(task.id, Status.QUEUED, { actor });
+      }
+      registered.push({
+        localId: item.localId,
+        id: task.id,
+        title: item.title,
+        status: immediate ? Status.QUEUED : Status.CREATED,
+        role: item.role,
+        deps: item.deps,
+      });
+    }
+    if (immediate) await scheduler.notify(WakeReason.TASK_CREATED);
+    log.info("control.tasks-registered", { project: projectId, count: registered.length, immediate, by: actor });
+    return { ok: true, registered, immediate };
+  }
+
   // --- control surface ------------------------------------------------------
   //
   // Permukaan chat untuk UI Semanggi. Berbagi router intent dengan Slack
@@ -1342,6 +1427,44 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       const taskProjectId = body.projectId ?? process.env.SEMANGGI_DEFAULT_PROJECT ?? null;
       if (!taskProjectId) throw badRequest("projectId is required (tidak ada project default yang dikonfigurasi)");
       const by = actor?.kind === "operator" ? actor.name : String(body.user ?? "agentos-ui");
+
+      // "Daftarkan semua tasks yang ada di docs/tasks.md…" juga PREPARE:
+      // menyiapkan pekerjaan agar bisa dijalankan — hanya saja hasilnya
+      // bukan dokumen, melainkan task di basis data. Dideteksi dari verba
+      // "daftarkan" + rujukan ke tasks.md; di luar itu jatuh ke jalur
+      // penyusunan dokumen rencana di bawah.
+      if (/daftarkan/i.test(parsed.text) && /tasks\.md/i.test(parsed.text)) {
+        const outcome = await registerTasksFromDoc({ projectId: taskProjectId, text: parsed.text, actor: by });
+        if (!outcome.ok) {
+          return {
+            intent: "PREPARE",
+            action: "register",
+            taskId: null,
+            needsConfirmation: false,
+            target: null,
+            reply: outcome.reason,
+            tasks: [],
+            registered: [],
+          };
+        }
+        return {
+          intent: "PREPARE",
+          action: "register",
+          taskId: null,
+          needsConfirmation: false,
+          target: null,
+          reply:
+            `${outcome.registered.length} task didaftarkan dari docs/tasks.md — ` +
+            (outcome.immediate
+              ? "semua masuk antrian (QUEUED) dan mengalir sesuai dependensinya."
+              : "semua berstatus CREATED, menunggu dijalankan; tambah “langsung jalankan” untuk mengantrekannya.") +
+            `  _(${by})_`,
+          tasks: [],
+          registered: outcome.registered,
+          created: true,
+        };
+      }
+
       const outcome = await createPrepareTask(controller, {
         projectId: taskProjectId,
         text: parsed.text,

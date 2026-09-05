@@ -29,6 +29,20 @@ test("the bot prefix is stripped", () => {
   assert.equal(classify("@semanggi status TASK-ABCD").action, Action.STATUS);
 });
 
+test("task ids may be given as #code or bare code — normalized to TASK-", () => {
+  // 8 hex digits is the shape shortId("TASK") produces; anything looser
+  // would harvest commit hashes and prose into task ids.
+  assert.equal(classify("status #4F59F63A").taskId, "TASK-4F59F63A");
+  assert.equal(classify("status 4F59F63A").taskId, "TASK-4F59F63A");
+  assert.equal(classify("stop task-4f59f63a").taskId, "TASK-4F59F63A");
+  // Already-complete ids are not double-prefixed.
+  assert.equal(classify("status TASK-4F59F63A").taskId, "TASK-4F59F63A");
+  // Lowercase 8-hex words are indistinguishable from prose — left alone.
+  assert.equal(classify("cek commit deadbeef di repo").taskId, null);
+  // The normalized id is what handlers receive in `text` too.
+  assert.match(classify("status #4F59F63A").text, /TASK-4F59F63A/);
+});
+
 test("P4-12: an unclassifiable message asks rather than acts", () => {
   for (const text of ["do the needful", "", "??? whatever"]) {
     const r = classify(text);

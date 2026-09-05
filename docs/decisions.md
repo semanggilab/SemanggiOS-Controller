@@ -1767,6 +1767,91 @@ UPPERCASE ("deadbeef" lowercase tak terbedakan dari prosa) — karena pola
 yang lebih longgar akan memanen commit hash menjadi task id.
 
 
+## D54 — `[-]` sebagai tanda "sudah didaftarkan"; `/task cancel` dan `/task run` multi-id; controller menulis docs/ untuk suntingan operator
+
+**Keputusan (2026-09-06).** Tiga permukaan Command Center yang sebelumnya
+memaksa operator mengulang pekerjaan:
+
+**`[-]` di docs/tasks.md = task sudah hidup di basis data.** Register
+menulis balik checkbox `[ ]` → `[-]` SETELAH seluruh loop sukses (bukan per
+task di tengah loop — kegagalan task ke-N tidak boleh menandai task yang
+belum dibuat). Register berikutnya hanya mendaftarkan `[ ]`; `[-]` dan `[x]`
+dilewati, sehingga pendaftaran ulang tidak pernah menduplikasi. Bila tidak
+ada `[ ]` tersisa, jawabannya "Semua tasks sudah didaftarkan sebelumnya" —
+bukan pesan galat, karena tidak ada yang salah. Kegagalan menulis balik
+bukan kegagalan mendaftarkan (task sudah ada), jadi ia jadi peringatan di
+jawaban, bukan rollback.
+
+**`cancel` adalah verba sendiri, dan `run`/`cancel` menerima multi-id.**
+CANCEL ≠ PAUSE: CANCELLED jalan buntu, BLOCKED bisa dijalankan ulang.
+Classifier mengekstrak semua id (`taskIds`; duplikat dilipat), handler
+menilai setiap id mandiri — satu id yang sudah bergerak/mati dilaporkan,
+tidak menggagalkan batch. Konfirmasi destruktif multi-id mendeskripsikan
+SEMUA target sebelum minta "yes" (§8.7: cara paling halus membunuh B adalah
+konfirmasi yang hanya menyebut A).
+
+**Controller menulis docs/, tidak pernah memory/.** PUT
+`/api/work/projects/{id}/docs/{name}` untuk tombol Edit/Save modal —
+mount workspaces controller berubah dari read-only menjadi RW (stack),
+PEMBERIAN IZIN INI SEKECIL MUNGKIN: whitelist hanya nama di `docs/`
+(brief, architecture, migration-plan, plans, tasks); `memory/`
+(blueprint, decisions) tetap ditolak PUT karena itu wilayah agen dua-tingkat
+(spec §9) — controller yang menulis memori agen adalah penulis kedua atas
+berkas yang bukan miliknya. Setiap penyimpanan tercatat di event_log
+(`project.doc-updated`). Pelajaran berbayar dari hari pertama: smoke test
+PUT JANGAN memakai dokumen project hidup — brief.md production tertimpa
+"# smoke edit" dan harus dipulihkan byte-demi-byte dari transkrip
+(`execution_messages` menyimpan hasil Read agen); gunakan project buangan
+atau dokumen dummy.
+
+
+## D54 — penghapusan task: hard delete tanpa riwayat eksekusi, soft delete bila ada; hanya CREATED dan CANCELLED
+
+**Keputusan (2026-09-06).** Papan penuh dengan pekerjaan yang tidak akan
+pernah jalan: 95 task `CREATED` (stok PREPARE "daftarkan", D53 — status
+default yang memang menahan mereka di luar antrian) dan 20 task `CANCELLED`
+yang ditinggalkan operator. Tidak ada jalur API untuk menghapus mereka, dan
+aturan 6 CLAUDE.md melarang `DELETE` tangan ke basis data — jadi satu-satunya
+"pembersihan" yang tersedia adalah membiarkan papan tenggelam.
+
+**Hanya `CREATED` dan `CANCELLED` yang boleh dihapus**
+(`DELETABLE_STATUSES`). Keduanya terbukti menganggur: CREATED belum pernah
+masuk antrian, dan CANCELLED adalah jalan buntu tanpa exit di state machine —
+menghapusnya tidak mungkin menghentikan pekerjaan yang sedang terjadi. Status
+lain (QUEUED, WAIT_*, BLOCKED, RESUMABLE, bahkan COMPLETE/FAILED) adalah
+pekerjaan yang masih atau bisa menjadi hidup — revisi menghidupkan COMPLETE
+dan FAILED kembali — dan menghapus mereka berarti menghentikan pekerjaan
+diam-diam, pelanggaran §8.7.
+
+**Hard delete bila tidak ada eksekusi; soft delete (`deleted_at`) bila ada.**
+Ini bukan preferensi estetika tapi paksaan skema: trigger
+`executions_no_delete` membuat riwayat eksekusi immutable, dan FK
+`executions.task_id → tasks.id` menolak penghapusan baris task yang masih
+ditunjuk. Diukur di cluster sebelum keputusan: 3 dari 20 CANCELLED punya
+eksekusi. Transkrip menggantung di eksekusi, jadi baris task harus tinggal —
+tetapi disembunyikan dari SEMUA listing (`list()` menyaring `deleted_at IS
+NULL`; scheduler ikut lewat `list()` yang sama, jadi tidak ada cabang kedua
+yang bisa membocorkan). `includeDeleted` hanya untuk audit. Task tanpa
+eksekusi dihapus total bersama tepi dependensi kedua arah dan approval-nya;
+`event_log` tidak pernah ikut terhapus — ia jejak audit, bukan milik task.
+
+**Setiap penghapusan menulis `task.deleted` di transaksi yang sama** dengan
+penghapusan barisnya (payload: status, title, projectId, method hard/soft,
+note, actor). Task yang menghilang tanpa entri penghapusan akan membuat
+basis data tampak kehilangan sejarah — penyakit yang sama dengan `UPDATE`
+tangan yang aturan 6 larang.
+
+**API: `DELETE /api/work/tasks/{id}` dan `POST /api/work/tasks/purge`.**
+Purge menerima daftar status eksplisit dan menolak status di luar
+DELETABLE_STATUSES satu per satu; jawaban menyebut SETIAP task yang dihapus
+(id + judul + method) dan yang ditolak (alasan) — pembersihan 115 task harus
+bisa diaudit dari responsnya saja. Keduanya admin-only, mengikuti preseden
+penghapusan project. Dispatcher kini mem-parse body DELETE juga — `note`
+dibaca dari body, dan pelajaran D36 (route yang body-nya tidak pernah
+di-parse tidak bisa berhasil) berlaku untuk setiap method, bukan hanya
+POST/PATCH/PUT.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

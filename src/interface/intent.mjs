@@ -111,7 +111,12 @@ const CHATTY = /^(hi|halo|hello|thanks|terima kasih|makasih|good morning|pagi|si
 // Found live 2026-09-05: "WORK: Baca semua dokumen…" fell through to
 // "could not classify" because "work" was never a verb, and "TASK:" died on
 // the verb boundary, which demands whitespace — a colon is not whitespace.
-const INTENT_PREFIX = /^(work|task|prepare)\s*:\s*/i;
+//
+// Bentuk utama adalah sintaks slash ala chatbot (`/work`, `/task`,
+// `/prepare`); bentuk lama dua-titik TETAP diterima karena router ini dibagi
+// dengan Slack dan kebiasaan lama tidak boleh mati diam-diam — yang berubah
+// adalah bentuk yang dipasang tombol-tombol template.
+const INTENT_PREFIX = /^(?:\/(work|task|prepare)\b|(work|task|prepare)\s*:)\s*:?\s*/i;
 
 const DURATION = /(\d+)\s*(m|min|mins|minute|minutes|menit|h|hr|hrs|hour|hours|jam)\b/i;
 
@@ -143,7 +148,8 @@ export function classify(raw) {
   let forced = null;
   const prefix = INTENT_PREFIX.exec(text);
   if (prefix) {
-    forced = prefix[1].toUpperCase();
+    // Grup 1 = bentuk slash (`/work`), grup 2 = bentuk dua-titik lama (`WORK:`).
+    forced = (prefix[1] ?? prefix[2]).toUpperCase();
     text = text.slice(prefix[0].length).trim();
     if (!text) {
       return {
@@ -152,7 +158,7 @@ export function classify(raw) {
         taskId: null,
         confidence: 0.4,
         text,
-        reason: `empty "${forced}:" command — say what should be done`,
+        reason: `empty "/${forced.toLowerCase()}" command — say what should be done`,
       };
     }
   }

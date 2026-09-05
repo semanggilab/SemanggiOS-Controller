@@ -32,9 +32,9 @@ const DESTRUCTIVE = new Set([Action.PAUSE]);
 const LIVE = ["PENDING", "DISPATCHED", "RUNNING"];
 
 const HELP =
-  "`task <what to do>` · `WORK: <what to do>` (decompose into phases) · " +
-  "`PREPARE: <guidance>` (one analyst task → docs/plans.md + docs/tasks.md) · " +
-  "`TASK: <what to do>` (one direct task) · `queue` · `status TASK-XXXX` · `stop TASK-XXXX` · " +
+  "`task <what to do>` · `/work <what to do>` (decompose into phases) · " +
+  "`/prepare <guidance>` (one analyst task → docs/plans.md + docs/tasks.md) · " +
+  "`/task <what to do>` (one direct task) · `queue` · `status TASK-XXXX` · `stop TASK-XXXX` · " +
   "`model TASK-XXXX glm-5.2 high` · `run TASK-XXXX` · `approve TASK-XXXX` · `expedite TASK-XXXX 30m`";
 
 export function createSlackApp(controller, { defaultProjectId = null, log = nullLogger } = {}) {

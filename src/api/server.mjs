@@ -37,8 +37,8 @@ const LEVEL_RANK = Object.freeze({ [Level.LOW]: 0, [Level.NORMAL]: 1, [Level.CRI
 
 const CONTROL_HELP =
   "Tulis pekerjaan yang ingin dikerjakan dan saya pecah menjadi task, " +
-  "awali dengan `PREPARE:` untuk satu task penyusun docs/plans.md + docs/tasks.md, " +
-  "awali dengan `TASK:` untuk satu task langsung, " +
+  "awali dengan `/prepare` untuk satu task penyusun docs/plans.md + docs/tasks.md, " +
+  "awali dengan `/task` untuk satu task langsung, " +
   "atau beri perintah pada task yang ada (status/stop/run/model TASK-XXXX).";
 
 /**

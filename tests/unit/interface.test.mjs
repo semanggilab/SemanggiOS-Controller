@@ -284,6 +284,32 @@ test("prefix WORK:/TASK: adalah deklarasi intent, bukan tebiasa", () => {
   assert.equal(task.text, "Perbaiki bug kecil pada footer");
 });
 
+test("sintaks slash /work /task /task adalah bentuk utama deklarasi intent", () => {
+  const work = classify("/work Baca semua dokumen dan buat rencana implementasi.");
+  assert.equal(work.intent, Intent.WORK);
+  assert.equal(work.action, Action.CREATE);
+  assert.equal(work.confidence, 1);
+  assert.equal(work.text, "Baca semua dokumen dan buat rencana implementasi.");
+
+  const prepare = classify("/prepare daftarkan semua tasks yang ada di docs/tasks.md");
+  assert.equal(prepare.intent, Intent.PREPARE);
+  assert.equal(prepare.action, Action.CREATE);
+
+  // Verba task-scope setelah /task tetap menjadi perintah, bukan payload.
+  const status = classify("/task status TASK-1234");
+  assert.equal(status.intent, Intent.TASK);
+  assert.equal(status.action, Action.STATUS);
+  assert.equal(status.taskId, "TASK-1234");
+
+  const stop = classify("/task stop #4F59F63A");
+  assert.equal(stop.action, Action.PAUSE);
+  assert.equal(stop.taskId, "TASK-4F59F63A");
+
+  // "/task" kosong tetap bertanya; "/taskX" bukan prefix (batas kata).
+  assert.equal(classify("/task").intent, Intent.CONFIRM);
+  assert.notEqual(classify("/taskxyz sesuatu").intent, Intent.TASK);
+});
+
 test("prefix dengan payload kosong tetap bertanya, bukan beraksi", () => {
   const r = classify("WORK:");
   assert.equal(r.intent, Intent.CONFIRM);

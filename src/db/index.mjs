@@ -91,6 +91,29 @@ class SqliteStore {
       this.#db.exec(`CREATE INDEX IF NOT EXISTS idx_executions_session_key ON executions(session_key)`);
     }
 
+    // D51: jadwal reset kuota dua level menjadi milik Brain. Backfill dari
+    // keluarga provider — jendela per-menit+harian untuk google, 5
+    // jam+mingguan untuk sisanya — supaya kebijakan retry bisa memutuskan
+    // sebelum sinyal provider pertama tiba. Brain yang dibuat setelah migrasi
+    // mendapat nilai yang sama dari create() (brains.mjs), jadi dua jalan ini
+    // tidak boleh berbeda pendapat.
+    const brainCols2 = cols("brains");
+    if (brainCols2.length > 0 && !brainCols2.includes("quota_reset_short_ms")) {
+      this.#db.exec(`ALTER TABLE brains ADD COLUMN quota_reset_short_ms INTEGER`);
+      this.#db.exec(`ALTER TABLE brains ADD COLUMN quota_reset_long_ms INTEGER`);
+      this.#db.exec(`
+        UPDATE brains SET
+          quota_reset_short_ms = CASE provider WHEN 'google' THEN 60000 ELSE 18000000 END,
+          quota_reset_long_ms  = CASE provider WHEN 'google' THEN 86400000 ELSE 604800000 END
+      `);
+    }
+
+    // D51: penghitung retry kuota jendela pendek. Default 0: task warisan
+    // belum pernah gagal karenanya.
+    if (taskCols.length > 0 && !taskCols.includes("quota_retries")) {
+      this.#db.exec(`ALTER TABLE tasks ADD COLUMN quota_retries INTEGER NOT NULL DEFAULT 0`);
+    }
+
     // D37: template and profile move from a per-request parameter (typed into
     // the Control page every time) to a per-project setting (typed once, in
     // Settings → Project). Existing rows get the same defaults the code

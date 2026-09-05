@@ -25,6 +25,7 @@ import { buildPlan } from "../domain/decompose.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
 import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
+import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
 import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -1091,10 +1092,21 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     const out = [];
     for (const b of list) {
       const resource = await repos.resources.get(b.provider, b.model);
+      // D51: jadwal reset dan kebijakan ulangnya diturunkan di sini, bukan
+      // disimpan dua kali — otak keputusan ada di quota-windows.mjs dan UI
+      // hanya menampilkan apa yang scheduler akan lakukan.
       out.push({
         ...b,
         availability: resource?.availability ?? "UNKNOWN",
         nextAvailableAt: resource?.next_available_at ?? null,
+        quotaReset: {
+          shortMs: b.quotaResetShortMs,
+          longMs: b.quotaResetLongMs,
+          shortLabel: describeWindow(b.quotaResetShortMs),
+          longLabel: describeWindow(b.quotaResetLongMs),
+          autoRetry: isRetryableWindow(b.quotaResetShortMs),
+          retryLimit: QUOTA_RETRY_LIMIT,
+        },
       });
     }
     return { brains: out };

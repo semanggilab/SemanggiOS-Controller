@@ -18,6 +18,7 @@
 // luar itu — bahkan untuk admin. Jadi Brain TIDAK bisa dipasangkan ke agen mana
 // pun saat dispatch. Pooler memilih agen yang sudah membawa Brain yang tepat;
 // ia tidak pernah mengonfigurasi ulang agen (D35).
+import { QUOTA_WINDOWS_BY_PROVIDER } from "./quota-windows.mjs";
 /** Level yang menghubungkan profil project dengan kandidat Brain. */
 export const Level = Object.freeze({ LOW: "low", NORMAL: "normal", CRITICAL: "critical" });
 
@@ -157,10 +158,25 @@ export function createBrains(store, { now, shortId }) {
     effortEvidence: row.effort_evidence,
     mode: row.mode,
     acpAgent: row.acp_agent,
+    quotaResetShortMs: row.quota_reset_short_ms ?? null,
+    quotaResetLongMs: row.quota_reset_long_ms ?? null,
     level: row.level,
     category: row.category,
     enabled: Boolean(row.enabled),
   });
+
+  // D51: jadwal reset default mengikuti keluarga provider. Pemanggil yang
+  // menyertakan nilai eksplisit menang — operator yang tahu lebih baik dari
+  // tabel ini harus bisa menulisnya, dan Brain ber-provider asing (bukan salah
+  // satu kunci di bawah) menyimpan null daripada menebak.
+  const windowOrNullOrThrow = (v, field, name) => {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`brain "${name}": ${field} must be a positive number of milliseconds or null`);
+    }
+    return Math.round(n);
+  };
 
   const brains = {
     async create({
@@ -175,6 +191,8 @@ export function createBrains(store, { now, shortId }) {
       effortEvidence = null,
       mode = "interactive",
       acpAgent = null,
+      quotaResetShortMs,
+      quotaResetLongMs,
       level = Level.NORMAL,
       category = null,
       enabled = true,
@@ -193,12 +211,16 @@ export function createBrains(store, { now, shortId }) {
         throw new Error(`level must be one of ${Object.values(Level).join("|")}, got "${level}"`);
       }
       const id = shortId("BRN");
+      const defaults = QUOTA_WINDOWS_BY_PROVIDER[String(provider ?? "").toLowerCase()] ?? null;
+      const short = quotaResetShortMs === undefined ? defaults?.shortMs ?? null : windowOrNullOrThrow(quotaResetShortMs, "quotaResetShortMs", name);
+      const long = quotaResetLongMs === undefined ? defaults?.longMs ?? null : windowOrNullOrThrow(quotaResetLongMs, "quotaResetLongMs", name);
       await store.run(
         `INSERT INTO brains (id, name, description, provider, model, thinking, effort_mode,
-                             effort_evidence, mode, acp_agent, level, category, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                             effort_evidence, mode, acp_agent, quota_reset_short_ms, quota_reset_long_ms,
+                             level, category, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, slug(name), description, provider, model, thinking, effortMode, effortEvidence,
-         mode, acpAgent, level, category, enabled ? 1 : 0, now(), now()],
+         mode, acpAgent, short, long, level, category, enabled ? 1 : 0, now(), now()],
       );
       return brains.get(id);
     },
@@ -233,6 +255,15 @@ export function createBrains(store, { now, shortId }) {
 
       if (patch.description !== undefined) put("description", patch.description);
       if (patch.thinking !== undefined) put("thinking", patch.thinking);
+      // D51: jadwal reset boleh berubah saat provider mengubah paketnya —
+      // berbeda dari provider/model yang memang beku, jadwal adalah fakta
+      // komersial yang bisa berpindah tanpa pindah model.
+      if (patch.quotaResetShortMs !== undefined) {
+        put("quota_reset_short_ms", windowOrNullOrThrow(patch.quotaResetShortMs, "quotaResetShortMs", before.name));
+      }
+      if (patch.quotaResetLongMs !== undefined) {
+        put("quota_reset_long_ms", windowOrNullOrThrow(patch.quotaResetLongMs, "quotaResetLongMs", before.name));
+      }
       if (patch.level !== undefined) {
         if (!Object.values(Level).includes(patch.level)) throw new Error(`invalid level "${patch.level}"`);
         put("level", patch.level);
@@ -309,6 +340,20 @@ export function createBrains(store, { now, shortId }) {
           )
         : await store.all(`SELECT * FROM brains WHERE enabled = 1 AND level = ? ORDER BY name`, [level]);
       return rows.map(present);
+    },
+
+    /**
+     * Brain untuk satu (provider, model) — dipakai jalur kegagalan kuota
+     * (D51) untuk membaca jadwal reset tanpa menunggu sinyal provider.
+     * Beberapa Brain bisa berbagi model; yang pertama menang karena jadwal
+     * reset milik model, bukan milik pilihan thinking/effort.
+     */
+    async forModel(provider, model) {
+      const row = await store.get(
+        `SELECT * FROM brains WHERE provider = ? AND model = ? ORDER BY enabled DESC, name LIMIT 1`,
+        [provider, model],
+      );
+      return row ? present(row) : null;
     },
   };
 

@@ -6,6 +6,7 @@
 // runtime capacity last, so a task never holds a lease while waiting on quota.
 import { Status, ExecutionStatus } from "../domain/state-machine.mjs";
 import { EventKind } from "../domain/events.mjs";
+import { QUOTA_RETRY_LIMIT, isRetryableWindow } from "../domain/quota-windows.mjs";
 import { orderCandidates } from "./selection.mjs";
 import { assertDispatchPathAllowed } from "./routing.mjs";
 import { nullLogger } from "../domain/logger.mjs";
@@ -449,6 +450,61 @@ export function createAdmission({
       if (err.quota) {
         await repos.resources.applyQuotaSignal(err.quota.provider, err.quota.model, err.quota);
         const resource = await repos.resources.get(err.quota.provider, err.quota.model);
+
+        // D51: a short (per-minute) window makes redispatch cheap, but not
+        // free forever — without a limit, a drained daily cap hiding behind
+        // RPM errors becomes a task that retries every minute for days and
+        // an event log full of nothing else. Ten failed attempts in a row
+        // means the window is not the problem, and the task says so plainly.
+        const brain = brains ? await brains.forModel(err.quota.provider, err.quota.model) : null;
+        if (isRetryableWindow(brain?.quotaResetShortMs ?? null)) {
+          const fresh = await repos.tasks.get(task.id);
+          const retries = fresh?.quota_retries ?? 0;
+          if (retries >= QUOTA_RETRY_LIMIT) {
+            log.warn("quota.retry-exhausted", {
+              task: task.id, exec: execution.id,
+              provider: err.quota.provider, model: err.quota.model,
+              attempts: retries,
+            });
+            return {
+              ok: false,
+              status: Status.BLOCKED,
+              detail: `quota retries exhausted (${QUOTA_RETRY_LIMIT}x): ${err.quota.provider}/${err.quota.model}: ${err.quota.message}`,
+            };
+          }
+          // The provider's reset time when it gave one, else one short
+          // window — the same rule the late-error path applies, so both
+          // entry points to a retry land on the same clock.
+          const eta =
+            resource?.next_available_at && resource.next_available_at > now()
+              ? resource.next_available_at
+              : now() + brain.quotaResetShortMs;
+          if (!resource?.next_available_at) {
+            // Anchor the resource to the same clock: a QUOTA_EXHAUSTED row
+            // without next_available_at is never released by the scheduler's
+            // window pass, which would wedge every OTHER task on this model
+            // long after this one's retry succeeded.
+            await repos.resources.applyQuotaSignal(err.quota.provider, err.quota.model, {
+              status: 429,
+              resetsAt: eta,
+              rateLimitType: err.quota.rateLimitType ?? null,
+              message: err.quota.message,
+            });
+          }
+          await repos.tasks.bumpQuotaRetry(task.id, eta);
+          log.warn("quota.parked", {
+            task: task.id, exec: execution.id,
+            provider: err.quota.provider, model: err.quota.model,
+            windowKind: err.quota.rateLimitType ?? null,
+            nextAvailableAt: resource?.next_available_at ?? null,
+            quotaRetry: retries + 1,
+            limit: QUOTA_RETRY_LIMIT,
+          });
+          return wait(Status.WAIT_QUOTA, `${err.quota.provider}/${err.quota.model}: ${err.quota.message}`, {
+            nextRetryAt: eta,
+          });
+        }
+
         log.warn("quota.parked", {
           task: task.id, exec: execution.id,
           provider: err.quota.provider, model: err.quota.model,

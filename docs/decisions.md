@@ -1644,6 +1644,62 @@ analyst merapikannya. Prompt berikutnya sebaiknya membatasi run tasks pada
 menulis docs/tasks.md saja bila pengetatan ini diinginkan.
 
 
+## D51 — jadwal reset kuota milik Brain; jendela per-menit dicoba ulang sampai 10× sebelum diblokir
+
+**Keputusan (2026-09-05, permintaan operator).** Setiap Brain menyimpan dua
+kolom `quota_reset_short_ms` / `quota_reset_long_ms` dengan default per
+keluarga provider: google (Gemini) **per-menit + harian**; zai (GLM),
+claude-code, groq (QWEN) **5 jam + mingguan**. Kegagalan kuota pada model
+yang jendela pendeknya ≤ 60 detik (`RETRYABLE_SHORT_WINDOW_MS`) TIDAK langsung
+memblokir task: task diparkir `WAIT_QUOTA` selama tepat satu jendela pendek
+(resetsAt provider menang bila ada), lalu di-dispatch ulang, sampai
+**`QUOTA_RETRY_LIMIT` = 10 kali**; baru setelah itu `BLOCKED` dengan alasan
+yang menyebut hitungannya. Jendela 5 jam tetap parkir-ETA seperti sebelumnya —
+menunggu 60 detik itu murah, menunggu 5 jam sambil berpura-pura "retry" tidak.
+
+**Mengapa milik Brain, bukan resources.** Tabel resources merekam keadaan
+SEKARANG (QUOTA_EXHAUSTED sampai kapan), bukan karakter jendelanya, dan sinyal
+provider tidak selalu tiba sebelum tabrakan pertama. Jadwal reset adalah
+properti model di sisi provider; menyimpannya di Brain membuat kebijakan retry
+bisa memutuskan sebelum sinyal pertama, dan operator melihatnya di halaman yang
+sama dengan modelnya (kolom "Quota" + dua select di form Brain, label
+Inggris sesuai §4.2).
+
+**Dua lubang yang kebetulan ditemukan saat menggali.** (1) Jalur late-error
+(`gateway.late-error` → `applyLateError`) memblokir task kuota TANPA memanggil
+`applyQuotaSignal` — task mati untuk alasan yang tidak pernah dipelajari
+scheduler, lalu task berikutnya menabrak tembok yang sama. Sekarang sinyal
+selalu direkam di kedua jalur. (2) Detektor lama
+(`/rate limit|too many requests|session limit|usage limit/i`) tidak mengenali
+kosakata Gemini ("quota", "RESOURCE_EXHAUSTED") — deteksi kini satu fungsi
+bersama `isQuotaErrorMessage` (quota-windows.mjs) yang dipakai repos dan
+runtime.
+
+**Menyamakan jam.** `resetsAt` dari pesan bisa epoch-detik ATAU milidetik; ia
+dinormalisasi sebelum dibandingkan dengan jam (1,7e9 detik selalu tampak
+"masa lalu" bagi `now()` milidetik — bug yang tertangkap tes, bukan review).
+Bila sinyal tidak membawa ETA dan jendela retry-able, **jendela itu sendiri
+menjadi jam** — untuk task DAN untuk resources, karena `releaseExpiredQuota`
+hanya melepas baris QUOTA_EXHAUSTED yang punya `next_available_at`; sinyal
+tanpa ETA akan mengunci model itu untuk semua task selamanya.
+
+**Transisi baru: `DISPATCHED → WAIT_QUOTA`.** Late-refusal adalah event yang
+sama dengan yang admission tangani sebelum accept; parkir adalah pencatatan
+yang jujur. Hanya kuota yang mendapat pintu keluar ini — task yang tidak pernah
+jalan tidak bisa menunggu hal lain.
+
+**Hitungan di-nol-kan** saat COMPLETE (applyEnd) dan saat revisi
+(createRevision): hitungan mengukur satu rentetan kalah, bukan umur task —
+task yang sudah terbukti lewat sekali tidak memikul dosa percobaan lamanya,
+dan operator yang me-revision blocked task sudah mengambil keputusan.
+
+**Batas yang diketahui.** Retry in place hanya melihat jendela PENDEK; kuota
+harian Gemini yang terkuras tampak sebagai 10 kegagalan per-menit beruntun
+lalu BLOCKED — itulah perilaku yang diminta, bukan bug. Otak kebijakan ada di
+`src/domain/quota-windows.mjs`; API menurunkannya sebagai `quotaReset` di
+`GET /api/work/brains` supaya UI tidak pernah menurunkan kebijakan sendiri.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

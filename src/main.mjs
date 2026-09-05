@@ -120,6 +120,9 @@ async function main() {
     events: controller.events,
     runtime,
     scheduler: controller.scheduler,
+    // D51: the late-error quota branch reads each model's reset schedule
+    // from the brains table to decide wait-one-window vs block.
+    brains: controller.brains,
     log: log.child({ component: "session-events" }),
   });
 

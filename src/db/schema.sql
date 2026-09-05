@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   pending_instruction TEXT,
   expedite_until INTEGER,
   next_retry_at  INTEGER,                       -- e.g. quota next_available
+  -- D51: berapa kali dispatch task ini sudah gagal karena kuota jendela
+  -- pendek. Naik satu tiap parkir-retry; nol saat COMPLETE dan saat revisi —
+  -- keberhasilan dan keputusan operator memulai hitungan baru.
+  quota_retries  INTEGER NOT NULL DEFAULT 0,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL
 );
@@ -315,6 +319,13 @@ CREATE TABLE IF NOT EXISTS brains (
   effort_evidence TEXT,
   mode           TEXT NOT NULL DEFAULT 'interactive',
   acp_agent      TEXT,
+  -- D51: jadwal reset kuota provider milik model ini (dua level). Jendela
+  -- PENDek yang masuk kelas "retry in place" (≤ RETRYABLE_SHORT_WINDOW_MS,
+  -- saat ini per-menit) membuat kegagalan kuota dicoba ulang sampai
+  -- QUOTA_RETRY_LIMIT kali sebelum task diblokir; jendela panjang hanya
+  -- informasi operator. NULL = belum diketahui (tidak pernah retry in place).
+  quota_reset_short_ms INTEGER,
+  quota_reset_long_ms  INTEGER,
   level          TEXT NOT NULL DEFAULT 'normal'
                  CHECK (level IN ('low','normal','critical')),
   category       TEXT,

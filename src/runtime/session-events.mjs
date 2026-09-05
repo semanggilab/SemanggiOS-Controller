@@ -33,6 +33,12 @@
 // error.
 import { EventKind } from "../domain/events.mjs";
 import { ExecutionStatus, Status } from "../domain/state-machine.mjs";
+import {
+  QUOTA_RETRY_LIMIT,
+  isQuotaErrorMessage,
+  isRetryableWindow,
+  parseQuotaReset,
+} from "../domain/quota-windows.mjs";
 import { nullLogger } from "../domain/logger.mjs";
 
 /**
@@ -116,7 +122,19 @@ export function isEmptyUsage(u) {
   );
 }
 
-export function createSessionEventSink({ repos, events, runtime, scheduler, now = () => Date.now(), log = nullLogger }) {
+export function createSessionEventSink({
+  repos,
+  events,
+  runtime,
+  scheduler,
+  // D51: the quota branch needs each model's reset schedule, and the brains
+  // table owns it. Optional so the sink stays constructible in tests without
+  // seeding a brain — a null brains means quota refusals take the old
+  // always-block path, which is still correct for every non-retryable case.
+  brains = null,
+  now = () => Date.now(),
+  log = nullLogger,
+}) {
   // Keyed by sessionKey, NOT runId.
   //
   // This is the bug that made every completed execution report zero tokens:
@@ -171,6 +189,12 @@ export function createSessionEventSink({ repos, events, runtime, scheduler, now 
       reason: verdict.task === Status.COMPLETE ? null : `run ended: ${verdict.reason}`,
       actor: "session-events",
     });
+    if (verdict.task === Status.COMPLETE) {
+      // D51: success starts the quota retry count over. A task that got
+      // through once does not carry the attempts of the run that finally
+      // worked — the count measures one losing streak, not a task's life.
+      await repos.tasks.resetQuotaRetries(execution.task_id);
+    }
 
     const task = await repos.tasks.get(execution.task_id);
     if (task?.workspace_path) {
@@ -240,20 +264,131 @@ export function createSessionEventSink({ repos, events, runtime, scheduler, now 
       return { handled: false, reason: `not awaiting first event (${execution.status})` };
     }
 
+    // Frees the workspace for whichever attempt comes next — a retry in the
+    // quota branch, or a revision in the blocked one. Either way this run is
+    // over and must not hold the path.
+    const releaseLease = async () => {
+      const task = await repos.tasks.get(execution.task_id);
+      if (task?.workspace_path) {
+        const lease = await repos.leases.get(task.workspace_path);
+        if (lease?.execution_id === runId) {
+          await repos.leases.release(task.workspace_path, { executionId: runId, actor: "gateway-late-error" });
+        }
+      }
+    };
+
+    // D51: a quota refusal that surfaces here used to block the task AND skip
+    // applyQuotaSignal — the worst of both: the task died for a reason the
+    // scheduler never learned, so the resource stayed AVAILABLE and the next
+    // task walked into the same wall. Now the signal is always recorded, and
+    // for models whose SHORT reset window is retry-sized (per-minute), the
+    // task parks in WAIT_QUOTA for exactly one window instead of dying: the
+    // cheap thing to do with a wall that disappears in sixty seconds is wait,
+    // up to QUOTA_RETRY_LIMIT times — after that the window is not the
+    // problem (a drained daily cap, an outage) and blocking tells the truth.
+    if (isQuotaErrorMessage(message)) {
+      const { resetsAt, rateLimitType } = parseQuotaReset(message);
+      const brain = brains ? await brains.forModel(execution.model_provider, execution.model_id) : null;
+      const shortMs = brain?.quotaResetShortMs ?? null;
+      const retryable = isRetryableWindow(shortMs);
+      try {
+        await repos.resources.applyQuotaSignal(execution.model_provider, execution.model_id, {
+          status: 429,
+          // When the message carries no clock and the window is retry-sized,
+          // the window itself is the clock — and it must anchor the RESOURCE
+          // too: releaseExpiredQuota only flips a QUOTA_EXHAUSTED entry whose
+          // next_available_at exists, so a signal without one would wedge the
+          // model for every task, not just this one.
+          resetsAt: resetsAt ?? (retryable ? now() + shortMs : null),
+          rateLimitType,
+          message: String(message).slice(0, 300),
+        });
+      } catch (err) {
+        // The signal routes OTHER tasks around the wall; this task's own
+        // handling must not depend on it succeeding.
+        log.error("quota.signal-failed", { exec: runId, error: String(err.message).slice(0, 200) });
+      }
+
+      if (retryable) {
+        const current = await repos.tasks.get(execution.task_id);
+        const retries = current?.quota_retries ?? 0;
+        if (retries < QUOTA_RETRY_LIMIT) {
+          // The provider's own reset time wins when it gave one; otherwise
+          // wait exactly one short window — "tunggu 1× reset, coba lagi".
+          // The message timestamp can arrive as epoch seconds OR millis, so
+          // normalise BEFORE comparing to the clock: 1.7e9 seconds always
+          // looks "in the past" to a 1.7e12 millisecond now().
+          const resetsAtMs = resetsAt ? (resetsAt < 1e12 ? resetsAt * 1000 : resetsAt) : null;
+          const eta = resetsAtMs && resetsAtMs > now() ? resetsAtMs : now() + shortMs;
+          const retryDetail = `quota retry ${retries + 1}/${QUOTA_RETRY_LIMIT}: ${message}`;
+          await repos.executions.setStatus(runId, ExecutionStatus.FAILED, {
+            result: `dispatch refused after accept: ${message}`,
+          });
+          await repos.tasks.setStatus(execution.task_id, Status.WAIT_QUOTA, {
+            reason: retryDetail,
+            waitDetail: retryDetail,
+            actor: "gateway-late-error",
+          });
+          await repos.tasks.bumpQuotaRetry(execution.task_id, eta);
+          await releaseLease();
+          await events.append({
+            kind: EventKind.QUOTA_DECISION,
+            subjectType: "task",
+            subjectId: execution.task_id,
+            payload: {
+              source: "gateway.late-error",
+              executionId: runId,
+              decision: "wait",
+              quotaRetry: retries + 1,
+              limit: QUOTA_RETRY_LIMIT,
+              nextRetryAt: eta,
+              error: payload?.error ?? null,
+            },
+          });
+          log.warn("quota.late-retry", {
+            task: execution.task_id, exec: runId,
+            provider: execution.model_provider, model: execution.model_id,
+            attempt: retries + 1, limit: QUOTA_RETRY_LIMIT,
+            nextRetryAt: eta,
+            error: String(message).slice(0, 300),
+          });
+          await scheduler?.notify?.("RUN_ENDED");
+          return { handled: true, status: Status.WAIT_QUOTA, quotaRetry: retries + 1 };
+        }
+        // Fall through to BLOCKED with the count named in the reason: after
+        // ten failures "blocked" must not look identical to a first refusal.
+        const detail = `quota retries exhausted (${QUOTA_RETRY_LIMIT}x, ${execution.model_provider}/${execution.model_id}): ${message}`;
+        await repos.executions.setStatus(runId, ExecutionStatus.BLOCKED, { result: detail });
+        await repos.tasks.setStatus(execution.task_id, Status.BLOCKED, {
+          reason: detail,
+          waitDetail: detail,
+          actor: "gateway-late-error",
+        });
+        await releaseLease();
+        await events.append({
+          kind: EventKind.EXECUTION_STATUS,
+          subjectType: "execution",
+          subjectId: runId,
+          payload: { source: "gateway.late-error", quotaRetriesExhausted: retries, error: payload?.error ?? null },
+        });
+        log.warn("dispatch.late-error", {
+          task: execution.task_id, exec: runId,
+          provider: execution.model_provider, model: execution.model_id,
+          quotaRetries: retries,
+          error: String(message).slice(0, 300),
+        });
+        await scheduler?.notify?.("RUN_ENDED");
+        return { handled: true, status: Status.BLOCKED, quotaRetriesExhausted: true };
+      }
+    }
+
     const detail = `dispatch refused after accept: ${message}`;
     await repos.executions.setStatus(runId, ExecutionStatus.BLOCKED, { result: detail });
     await repos.tasks.setStatus(execution.task_id, Status.BLOCKED, {
       reason: detail,
       actor: "gateway-late-error",
     });
-
-    const task = await repos.tasks.get(execution.task_id);
-    if (task?.workspace_path) {
-      const lease = await repos.leases.get(task.workspace_path);
-      if (lease?.execution_id === runId) {
-        await repos.leases.release(task.workspace_path, { executionId: runId, actor: "gateway-late-error" });
-      }
-    }
+    await releaseLease();
 
     await events.append({
       kind: EventKind.EXECUTION_STATUS,

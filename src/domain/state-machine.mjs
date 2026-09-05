@@ -88,7 +88,19 @@ const TRANSITIONS = new Map(
     // observes outcomes, not every step: a short task can finish between two
     // polls and we never witness RUNNING. Inventing the missing transition
     // would be recording something that did not happen.
-    DISPATCHED: [Status.RUNNING, Status.COMPLETE, Status.BLOCKED, Status.FAILED, Status.CANCELLED],
+    // WAIT_QUOTA is reachable the same way for the same reason: a provider
+    // refusal that arrives after accept is the same event admission handles
+    // BEFORE accept, and parking is the honest recording of it. Only quota
+    // gets this exit — a task that never started cannot wait on anything
+    // else (D51).
+    DISPATCHED: [
+      Status.RUNNING,
+      Status.COMPLETE,
+      Status.WAIT_QUOTA,
+      Status.BLOCKED,
+      Status.FAILED,
+      Status.CANCELLED,
+    ],
     // RUNNING → WAIT_HUMAN is the permission pause: the interposer holds a tool
     // call mid-turn, so the run is alive but waiting on a person. It returns to
     // RUNNING on approval (POC-3 E3), which is why this is not a terminal exit.

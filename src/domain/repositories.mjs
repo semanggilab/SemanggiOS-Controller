@@ -9,6 +9,7 @@ import {
   isExecutionTerminal,
 } from "./state-machine.mjs";
 import { PROFILES } from "./brains.mjs";
+import { isQuotaErrorMessage } from "./quota-windows.mjs";
 import { nullLogger } from "./logger.mjs";
 
 /**
@@ -442,6 +443,26 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       return tasks.get(taskId);
     },
 
+    // D51: penghitung gagal-kuota jendela pendek. Naik satu saat sebuah
+    // percobaan dispatch diparkir untuk dicoba ulang; menulis ETA di sini
+    // sekaligus (bukan lewat setRetryAt terpisah) supaya hitungan dan jadwal
+    // tidak pernah berpisah di tengah jalan.
+    async bumpQuotaRetry(taskId, nextRetryAt) {
+      await store.run(
+        `UPDATE tasks SET quota_retries = quota_retries + 1, next_retry_at = ?, updated_at = ? WHERE id = ?`,
+        [nextRetryAt, now(), taskId],
+      );
+      return tasks.get(taskId);
+    },
+
+    // Nol saat keberhasilan (COMPLETE) dan saat revisi: hitungan mengukur
+    // satu rentetan kegagalan, bukan keseluruhan hidup task — task yang sudah
+    // terbukti lewat sekali tidak pantas memikul dosa percobaan lamanya.
+    async resetQuotaRetries(taskId) {
+      await store.run(`UPDATE tasks SET quota_retries = 0 WHERE id = ?`, [taskId]);
+      return tasks.get(taskId);
+    },
+
     // A revision does not mutate history (spec induk §5.2): the previous
     // Execution rows stay frozen and the task is re-queued carrying only the
     // new session mode and instruction.
@@ -461,8 +482,11 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
             taskId,
           ]);
         }
+        // A revision also resets the quota retry count (D51): an operator who
+        // re-queues blocked work has made a decision, and the counter that
+        // measured the OLD attempts must not condemn the new ones.
         await store.run(
-          `UPDATE tasks SET session_policy = ?, pending_instruction = ?, updated_at = ? WHERE id = ?`,
+          `UPDATE tasks SET session_policy = ?, pending_instruction = ?, quota_retries = 0, updated_at = ? WHERE id = ?`,
           [sessionMode, instruction, now(), taskId],
         );
         // BLOCKED cannot go straight back to QUEUED — the state machine routes
@@ -1001,7 +1025,11 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
      * carry a real ETA instead of a guess.
      */
     async applyQuotaSignal(provider, model, { status, resetsAt = null, rateLimitType = null, message = null, retryAfterSeconds = null }) {
-      const is429 = status === 429 || /rate limit|too many requests|session limit|usage limit/i.test(message ?? "");
+      // The detector lives in quota-windows (D51) and is a superset of the
+      // regex that lived here: Gemini exhaustions say "quota" /
+      // "RESOURCE_EXHAUSTED" with no 429 and no "rate limit", so this regex
+      // let them through and a Gemini wall never became a scheduling fact.
+      const is429 = status === 429 || isQuotaErrorMessage(message);
       if (!is429) return resources.get(provider, model);
       const at = resetsAt
         ? resetsAt < 1e12

@@ -424,6 +424,23 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
       return Array.isArray(agents) ? agents : [];
     },
 
+    /**
+     * D65: operator-initiated probe-agent creation for the Brain Test button.
+     *
+     * This is NOT the autonomous provisioning the registry deliberately
+     * refuses (fleet shape during scheduling stays an operator decision) —
+     * it fires only from an explicit Test click, creates exactly one
+     * deterministic, conventionally-named agent (`sem-workspaces-probe-*`,
+     * the same shape the probe fleet already uses), and is idempotent by
+     * name. agents.create needs operator.admin, which the controller identity
+     * has held since 2026-08-21 (model override); the shape {name, workspace,
+     * model} is the one scripts/provision-agents.mjs measured on the wire.
+     */
+    async createProbeAgent({ name, workspace, model }) {
+      const payload = await request("agents.create", { name, workspace, model });
+      return { id: payload?.id ?? name, name };
+    },
+
     async health() {
       try {
         const h = await connect();

@@ -2236,3 +2236,39 @@ Agen probe yang tercipta tetap ada (mengikuti konvensi probe agent),
 sehingga tes berikutnya untuk model yang sama langsung lolos resolve.
 (Sinkron dengan D64 rev.3: provider dropdown kini ter-reduksi ke live,
 dan auto-provision ini menutup celah pengalamannya).
+
+**Rev.2 (2026-09-06, setelah tombol Tetap gagal di cluster).** Implementasi
+pertama D65 menelan setiap kegagalan `ensureProbeAgent` dan menjawab pesan
+lama "No agent is currently provisioned … pin one via Brain Map" — sehingga
+kegagalan nyata tidak pernah sampai ke operator. Pengukuran langsung di
+cluster (mistral-custom/codestral-latest):
+
+1. **Akar EACCES:** `agents.create` menjalankan `ensureAgentWorkspace` →
+   `fs.mkdir(workspace, {recursive})` **sebagai uid gateway (1000)**
+   (entrypoint image menurunkan privilese; `docker exec` tanpa `-u`
+   berjalan sebagai root dan MENIPU — mkdir "berhasil" di exec while
+   PID 1 gagal). `workspaces/probe/` di NFS dimiliki root:root 755, jadi
+   uid 1000 tidak bisa membuat direktori provider baru. Probe groq/
+   cerebras selama ini hidup karena direktorinya sudah dibuat operator
+   dengan ownership yang benar. Perbaikan ops (sekali, di node):
+   `chown 1000:1000` direktori `workspaces/probe/` — gateway dan
+   controller sama-sama uid 1000, sesuai konvensi mount.
+2. **Bentuk respons `agents.create`:** payload membawa `agentId`
+   (hasil `createAgent` di gateway: `{status, agentId, name, workspace,
+   …}`), bukan `id` — pembacaan `payload?.id` selalu jatuh ke fallback
+   nama. `createProbeAgent` kini membaca `agentId ?? id ?? name`.
+3. **Kontrak baru `runBrainTest`:** kegagalan provisioning →
+   `reason:"provision-failed"` dengan error gateway apa adanya (plus
+   petunjuk chown bila EACCES); sukses provisioning tapi belum
+   ter-advertise di `agents.list` → tetap diuji pakai id yang dipegang
+   (agen yang benar-benar rusak menolak dengan kata-kata gatewaynya
+   sendiri — lebih jujur daripada menyangkal agen yang baru dibuat);
+   respons membawa `provisioned:true` agar log/UI bisa membedakan.
+4. **Workspace fallback mutlak:** fallback lama
+   `workspaces/probe/<provider>` RELATIF — melanggar kontrak mount
+   (path host = path container); kini workspace selalu absolut, diturunkan
+   dari probe agent hidup (…/workspaces/probe/<provider>) atau root
+   konvensional (env `SEMANGGI_PROBE_WORKSPACE_ROOT`).
+
+**Test:** 456 → 460 (auto-provision sukses + uji by-id saat re-list kosong +
+surfas kegagalan EACCES + runtime tanpa createProbeAgent).

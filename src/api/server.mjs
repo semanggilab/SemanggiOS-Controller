@@ -2073,12 +2073,16 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
 
   // --- brain connection test --------------------------------------------------
   //
-  // "Test" berarti: cari agen yang SUDAH ada dan sudah membawa model Brain ini,
-  // lalu kirim satu prompt sekali pakai. Tidak ada RPC untuk menguji kombinasi
-  // (provider, model, thinking) secara abstrak — satu agen membawa tepat satu
-  // model (D35), dan gateway menolak menjalankan model di luar itu bahkan untuk
-  // admin. Kalau belum ada agen untuk Brain ini, itu dilaporkan apa adanya,
-  // bukan disamarkan sebagai kegagalan koneksi.
+  // "Test" berarti: kirim satu prompt sekali pakai ke agen yang membawa model
+  // Brain ini. Tidak ada RPC untuk menguji kombinasi (provider, model,
+  // thinking) secara abstrak — satu agen membawa tepat satu model (D35), dan
+  // gateway menolak menjalankan model di luar itu bahkan untuk admin. Kalau
+  // belum ada agen untuk Brain ini, D65: buat probe agent sekali pakai (nama
+  // deterministik, idempoten) lalu uji dia. Kegagalan pembuatannya
+  // disurfasikan apa adanya — menelan error dan menjawab pesan "belum ada
+  // agen" yang lama adalah bug terukur (2026-09-06): EACCES di NFS terbaca
+  // sebagai "buat agen dulu di AgentOS", padahal tombol Test itulah yang
+  // seharusnya menyelesaikannya.
   //
   // `claude-code` MUST NOT be matched the same way as every other provider.
   // It is harness-routed (POC-3, agent-registry.mjs `isHarnessRouted`): the
@@ -2120,42 +2124,79 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
 
   function slug(s) { return String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); }
 
+  // D65: the workspace a probe agent lives in. MUST be absolute — the mount
+  // contract says host and container paths are identical, and a relative
+  // workspace is an agent that silently works nowhere (the pre-fix fallback
+  // `workspaces/probe/<provider>` had exactly that defect). Learned from the
+  // live probe fleet (.../workspaces/probe/<provider>) by swapping the
+  // provider leaf; the conventional root is only for a fleet with no probe
+  // agent left to learn from.
+  function probeWorkspaceFor(live, provider) {
+    const anyProbe = live.find(
+      (a) =>
+        String(a?.id ?? "").startsWith("sem-workspaces-probe-") &&
+        String(a?.workspace ?? "").includes("/workspaces/probe/"),
+    );
+    if (anyProbe) {
+      const parts = String(anyProbe.workspace).replace(/\/+$/, "").split("/");
+      parts[parts.length - 1] = slug(provider);
+      return parts.join("/");
+    }
+    const root = process.env.SEMANGGI_PROBE_WORKSPACE_ROOT ??
+      "/opt/semanggi/volumes/shared/service/semanggios/openclaw/workspaces";
+    return `${root}/probe/${slug(provider)}`;
+  }
+
   async function ensureProbeAgent(live, { provider, model }) {
+    if (typeof controller.runtime?.createProbeAgent !== "function") {
+      return { ok: false, error: "this runtime has no probe-agent provisioning (agents.create)" };
+    }
     const full = `${provider}/${model}`;
     const probeName = `sem-workspaces-probe-${slug(provider)}-${slug(full)}`.slice(0, 63);
-    
-    // Gunakan workspace root dari probe agent yang ada sebagai referensi.
-    const anyProbe = live.find((a) => String(a?.id ?? "").startsWith("sem-workspaces-probe-"));
-    let workspace = null;
-    if (anyProbe?.workspace) {
-      const parts = String(anyProbe.workspace).split("/");
-      parts[parts.length - 1] = slug(provider); // ganti segmen provider terakhir
-      workspace = parts.join("/");
-    } else {
-      workspace = `workspaces/probe/${slug(provider)}`;
-    }
-
+    const workspace = probeWorkspaceFor(live, provider);
     try {
       log.info("brain.test-provisioning", { probeName, workspace, full });
       const created = await controller.runtime.createProbeAgent({ name: probeName, workspace, model: full });
-      log.info("brain.test-provisioned", { agentId: created.id });
-      return created.id;
+      log.info("brain.test-provisioned", { agentId: created.id, probeName, workspace });
+      return { ok: true, agentId: created.id, probeName, workspace };
     } catch (err) {
-      log.error("brain.test-provision-failed", { provider, model, error: err.message });
-      return null;
+      const error = String(err.gatewayError?.message ?? err.message).slice(0, 300);
+      log.error("brain.test-provision-failed", { provider, model, error });
+      return { ok: false, error };
     }
   }
 
   async function runBrainTest({ provider, model, acpAgent, thinking, effortMode }) {
     let live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
     let { match, message } = resolveTestAgent(live, { provider, model, acpAgent });
+    let provisioned = false;
 
-    // D65: auto-provision probe agent jika tidak ditemukan (bukan claude-code)
+    // D65: an ordinary provider with no matching agent gets a probe agent
+    // provisioned right here, then tested. claude-code never does: it is
+    // routed to a named ACP harness agent (`acpAgent`), never to anything
+    // creatable by model.
     if (!match && provider !== "claude-code") {
-      const provisionedId = await ensureProbeAgent(live, { provider, model });
-      if (provisionedId) {
-        live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
-        ({ match } = resolveTestAgent(live, { provider, model, acpAgent }));
+      const probe = await ensureProbeAgent(live, { provider, model });
+      if (!probe.ok) {
+        return {
+          ok: false,
+          reason: "provision-failed",
+          message:
+            `Auto-provisioning a probe agent for ${provider}/${model} failed: ${probe.error}` +
+            (/EACCES/i.test(probe.error)
+              ? " — the gateway bootstraps agent workspaces as its own uid; make the probe workspace root writable by it (chown the workspaces/probe directory to that uid)."
+              : ""),
+        };
+      }
+      provisioned = true;
+      live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+      ({ match } = resolveTestAgent(live, { provider, model, acpAgent }));
+      if (!match) {
+        // Created, but agents.list has not advertised it yet. Test the id the
+        // gateway handed back rather than denying the agent we just made: a
+        // genuinely broken one refuses in the gateway's own words, which is
+        // the honest answer, not "no agent provisioned".
+        match = { id: probe.agentId };
       }
     }
 
@@ -2167,7 +2208,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       throw badRequest("this runtime does not support connection testing");
     }
     const result = await controller.runtime.testAgent({ agentId, thinking: effectiveThinking });
-    return { ok: result.ok, agentId, thinking: effectiveThinking, ...result };
+    return { ok: result.ok, agentId, thinking: effectiveThinking, provisioned, ...result };
   }
 
   route("POST", "/api/work/brains/{id}/test", async ({ id }) => {

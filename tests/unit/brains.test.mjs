@@ -368,6 +368,108 @@ test("update acpAgent on a claude-code brain persists the value", async () => {
   assert.equal(cleared.acpAgent, null);
 });
 
+// ── connection test auto-provisioning (D65) ─────────────────────────────────
+//
+// Measured on the cluster (2026-09-06): the first cut of D65 swallowed every
+// ensureProbeAgent failure and answered with the stale "No agent is currently
+// provisioned … pin one via Brain Map" message — so a gateway-side EACCES
+// (probe workspace root owned by root; the gateway bootstraps workspaces as
+// uid 1000) read as "go create an agent by hand", the exact runaround D65
+// exists to remove. These tests pin the honest contract.
+
+test("connection test auto-provisions a probe agent when none exists, then tests it", async () => {
+  const h = await buildHarness();
+  const brain = await h.brains.create({ name: "codestral-brain", provider: "mistral-custom", model: "codestral-latest" });
+  const live = [{ id: "glm-agent", model: { primary: "zai/glm-5.2" } }];
+  h.runtime.listAgents = async () => live;
+  const created = [];
+  h.runtime.createProbeAgent = async ({ name, workspace, model }) => {
+    created.push({ name, workspace, model });
+    live.push({ id: name, model: { primary: model } });
+    return { id: name, name };
+  };
+  h.runtime.testAgent = async ({ agentId }) => ({ ok: true, status: "completed", agentId });
+  const api = await startApi(h);
+  try {
+    const res = await api.call("POST", `/api/work/brains/${brain.id}/test`, {});
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, JSON.stringify(res.body));
+    assert.equal(res.body.provisioned, true);
+    assert.equal(res.body.agentId, created[0].name);
+    assert.equal(created[0].model, "mistral-custom/codestral-latest");
+    assert.match(created[0].name, /^sem-workspaces-probe-mistral-custom-/);
+    // Mount contract: host and container paths are identical — a relative
+    // workspace is an agent that works nowhere (the pre-fix fallback was).
+    assert.ok(created[0].workspace.startsWith("/"), "probe workspace must be absolute");
+    assert.ok(created[0].workspace.endsWith("/probe/mistral-custom"));
+  } finally {
+    await api.close();
+  }
+});
+
+test("a probe agent missing from the re-list is still tested by the id the gateway returned", async () => {
+  const h = await buildHarness();
+  h.runtime.listAgents = async () => []; // advertisement lags create forever here
+  h.runtime.createProbeAgent = async ({ name }) => ({ id: name, name });
+  const tested = [];
+  h.runtime.testAgent = async ({ agentId }) => {
+    tested.push(agentId);
+    return { ok: false, status: "error", error: "agent is not runnable" };
+  };
+  const api = await startApi(h);
+  try {
+    const res = await api.call("POST", "/api/work/brains/test", { provider: "zai", model: "glm-5.2" });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, false);
+    assert.equal(res.body.provisioned, true);
+    assert.deepEqual(tested, [res.body.agentId]);
+    assert.match(res.body.agentId, /^sem-workspaces-probe-zai-/);
+  } finally {
+    await api.close();
+  }
+});
+
+test("connection test surfaces an agents.create failure instead of the stale no-agent message", async () => {
+  const h = await buildHarness();
+  h.runtime.listAgents = async () => [];
+  h.runtime.createProbeAgent = async () => {
+    throw new Error(
+      '{"code":"UNAVAILABLE","message":"Error: EACCES: permission denied, mkdir ' +
+        "'/opt/semanggi/volumes/shared/service/semanggios/openclaw/workspaces/probe/mistral-custom': code=EACCES\"}",
+    );
+  };
+  const api = await startApi(h);
+  try {
+    const res = await api.call("POST", "/api/work/brains/test", {
+      provider: "mistral-custom",
+      model: "codestral-latest",
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, false);
+    assert.equal(res.body.reason, "provision-failed");
+    assert.match(res.body.message, /EACCES/);
+    assert.match(res.body.message, /chown/);
+    assert.doesNotMatch(res.body.message, /pin one via Brain Map/);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a runtime without probe-agent provisioning reports that gap, not a missing agent", async () => {
+  const h = await buildHarness();
+  h.runtime.listAgents = async () => [];
+  const api = await startApi(h);
+  try {
+    const res = await api.call("POST", "/api/work/brains/test", { provider: "zai", model: "glm-9.9" });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, false);
+    assert.equal(res.body.reason, "provision-failed");
+    assert.match(res.body.message, /no probe-agent provisioning/);
+  } finally {
+    await api.close();
+  }
+});
+
 test("update acpAgent on a non-claude brain is rejected", async () => {
   const h = await buildHarness();
   const b = await h.brains.create({

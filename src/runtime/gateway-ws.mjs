@@ -438,7 +438,13 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
      */
     async createProbeAgent({ name, workspace, model }) {
       const payload = await request("agents.create", { name, workspace, model });
-      return { id: payload?.id ?? name, name };
+      // Response shape from the gateway's createAgent result: {status,
+      // agentId, name, workspace, ...} — the id is derived from the name
+      // server-side, and status "existing" just means the deterministic name
+      // already had this agent (idempotent by construction). agentId is the
+      // field to read; `id` never exists on this payload and name is only the
+      // last-ditch fallback.
+      return { id: payload?.agentId ?? payload?.id ?? name, name };
     },
 
     async health() {

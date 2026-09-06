@@ -63,19 +63,19 @@ test("GET /api/work/gateway/thinking-levels menjawab lewat HTTP", async () => {
   }
 });
 
-test("POST /api/work/brains/{id}/test melaporkan tidak ada agen, bukan gagal diam-diam", async () => {
+test("POST /api/work/brains/{id}/test melaporkan kegagalan provisioning apa adanya, bukan gagal diam-diam", async () => {
   const h = await buildHarness();
-  const { brain } = await (async () => {
-    const b = await h.brains.create({ name: "tanpa-agen", provider: "zai", model: "glm-9.9-belum-ada", level: "normal" });
-    return { brain: b };
-  })();
+  // D65: tanpa agen, tombol Test mencoba auto-provision probe agent. Runtime
+  // uji ini tidak punya createProbeAgent — jalur yang dulu menjawab "no agent
+  // provisioned" kini wajib jujur soal gap itu, tetap ok:false dengan alasan.
+  const b = await h.brains.create({ name: "tanpa-agen", provider: "zai", model: "glm-9.9-belum-ada", level: "normal" });
   const api = await startApi(h);
   try {
-    const res = await api.call("POST", `/api/work/brains/${brain.id}/test`, {});
+    const res = await api.call("POST", `/api/work/brains/${b.id}/test`, {});
     assert.equal(res.status, 200);
     assert.equal(res.body.ok, false);
-    assert.equal(res.body.reason, "no-agent");
-    assert.match(res.body.message, /No agent is currently provisioned/);
+    assert.equal(res.body.reason, "provision-failed");
+    assert.match(res.body.message, /no probe-agent provisioning/);
   } finally {
     await api.close();
   }

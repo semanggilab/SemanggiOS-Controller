@@ -6,6 +6,10 @@
 // lubang di PUT berarti seluruh workspace bisa ditulis lewat satu request),
 // dan setiap penyimpanan meninggalkan jejak di event_log — "siapa mengubah
 // tasks.md" harus bisa dijawab dari audit, bukan dari memori orang.
+//
+// Sejak D58 dokumen memory/ (blueprint, decisions) IKUT bisa ditulis —
+// pembatasan D55 dibatalkan atas keputusan operator; yang tetap diuji adalah
+// whitelist namanya, bukan direktorinya.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
@@ -94,14 +98,26 @@ test("nama dokumen di luar whitelist ditolak oleh PUT", async () => {
   }
 });
 
-test("dokumen memori agen (memory/) ditolak oleh PUT — wilayah agen, bukan operator", async () => {
+test("dokumen memory/ (blueprint) ikut tersimpan oleh PUT dan diaudit (D58)", async () => {
   const t = await setup();
   try {
     const res = await t.call("PUT", `/api/work/projects/${t.project.id}/docs/blueprint`, {
-      content: "mencoba menulis memori",
+      content: "# Blueprint\n\nDisunting operator dari Command Center.\n",
     });
-    assert.equal(res.status, 400);
-    assert.match(res.body.error, /memori agen/);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.dir, "memory");
+
+    const read = await t.call("GET", `/api/work/projects/${t.project.id}/docs/blueprint`);
+    assert.equal(read.status, 200);
+    assert.equal(read.body.exists, true);
+    assert.match(read.body.content, /Disunting operator/);
+
+    const events = await t.h.store.all(
+      `SELECT * FROM event_log WHERE kind = 'project.doc-updated' AND subject_id = ?`,
+      [t.project.id],
+    );
+    assert.equal(events.length, 1);
+    assert.equal(JSON.parse(events[0].payload).document, "memory/blueprint.md");
   } finally {
     await t.close();
   }

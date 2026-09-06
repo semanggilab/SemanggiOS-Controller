@@ -1851,6 +1851,9 @@ PUT JANGAN memakai dokumen project hidup — brief.md production tertimpa
 (`execution_messages` menyimpan hasil Read agen); gunakan project buangan
 atau dokumen dummy.
 
+*(Paragraf di atas dibatalkan D58 atas keputusan operator — memory/ kini
+ikut bisa disunting dari Command Center.)*
+
 *(Dinomori ulang dari D54 duplikat; semua rujukan "D54" di kode —
 repositories.mjs, schema.sql, db/index.mjs, task-delete.test.mjs — menunjuk
 keputusan penghapusan task di atas, jadi entri ini yang mengalah.)*
@@ -1940,6 +1943,29 @@ penghapusan tutup dengan sengaja. QUEUED, WAIT_*, DISPATCHED, RUNNING,
 BLOCKED, RESUMABLE tetap tertolak — BLOCKED termasuk yang tertolak karena
 ia pekerjaan yang DIPARKIR untuk dilihat manusia, bukan pekerjaan yang
 selesai.
+
+
+## D58 — dokumen memory/ bisa disunting dari Command Center (membatalkan pembatasan D55)
+
+**Keputusan (2026-09-06, operator).** Paragraf ketiga D55 mengunci
+`memory/` (blueprint, decisions) dari PUT dengan alasan ia wilayah
+bootstrap dua-tingkat agen — controller yang menulis memori agen adalah
+penulis kedua atas berkas yang bukan miliknya. Operator memutuskan
+sebaliknya: agen hanya MEMBACA berkas-berkas itu (spec §9), jadi
+keputusan operator tentang isinya lebih berwenang daripada keengganan
+controller menulisnya. Sejak D58, PUT
+`/api/work/projects/{id}/docs/{name}` menerima SEMUA nama whitelist —
+`WRITABLE_DOCS` dihapus; whitelist-nya kini `DOC_DIRS` itu sendiri,
+sama persis dengan GET.
+
+**Yang tetap dijaga:** whitelist nama (tidak ada segmen path dari request
+yang sampai ke filesystem), controller hanya menulis atas PUT eksplisit
+operator — tak pernah atas inisiatif sendiri — dan setiap penyimpanan
+tercatat di event_log sebagai `project.doc-updated`. Tes yang dulu
+mengasertikan penolakan memory/ diganti tes penyimpanan + audit
+`memory/blueprint.md`. UI tidak lagi menghakimi lebih dulu: Edit muncul
+untuk setiap dokumen yang termuat, dan bila controller suatu hari menolak
+sebuah nama lagi, kegagalannya tampil apa adanya lewat `saveError`.
 
 
 ## Open questions for phase 4+

@@ -386,22 +386,21 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   });
 
   // Menyimpan suntingan dokumen dari modal Command Center (tombol Edit/Save).
-  // D55: HANYA direktori docs/ — dokumen perencanaan operator (brief,
-  // architecture, plans, tasks). memory/ (blueprint, decisions) tetap
-  // read-only di jalur ini karena itu wilayah agen dua-tingkat (spec §9):
-  // controller yang menulis memori agen adalah penulis kedua atas berkas
-  // yang bukan miliknya. Whitelist nama sama persis dengan GET; tidak ada
-  // segmen path dari request yang sampai ke filesystem.
-  const WRITABLE_DOCS = new Set(["brief", "architecture", "migration-plan", "plans", "tasks"]);
+  // D58 (membatalkan pembatasan D55): SEMUA dokumen whitelist — docs/ maupun
+  // memory/ (blueprint, decisions) — bisa disunting operator dari sini.
+  // memory/ memang wilayah bootstrap dua-tingkat agen (spec §9), tetapi agen
+  // hanya MEMBACANYA; keputusan operator tentang isi dokumen itu lebih
+  // berwenang daripada keengganan controller menulisnya. Yang tetap dijaga:
+  // whitelist nama sama persis dengan GET (tidak ada segmen path dari
+  // request yang sampai ke filesystem), controller hanya menulis atas PUT
+  // eksplisit operator — tak pernah atas inisiatif sendiri — dan setiap
+  // penyimpanan tercatat di event_log.
   route("PUT", "/api/work/projects/{id}/docs/{name}", async ({ id, name }, body, _q, actor) => {
     const project = await repos.projects.get(id);
     if (!project) throw notFound(`unknown project ${id}`);
     const doc = String(name ?? "").toLowerCase();
     const dir = DOC_DIRS[doc];
     if (!dir) throw badRequest(`unknown document "${name}"`);
-    if (!WRITABLE_DOCS.has(doc)) {
-      throw badRequest(`"${doc}" adalah dokumen memori agen — hanya bisa dibaca, bukan disunting dari sini.`);
-    }
     if (typeof body?.content !== "string") throw badRequest("content is required");
     const root = project.workspace_path;
     if (!root) throw badRequest("Project belum punya workspace — dokumen tidak bisa disimpan.");

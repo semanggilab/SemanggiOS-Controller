@@ -2272,3 +2272,53 @@ cluster (mistral-custom/codestral-latest):
 
 **Test:** 456 → 460 (auto-provision sukses + uji by-id saat re-list kosong +
 surfas kegagalan EACCES + runtime tanpa createProbeAgent).
+
+## D66 — Model Map: resources + thinking-levels jadi milik operator, berkas turun jadi seed
+
+**Masalah.** Dua dari tiga berkas konfigurasi model (`resources.json`,
+`thinking-levels.json`) hanya bisa diubah lewat sunting berkas + sync + restart,
+padahal keduanya TIDAK dipakai jalur dispatch sebagai berkas: admission membaca
+tabel `resources` (D42-class), dan tabel `thinking_levels` hanya dibaca endpoint
+API/probe — pemeriksaan thinking saat dispatch memakai iklan agen live
+(agent-registry), bukan tabel ini. Yang menghalangkan kepemilikan DB selama ini
+justru arah seeding: thinking-levels di-refresh PENUH dari berkas di SETIAP boot
+(app.mjs lama) — artinya file > DB, dan setiap suntingan operator atau hasil
+probe di DB hilang diam-diam pada restart berikutnya. Celah tambahan:
+`POST /api/work/resources` tanpa guard admin dan tanpa event_log.
+
+**Keputusan.** Halaman Settings → Model Map (panel UI baru) menjadi pemilik
+kedua tabel itu:
+
+1. `GET /api/work/model-map` — join kedua tabel per (provider, model)
+   (domain/model-map.mjs). Baris satu sisi TETAP tampil: resource tanpa
+   pengukuran, dan pengukuran tanpa baris resource (yang memarkir task di
+   WAIT_RESOURCE) — persis masalah yang dicari operator di halaman ini.
+   Tidak ada brains di join ini: Brain adalah endpoint routing
+   (model+thinking+mode), grain-nya berbeda; halaman Brains/Brain Map tetap
+   pemiliknya.
+2. `PATCH /api/work/resources?provider=&model=` — hanya bidang kebijakan
+   (creditClass, concurrencyLimit, quotaPolicy, windowKind). Provider/model
+   jadi query param, bukan path segment, karena model id groq mengandung "/"
+   ("qwen/qwen3.6-27b") yang tak akan selamat dari proxy catch-all AgentOS.
+   Field tak dikenal DITOLAK (bukan diabaikan — kelas bug D36).
+   `availability`, `next_available_at`, `last_quota_signal` terbawa apa adanya:
+   operator menyunting kebijakan tidak boleh bisa me-reset sinyal 429 live.
+3. `PUT /api/work/thinking-levels` — tulis operator untuk fakta terukur;
+   `effortMode=preference` tanpa evidence ditolak (aturan yang sama dengan
+   brains.create). Jalur yang diutamakan tetap probe (D38) — edit manual untuk
+   model yang tidak bisa di-probe.
+4. Semua tulis admin-only + event_log (`resource.policy`,
+   `thinking-levels.updated`) + membangunkan scheduler.
+5. app.mjs: seed thinking-levels HANYA saat tabel kosong (pola D35 brains).
+   Berkas tetap seed instalasi baru; import eksplisit tetap ada lewat
+   `POST /api/work/gateway/thinking-levels/refresh`.
+
+**Yang tidak berubah.** `routing.json` (katalog+routes) tidak disentuh — itu
+ranah Fase 3 (kelompok peer per sel brain-map, bukan per baris model): grain
+routing adalah endpoint, bukan model, dan urutan preferensi lintas model tidak
+bisa dinyatakan dari keanggotaan per-model. Lihat analisis 2026-09-06 sebelum
+D66.
+
+**Test:** 460 → 467 (merge dua sisi + satu sisi, GET agregat, PATCH menjaga
+sinyal live + event + validasi, PUT thinking-levels + evidence wajib untuk
+preference, restart tidak menimpa suntingan operator).

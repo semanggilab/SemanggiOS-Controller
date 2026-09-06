@@ -18,6 +18,11 @@ export const EventKind = Object.freeze({
   EXECUTION_STATUS: "execution.status",
   QUOTA_DECISION: "quota.decision",
   RESOURCE_AVAILABILITY: "resource.availability",
+  // D66: operator writes through the Model Map page. Availability signals are
+  // the scheduler's own findings about the world; these two are the operator's
+  // decisions about policy — the audit trail must be able to tell them apart.
+  RESOURCE_POLICY: "resource.policy",
+  THINKING_LEVELS_UPDATED: "thinking-levels.updated",
   LEASE_ACQUIRED: "lease.acquired",
   LEASE_RELEASED: "lease.released",
   LEASE_RECLAIMED: "lease.reclaimed",

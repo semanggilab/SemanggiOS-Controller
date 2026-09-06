@@ -60,15 +60,22 @@ export async function createController({
     log.info("brain.seeded", { count: (await brains.list()).length, source: "routing config" });
   }
 
-  // Katalog thinking levels: sinkron sekali dari berkas seed di setiap start.
-  // Aman dijalankan berulang (upsert per baris) dan tidak menghapus apa pun,
-  // sehingga skrip probe yang menulis ulang berkas seed di antara restart
-  // selalu berhasil sampai ke DB tanpa langkah manual tambahan.
-  try {
-    const synced = await thinkingLevels.refresh();
-    log.info("thinking-levels.seeded", synced);
-  } catch (err) {
-    log.warn("thinking-levels.seed-failed", { error: String(err.message).slice(0, 160) });
+  // Katalog thinking levels: diseed HANYA saat tabelnya kosong (D66). Selama
+  // bertahun-tahun ini sync penuh tiap boot — arah kepemilikannya file > DB —
+  // yang benar selama file adalah satu-satunya penulis. Sekarang bukan:
+  // probe menulis langsung ke DB (endpoint probe), dan operator menyuntingnya
+  // lewat halaman Model Map. Boot-refresh pada keadaan itu berarti setiap
+  // suntingan operator dan hasil probe hilang diam-diam pada restart berikutnya
+  // — kelas kesalahan yang sama dengan yang dicegah seeding brains di atas.
+  // Berkas tetap menjadi seed instalasi baru; import eksplisit tetap tersedia
+  // lewat POST /api/work/gateway/thinking-levels/refresh.
+  if ((await thinkingLevels.list()).length === 0) {
+    try {
+      const synced = await thinkingLevels.refresh();
+      log.info("thinking-levels.seeded", synced);
+    } catch (err) {
+      log.warn("thinking-levels.seed-failed", { error: String(err.message).slice(0, 160) });
+    }
   }
 
   // D42: admission resolves Brain names from the brains table (seeded above),

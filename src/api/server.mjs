@@ -32,6 +32,7 @@ import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
 import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
+import { mergeModelMap } from "../domain/model-map.mjs";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 
@@ -211,6 +212,77 @@ const presentResource = (r) => ({
   windowKind: r.window_kind,
   lastQuotaSignal: r.last_quota_signal,
 });
+
+/**
+ * Validates a Model Map resource write into the exact shape resources.upsert
+ * accepts (D66). Unknown keys are REJECTED, not ignored: this body comes from
+ * a policy editor, and a typo'd field that silently does nothing is the D36
+ * class of bug — a route that looks like it worked and changed nothing.
+ *
+ * On PATCH (`existing` given) every field defaults to the row's current value,
+ * so the caller passes through only what the operator actually touched.
+ */
+function parseResourcePolicy(body, { requireIdentity = false, existing = null } = {}) {
+  const ALLOWED = ["provider", "model", "creditClass", "concurrencyLimit", "quotaPolicy", "windowKind"];
+  const unknown = Object.keys(body ?? {}).filter((k) => !ALLOWED.includes(k));
+  if (unknown.length > 0) {
+    throw badRequest(`unknown resource field(s): ${unknown.join(", ")}`);
+  }
+
+  const out = {
+    creditClass: existing?.credit_class ?? "metered",
+    concurrencyLimit: existing?.concurrency_limit ?? 1,
+    quotaPolicy: existing?.quota_policy ?? {},
+    windowKind: existing?.window_kind ?? null,
+  };
+
+  if (requireIdentity) {
+    const provider = String(body.provider ?? "").trim();
+    const model = String(body.model ?? "").trim();
+    if (!provider || !model) throw badRequest("provider and model are required");
+    out.provider = provider;
+    out.model = model;
+  }
+
+  if (body.creditClass !== undefined) {
+    if (!["metered", "subscription"].includes(body.creditClass)) {
+      throw badRequest(`creditClass must be metered or subscription, got "${body.creditClass}"`);
+    }
+    out.creditClass = body.creditClass;
+  }
+
+  if (body.concurrencyLimit !== undefined) {
+    const n = body.concurrencyLimit;
+    if (!Number.isInteger(n) || n < 0) {
+      throw badRequest("concurrencyLimit must be an integer >= 0 (0 parks every dispatch on the model)");
+    }
+    out.concurrencyLimit = n;
+  }
+
+  if (body.quotaPolicy !== undefined) {
+    let policy = body.quotaPolicy;
+    if (typeof policy === "string") {
+      try {
+        policy = JSON.parse(policy);
+      } catch {
+        throw badRequest("quotaPolicy must be a JSON object");
+      }
+    }
+    if (policy !== null && (typeof policy !== "object" || Array.isArray(policy))) {
+      throw badRequest("quotaPolicy must be a JSON object or null");
+    }
+    out.quotaPolicy = policy ?? {};
+  }
+
+  if (body.windowKind !== undefined) {
+    if (body.windowKind !== null && typeof body.windowKind !== "string") {
+      throw badRequest("windowKind must be a string or null");
+    }
+    out.windowKind = body.windowKind === "" ? null : body.windowKind;
+  }
+
+  return out;
+}
 
 export function createApi(controller, { token, slackSigningSecret = process.env.SLACK_SIGNING_SECRET ?? null } = {}) {
   const { repos, admission, scheduler, now } = controller;
@@ -1175,6 +1247,21 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     return { models: out };
   });
 
+  // --- model map --------------------------------------------------------------
+  //
+  // D66: satu baris per (provider, model), digabung dari DUA tabel — resources
+  // (kebijakan operator + sinyal live) dan thinking_levels (fakta terukur
+  // probe). Ini permukaan baca halaman Settings → Model Map. Tidak ada brains
+  // di sini: Brain adalah endpoint routing (model + thinking + mode), bukan
+  // fakta model, dan grain-nya memang berbeda.
+  route("GET", "/api/work/model-map", async () => {
+    const [resources, levels] = await Promise.all([
+      repos.resources.list(),
+      controller.thinkingLevels.list(),
+    ]);
+    return { models: mergeModelMap(resources, levels) };
+  });
+
   /**
    * The conversation: what we sent, and what the model actually said back.
    *
@@ -1964,6 +2051,40 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     }
   });
 
+  // Operator write for ONE thinking-levels row (D66, Model Map page). The
+  // preferred path for these facts is the probe above — levels are measured,
+  // never advertised (D38) — but a manual edit with recorded evidence is
+  // legitimate when a probe cannot run (no agent provisioned yet, or a level
+  // known to hang). What is NOT legitimate is a preference claim with no
+  // evidence: the same rule brains.create already enforces, because an
+  // evidence-free "preference" row is an unauditable claim the next operator
+  // has to take on faith.
+  route("PUT", "/api/work/thinking-levels", async (_p, body, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may edit thinking levels");
+    const provider = String(body?.provider ?? "").trim();
+    const model = String(body?.model ?? "").trim();
+    if (!provider || !model) throw badRequest("provider and model are required");
+    const effortMode = body?.effortMode ?? "guaranteed";
+    const evidence = body?.evidence ?? null;
+    if (effortMode === "preference" && !evidence) {
+      throw badRequest("effortMode=preference requires evidence: measured why the level is accepted-but-not-applied");
+    }
+    let entry;
+    try {
+      entry = await controller.thinkingLevels.upsert({ provider, model, levels: body?.levels, effortMode, evidence });
+    } catch (err) {
+      throw badRequest(err.message);
+    }
+    await controller.events.append({
+      kind: EventKind.THINKING_LEVELS_UPDATED,
+      subjectType: "model",
+      subjectId: `${entry.provider}/${entry.model}`,
+      actor: actor?.name ?? "operator",
+      payload: { levels: entry.levels, effortMode: entry.effortMode, evidence: entry.evidence },
+    });
+    return { level: entry };
+  });
+
   // --- thinking-level probe ---------------------------------------------------
   //
   // "Refresh Levels" in the Brain form. Unlike /refresh above (which only
@@ -2280,9 +2401,70 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     resources: (await repos.resources.list()).map(presentResource),
   }));
 
-  route("POST", "/api/work/resources", async (_p, body) => {
-    if (!body.provider || !body.model) throw badRequest("provider and model are required");
-    const resource = await repos.resources.upsert(body);
+  // D66: creating a resource row from the Model Map page. Admin-only and
+  // audited like every other operator write — before this the endpoint was a
+  // bare upsert any caller could hit, and a config change with no event_log
+  // entry is a change the audit trail denies ever happened.
+  route("POST", "/api/work/resources", async (_p, body, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may change the resource catalogue");
+    const parsed = parseResourcePolicy(body, { requireIdentity: true });
+    const resource = await repos.resources.upsert(parsed);
+    await controller.events.append({
+      kind: EventKind.RESOURCE_POLICY,
+      subjectType: "resource",
+      subjectId: `${parsed.provider}/${parsed.model}`,
+      actor: actor?.name ?? "operator",
+      payload: { change: "upsert", creditClass: parsed.creditClass, concurrencyLimit: parsed.concurrencyLimit },
+    });
+    await scheduler.notify(WakeReason.RESOURCE_CHANGED);
+    return { resource: presentResource(resource) };
+  });
+
+  // Partial update of ONE resource row's policy fields (D66). Availability,
+  // next_available_at and last_quota_signal are runtime facts owned by the
+  // scheduler's quota signals — they pass through untouched, because an
+  // operator editing concurrency must not be able to reset a live
+  // QUOTA_EXHAUSTED back to AVAILABLE by side effect.
+  //
+  // Provider/model arrive as QUERY params, not path segments: groq model ids
+  // contain "/" ("qwen/qwen3.6-27b"), and a slash in a path segment cannot
+  // survive the Next.js catch-all proxy in front of this controller. Same
+  // precedent as GET .../gateway/thinking-levels.
+  route("PATCH", "/api/work/resources", async (_p, body, query, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may change the resource catalogue");
+    const provider = String(query.get("provider") ?? "").trim();
+    const model = String(query.get("model") ?? "").trim();
+    if (!provider || !model) throw badRequest("provider and model query params are required");
+    const existing = await repos.resources.get(provider, model);
+    if (!existing) throw notFound(`no resource entry for ${provider}/${model}`);
+    const patch = parseResourcePolicy(body, { existing });
+
+    const resource = await repos.resources.upsert({
+      provider: existing.provider,
+      model: existing.model,
+      concurrencyLimit: patch.concurrencyLimit,
+      quotaPolicy: patch.quotaPolicy,
+      availability: existing.availability,
+      creditClass: patch.creditClass,
+      nextAvailableAt: existing.next_available_at,
+      windowKind: patch.windowKind,
+    });
+    await controller.events.append({
+      kind: EventKind.RESOURCE_POLICY,
+      subjectType: "resource",
+      subjectId: `${existing.provider}/${existing.model}`,
+      actor: actor?.name ?? "operator",
+      payload: {
+        change: "patch",
+        creditClass: resource.credit_class,
+        concurrencyLimit: resource.concurrency_limit,
+        // The live fields are reported so the audit shows they were carried,
+        // not chosen, by this write.
+        availability: existing.availability,
+        nextAvailableAt: existing.next_available_at,
+      },
+    });
+    // A raised concurrency limit can free tasks parked on WAIT_CONCURRENCY.
     await scheduler.notify(WakeReason.RESOURCE_CHANGED);
     return { resource: presentResource(resource) };
   });

@@ -2188,6 +2188,18 @@ hanya sebagai pintasan "Copy from catalog" yang berlabel eksplisit.
 Field provider menunjuk driver yang memiliki label itu — peringatan
 jelas saat sebuah label akan jatuh ke generic.
 
+**Rev.2 (hari yang sama, laporan operator):** union cache-gateway saja
+ternyata kaku ke arah sebaliknya — model mistral SUDAH terdaftar di
+AgentOS tapi cache `gateway_models` belum di-refresh, jadi provider
+tidak muncul di dropdown walau drivernya ada (dan `models.list` live
+memang mengembalikan `mistral-custom/*` begitu di-refresh; cache-nya
+saja yang basi). Opsi provider kini union TIGA sumber: cache gateway +
+brain yang ada + **semua `providerKeys` driver**. Label yang belum ada
+di cache ditandai hint ("ketik label persis seperti terdaftar di
+AgentOS, atau tekan Refresh Models") — brain.provider harus sama dengan
+label gateway atau resolusi agen tidak akan pernah cocok (pelajaran
+D42); field model tetap bebas diketik (Combobox = input+datalist).
+
 **Test:** 454 → 456 (alias + katalog; migrasi D64 dengan baris selamat).
 Batas diketahui: tidak ada peringatan runtime saat brain provider
 menangkap generic driver oleh label tak dikenal — anotasi ada di API/UI,

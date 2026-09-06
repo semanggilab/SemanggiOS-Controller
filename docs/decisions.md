@@ -2021,40 +2021,23 @@ normally" dan operator kehilangan satu-satunya kalimat yang menjelaskan
 penyebabnya: penolakan level thinking terbaca seperti outage. Kini kedua
 bentuk dibaca.
 
+**Bug kedua yang diperbaiki (terukur pada kasus qwen):** `agent.wait`
+berhenti mematui di ~30 dtk dan menjawab `status:"timeout"` selama run
+masih diantrikan; vonis sebenarnya — `FailoverError: API rate limit
+reached` dari groq free tier — baru muncul pada wait KETIGA (~90 dtk).
+`testAgent` berhenti di wait pertama, sehingga antrian provider
+terbaca "possible hang" dan laporan rate limit yang jujur hilang. Kini
+ia menunggu ulang selama gateway masih menjawab timeout, dibatasi
+jendela pemanggil — default test naik 45 dtk → 120 dtk agar muat 3-4
+wait. Pesan timeout juga jujur soal siapa yang menyerah: durasi nyata
+menunggu, bukan jendela yang diminta.
+
 **Batas yang tetap:** Test mengirim level thinking hanya untuk Brain
 `guaranteed` — itulah jalur yang dipakai dispatch nyata (D31); untuk
 `preference` level tidak pernah dikirim, jadi mengujinya berarti
 mengukur jalur yang tidak pernah dipakai. Karakterisasi level lintas
 kandidat tetap pekerjaan tombol Probe terpisah. Cerebras juga tetap
 tertahan billing 402 — perbaikan pesan tidak mengubah dindingnya.
-
-
-## D60 — brain bisa dihapus; provider aliyuncs dicabut penuh
-
-**Keputusan (2026-09-06, operator).** Asumsi lama "brains tidak pernah
-dihapus, hanya di-disable" mendahului era pencabutan provider. `DELETE
-/api/work/brains/{id}` (admin) kini menghapus baris brain, melepas sel
-`brain_map` yang memakunya dengan semantik yang sama dengan resolusi pada
-brain yang hilang ("tidak dipaku"), dan melaporkan sel mana yang kembali
-ke default grid. Agen provisioned tidak disentuh endpoint — ia milik
-gateway; `scripts/remove-provider-agents.mjs` (pola reap-agents, selector
-model `provider/*`) memungutnya lewat `agents.delete` sebagai tindakan
-operator terpisah yang tercatat.
-
-**Penerapan penuh pada aliyuncs.** Pencabutan provider menyinggung LIMA
-permukaan yang saling menjaga konfigurasi hidup: (1) `models.providers`
-di `openclaw.json`; (2) `agents.defaults.models` — peta per-model yang
-menyuplai `models.list` view configured, ditemukan lewat `config.get`
-karena kunci "aliyuncs/..." hidup di KEY peta, bukan value (pelajaran
-audit: berjalan atas nilai saja melewatkannya); (3) katalog state agen
-`state/agents/main/agent/models.json`; (4) tabel sqlite
-`agent_model_catalogs` yang diregenerasi gateway saat boot; (5) registry
-sandbox untuk kontainer probe. Keempat yang terakhir hanya dibersihkan
-saat gateway berhenti — edit hidup akan ditimpa balik oleh regenerasi.
-`thinking_levels` aliyuncs dibiarkan: catatan pengukuran, bukan
-permukaan routing; tidak ada pembaca setelah gateway_models bersih.
-Kunci API workspace tinggal direvokasi di konsol Alibaba — file config
-lama yang memuatnya sudah dihapus dari config dir.
 
 
 ## Open questions for phase 4+

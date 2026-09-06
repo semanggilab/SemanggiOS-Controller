@@ -2029,6 +2029,34 @@ kandidat tetap pekerjaan tombol Probe terpisah. Cerebras juga tetap
 tertahan billing 402 — perbaikan pesan tidak mengubah dindingnya.
 
 
+## D60 — brain bisa dihapus; provider aliyuncs dicabut penuh
+
+**Keputusan (2026-09-06, operator).** Asumsi lama "brains tidak pernah
+dihapus, hanya di-disable" mendahului era pencabutan provider. `DELETE
+/api/work/brains/{id}` (admin) kini menghapus baris brain, melepas sel
+`brain_map` yang memakunya dengan semantik yang sama dengan resolusi pada
+brain yang hilang ("tidak dipaku"), dan melaporkan sel mana yang kembali
+ke default grid. Agen provisioned tidak disentuh endpoint — ia milik
+gateway; `scripts/remove-provider-agents.mjs` (pola reap-agents, selector
+model `provider/*`) memungutnya lewat `agents.delete` sebagai tindakan
+operator terpisah yang tercatat.
+
+**Penerapan penuh pada aliyuncs.** Pencabutan provider menyinggung LIMA
+permukaan yang saling menjaga konfigurasi hidup: (1) `models.providers`
+di `openclaw.json`; (2) `agents.defaults.models` — peta per-model yang
+menyuplai `models.list` view configured, ditemukan lewat `config.get`
+karena kunci "aliyuncs/..." hidup di KEY peta, bukan value (pelajaran
+audit: berjalan atas nilai saja melewatkannya); (3) katalog state agen
+`state/agents/main/agent/models.json`; (4) tabel sqlite
+`agent_model_catalogs` yang diregenerasi gateway saat boot; (5) registry
+sandbox untuk kontainer probe. Keempat yang terakhir hanya dibersihkan
+saat gateway berhenti — edit hidup akan ditimpa balik oleh regenerasi.
+`thinking_levels` aliyuncs dibiarkan: catatan pengukuran, bukan
+permukaan routing; tidak ada pembaca setelah gateway_models bersih.
+Kunci API workspace tinggal direvokasi di konsol Alibaba — file config
+lama yang memuatnya sudah dihapus dari config dir.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

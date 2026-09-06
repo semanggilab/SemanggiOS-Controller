@@ -2213,3 +2213,26 @@ deteksi otomatis menyusul bila dibutuhkan.
 2. **Status reconciliation.** POC-2 E3/E7 found AgentOS dispatch records that stay `running` or report `timeout` after the work succeeded. The controller must not trust a single poll; reconciliation strategy is a phase-4 decision.
 3. **Fairness window length.** Currently 24 hours. Whether that matches how the team actually experiences fairness is an empirical question for the §12.4 evaluation.
 4. **`claude-code` concurrency.** Modelled as an ordinary resource, but a Pro subscription's real limit is a rolling usage window rather than a concurrency count. Needs POC-3 E8 numbers.
+
+## D65 — Test Brain otomatis melakukan auto-provisioning probe agent
+
+**Masalah.** Test Brain baru terjebak "lingkaran setan": tidak bisa di-test
+sebelum ada agen, dan agen hanya dibuat oleh skrip operator (provision-agents.mjs).
+UI mengeluh "No agent is currently provisioned", mengharuskan operator membuka
+terminal, menjalankan skrip, baru kembali ke UI untuk menekan Test — pengalaman
+pengguna yang buruk untuk verifikasi provider baru.
+
+**Keputusan.** Tombol "Test" kini secara otomatis melakukan ensureProbeAgent
+(menggunakan RPC agents.create) jika agen untuk (provider, model) tidak
+ditemukan (kecuali claude-code yang ACP-path). Ia membuat agen dengan nama
+konvensional sem-workspaces-probe-<provider>-<slug> di workspace workspaces/probe/<provider>
+(mengikuti pola probe agent yang sudah ada).
+
+**Batas.** Ini HANYA untuk aksi Test eksplisit, BUKAN reshaping fleet otonom saat
+scheduling. Aksi operator (tombol Test) = pengecualian yang sah dari aturan
+"provisioning stays a script". Jika agents.create gagal (scope/izin),
+error-nya disurfasikan ke UI sebagai hasil Test — jujur, bisa ditindaklanjuti.
+Agen probe yang tercipta tetap ada (mengikuti konvensi probe agent),
+sehingga tes berikutnya untuk model yang sama langsung lolos resolve.
+(Sinkron dengan D64 rev.3: provider dropdown kini ter-reduksi ke live,
+dan auto-provision ini menutup celah pengalamannya).

@@ -2118,11 +2118,46 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     };
   }
 
-  async function runBrainTest({ provider, model, acpAgent, thinking, effortMode }) {
-    const live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
-    const { match, message } = resolveTestAgent(live, { provider, model, acpAgent });
-    if (!match) return { ok: false, reason: "no-agent", message };
+  function slug(s) { return String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); }
 
+  async function ensureProbeAgent(live, { provider, model }) {
+    const full = `${provider}/${model}`;
+    const probeName = `sem-workspaces-probe-${slug(provider)}-${slug(full)}`.slice(0, 63);
+    
+    // Gunakan workspace root dari probe agent yang ada sebagai referensi.
+    const anyProbe = live.find((a) => String(a?.id ?? "").startsWith("sem-workspaces-probe-"));
+    let workspace = null;
+    if (anyProbe?.workspace) {
+      const parts = String(anyProbe.workspace).split("/");
+      parts[parts.length - 1] = slug(provider); // ganti segmen provider terakhir
+      workspace = parts.join("/");
+    }
+    if (!workspace) return null;
+
+    try {
+      const created = await controller.runtime.createProbeAgent({ name: probeName, workspace, model: full });
+      return created.id;
+    } catch (err) {
+      log.error("brain.test-provision-failed", { provider, model, error: err.message });
+      return null;
+    }
+  }
+
+  async function runBrainTest({ provider, model, acpAgent, thinking, effortMode }) {
+    let live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+    let { match, message } = resolveTestAgent(live, { provider, model, acpAgent });
+
+    // D65: auto-provision probe agent jika tidak ditemukan (bukan claude-code)
+    if (!match && provider !== "claude-code") {
+      const provisionedId = await ensureProbeAgent(live, { provider, model });
+      if (provisionedId) {
+        live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+        ({ match } = resolveTestAgent(live, { provider, model, acpAgent }));
+      }
+    }
+
+    if (!match) return { ok: false, reason: "no-agent", message };
+    
     const agentId = match.id ?? match.agentId;
     const effectiveThinking = thinking && effortMode === "guaranteed" ? thinking : null;
     if (!controller.runtime?.testAgent) {

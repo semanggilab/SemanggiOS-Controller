@@ -18,7 +18,7 @@
 // luar itu — bahkan untuk admin. Jadi Brain TIDAK bisa dipasangkan ke agen mana
 // pun saat dispatch. Pooler memilih agen yang sudah membawa Brain yang tepat;
 // ia tidak pernah mengonfigurasi ulang agen (D35).
-import { QUOTA_WINDOWS_BY_PROVIDER } from "./quota-windows.mjs";
+import { quotaDriverFor } from "./quota-drivers/index.mjs";
 /** Level yang menghubungkan profil project dengan kandidat Brain. */
 export const Level = Object.freeze({ LOW: "low", NORMAL: "normal", CRITICAL: "critical" });
 
@@ -145,6 +145,10 @@ export function resolveLevel({ template, role, profile, overrides = {}, projectO
 
 const slug = (s) => String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
+// POC-6 §5.1: the window-kind vocabulary drivers write and the schema CHECKs.
+const SHORT_WINDOW_TYPES = ["rolling", "fixed-time", "token-bucket", "credits"];
+const LONG_WINDOW_TYPES = [...SHORT_WINDOW_TYPES, "credits-anniversary"];
+
 export function createBrains(store, { now, shortId }) {
   /** Bentuk yang dipakai routing dan registry agen. */
   const present = (row) => ({
@@ -160,10 +164,31 @@ export function createBrains(store, { now, shortId }) {
     acpAgent: row.acp_agent,
     quotaResetShortMs: row.quota_reset_short_ms ?? null,
     quotaResetLongMs: row.quota_reset_long_ms ?? null,
+    quotaTier: row.quota_tier ?? null,
+    quotaShortType: row.quota_short_type ?? null,
+    quotaLongType: row.quota_long_type ?? null,
+    quotaFixedReset: parseFixedReset(row.quota_fixed_reset),
+    rpm: row.rpm ?? null,
+    rpd: row.rpd ?? null,
+    tpm: row.tpm ?? null,
+    tpd: row.tpd ?? null,
+    contextWindowTokens: row.context_window_tokens ?? null,
     level: row.level,
     category: row.category,
     enabled: Boolean(row.enabled),
   });
+
+  // quota_fixed_reset is stored as JSON text; a malformed row (hand-edited)
+  // presents as null rather than poisoning every brain listing.
+  function parseFixedReset(raw) {
+    if (raw == null) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
 
   // D51: jadwal reset default mengikuti keluarga provider. Pemanggil yang
   // menyertakan nilai eksplisit menang — operator yang tahu lebih baik dari
@@ -176,6 +201,44 @@ export function createBrains(store, { now, shortId }) {
       throw new Error(`brain "${name}": ${field} must be a positive number of milliseconds or null`);
     }
     return Math.round(n);
+  };
+
+  // POC-6 §5.1 validators for the quota columns beyond durations.
+  const tierOrNull = (v, name) => {
+    if (v === null || v === undefined || v === "") return null;
+    const s = String(v).trim().toLowerCase();
+    if (!/^[a-z0-9-]+$/.test(s)) throw new Error(`brain "${name}": quotaTier must be a slug-like plan name or null`);
+    return s;
+  };
+  const typeOrNull = (v, allowed, field, name) => {
+    if (v === null || v === undefined || v === "") return null;
+    const s = String(v).trim().toLowerCase();
+    if (!allowed.includes(s)) throw new Error(`brain "${name}": ${field} must be one of ${allowed.join("|")}`);
+    return s;
+  };
+  const rateOrNull = (v, field, name) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`brain "${name}": ${field} must be a positive integer or null`);
+    return n;
+  };
+  // Accepts the parsed object (API) and stores canonical JSON text (schema).
+  const fixedResetOrNull = (v, name) => {
+    if (v === null || v === undefined || v === "") return null;
+    const obj = typeof v === "string" ? parseFixedReset(v) : v;
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+      throw new Error(`brain "${name}": quotaFixedReset must be an object {atHourLocal, timeZone, day?} or null`);
+    }
+    if (obj.atHourLocal != null && !(Number.isInteger(obj.atHourLocal) && obj.atHourLocal >= 0 && obj.atHourLocal <= 23)) {
+      throw new Error(`brain "${name}": quotaFixedReset.atHourLocal must be an hour 0-23`);
+    }
+    if (obj.day != null && !(Number.isInteger(obj.day) && obj.day >= 0 && obj.day <= 6)) {
+      throw new Error(`brain "${name}": quotaFixedReset.day must be 0 (Sun) through 6 (Sat)`);
+    }
+    if (obj.timeZone != null && typeof obj.timeZone !== "string") {
+      throw new Error(`brain "${name}": quotaFixedReset.timeZone must be an IANA zone name`);
+    }
+    return JSON.stringify(obj);
   };
 
   const brains = {
@@ -193,6 +256,15 @@ export function createBrains(store, { now, shortId }) {
       acpAgent = null,
       quotaResetShortMs,
       quotaResetLongMs,
+      quotaTier,
+      quotaShortType,
+      quotaLongType,
+      quotaFixedReset,
+      rpm,
+      rpd,
+      tpm,
+      tpd,
+      contextWindowTokens,
       level = Level.NORMAL,
       category = null,
       enabled = true,
@@ -211,16 +283,37 @@ export function createBrains(store, { now, shortId }) {
         throw new Error(`level must be one of ${Object.values(Level).join("|")}, got "${level}"`);
       }
       const id = shortId("BRN");
-      const defaults = QUOTA_WINDOWS_BY_PROVIDER[String(provider ?? "").toLowerCase()] ?? null;
-      const short = quotaResetShortMs === undefined ? defaults?.shortMs ?? null : windowOrNullOrThrow(quotaResetShortMs, "quotaResetShortMs", name);
-      const long = quotaResetLongMs === undefined ? defaults?.longMs ?? null : windowOrNullOrThrow(quotaResetLongMs, "quotaResetLongMs", name);
+      // POC-6: defaults come from the driver registry — windows, types, tier
+      // and rates in one place, so what a new Brain gets and what the D63
+      // migration backfilled can never drift apart. Explicit caller values
+      // still win (the D51 rule), including per-model rates google cannot
+      // express as a flat table.
+      const driverDefaults = quotaDriverFor(provider).defaults({ model });
+      const short = quotaResetShortMs === undefined ? driverDefaults.shortMs : windowOrNullOrThrow(quotaResetShortMs, "quotaResetShortMs", name);
+      const long = quotaResetLongMs === undefined ? driverDefaults.longMs : windowOrNullOrThrow(quotaResetLongMs, "quotaResetLongMs", name);
+      const tier = quotaTier === undefined ? driverDefaults.quotaTier : tierOrNull(quotaTier, name);
+      const shortType = quotaShortType === undefined ? driverDefaults.shortType : typeOrNull(quotaShortType, SHORT_WINDOW_TYPES, "quotaShortType", name);
+      const longType = quotaLongType === undefined ? driverDefaults.longType : typeOrNull(quotaLongType, LONG_WINDOW_TYPES, "quotaLongType", name);
+      const fixedReset = quotaFixedReset === undefined
+        ? (driverDefaults.fixedReset ? JSON.stringify(driverDefaults.fixedReset) : null)
+        : fixedResetOrNull(quotaFixedReset, name);
+      const rateOrDriver = (v, dflt, field) => (v === undefined ? dflt : rateOrNull(v, field, name));
       await store.run(
         `INSERT INTO brains (id, name, description, provider, model, thinking, effort_mode,
                              effort_evidence, mode, acp_agent, quota_reset_short_ms, quota_reset_long_ms,
+                             quota_tier, quota_short_type, quota_long_type, quota_fixed_reset,
+                             rpm, rpd, tpm, tpd, context_window_tokens,
                              level, category, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, slug(name), description, provider, model, thinking, effortMode, effortEvidence,
-         mode, acpAgent, short, long, level, category, enabled ? 1 : 0, now(), now()],
+         mode, acpAgent, short, long,
+         tier, shortType, longType, fixedReset,
+         rateOrDriver(rpm, driverDefaults.rates.rpm, "rpm"),
+         rateOrDriver(rpd, driverDefaults.rates.rpd, "rpd"),
+         rateOrDriver(tpm, driverDefaults.rates.tpm, "tpm"),
+         rateOrDriver(tpd, driverDefaults.rates.tpd, "tpd"),
+         rateOrNull(contextWindowTokens, "contextWindowTokens", name),
+         level, category, enabled ? 1 : 0, now(), now()],
       );
       return brains.get(id);
     },
@@ -257,12 +350,33 @@ export function createBrains(store, { now, shortId }) {
       if (patch.thinking !== undefined) put("thinking", patch.thinking);
       // D51: jadwal reset boleh berubah saat provider mengubah paketnya —
       // berbeda dari provider/model yang memang beku, jadwal adalah fakta
-      // komersial yang bisa berpindah tanpa pindah model.
+      // komersial yang bisa berpindah tanpa pindah model. POC-6 memperluas
+      // kelas fakta komersial itu: tier, tipe jendela, deskriptor reset
+      // jam-tetap, laju, dan context window ikut bisa dipatch operator.
       if (patch.quotaResetShortMs !== undefined) {
         put("quota_reset_short_ms", windowOrNullOrThrow(patch.quotaResetShortMs, "quotaResetShortMs", before.name));
       }
       if (patch.quotaResetLongMs !== undefined) {
         put("quota_reset_long_ms", windowOrNullOrThrow(patch.quotaResetLongMs, "quotaResetLongMs", before.name));
+      }
+      if (patch.quotaTier !== undefined) put("quota_tier", tierOrNull(patch.quotaTier, before.name));
+      if (patch.quotaShortType !== undefined) {
+        put("quota_short_type", typeOrNull(patch.quotaShortType, SHORT_WINDOW_TYPES, "quotaShortType", before.name));
+      }
+      if (patch.quotaLongType !== undefined) {
+        put("quota_long_type", typeOrNull(patch.quotaLongType, LONG_WINDOW_TYPES, "quotaLongType", before.name));
+      }
+      if (patch.quotaFixedReset !== undefined) {
+        put("quota_fixed_reset", fixedResetOrNull(patch.quotaFixedReset, before.name));
+      }
+      for (const [field, column] of [
+        ["rpm", "rpm"],
+        ["rpd", "rpd"],
+        ["tpm", "tpm"],
+        ["tpd", "tpd"],
+        ["contextWindowTokens", "context_window_tokens"],
+      ]) {
+        if (patch[field] !== undefined) put(column, rateOrNull(patch[field], field, before.name));
       }
       if (patch.level !== undefined) {
         if (!Object.values(Level).includes(patch.level)) throw new Error(`invalid level "${patch.level}"`);

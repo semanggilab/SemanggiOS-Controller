@@ -1248,6 +1248,21 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
           longLabel: describeWindow(b.quotaResetLongMs),
           autoRetry: isRetryableWindow(b.quotaResetShortMs),
           retryLimit: QUOTA_RETRY_LIMIT,
+          // POC-6 (D63): the ms pair says how LONG a window is; these say
+          // WHEN it reopens. The UI shows them side by side because "24h
+          // rolling" and "daily at midnight Pacific" price a retry
+          // differently — the driver parks the first from the hit and the
+          // second at its wall-clock occurrence.
+          tier: b.quotaTier ?? null,
+          shortType: b.quotaShortType ?? null,
+          longType: b.quotaLongType ?? null,
+          fixedReset: b.quotaFixedReset ?? null,
+          rates: {
+            rpm: b.rpm ?? null,
+            rpd: b.rpd ?? null,
+            tpm: b.tpm ?? null,
+            tpd: b.tpd ?? null,
+          },
         },
       });
     }

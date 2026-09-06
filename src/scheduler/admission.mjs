@@ -7,6 +7,7 @@
 import { Status, ExecutionStatus } from "../domain/state-machine.mjs";
 import { EventKind } from "../domain/events.mjs";
 import { QUOTA_RETRY_LIMIT, isRetryableWindow } from "../domain/quota-windows.mjs";
+import { quotaDriverFor } from "../domain/quota-drivers/index.mjs";
 import { orderCandidates } from "./selection.mjs";
 import { assertDispatchPathAllowed } from "./routing.mjs";
 import { nullLogger } from "../domain/logger.mjs";
@@ -447,6 +448,25 @@ export function createAdmission({
         return wait(Status.WAIT_RESOURCE, err.message);
       }
 
+      // POC-6 (D63): a driver-fatal refusal — groq's 413 structural input
+      // wall, a 402 from a spent trial — is neither capacity nor a task bug.
+      // It names an operator fix (paid tier, credits, or a prompt budget),
+      // and parking it in WAIT_RUNTIME just replays the identical wall five
+      // times with backoff in between. BLOCKED once, reason first.
+      if (err.fatalQuota) {
+        log.warn("quota.fatal", {
+          task: task.id, exec: execution.id,
+          provider: err.fatalQuota.provider, model: err.fatalQuota.model,
+          reason: err.fatalQuota.reason ?? null,
+          structural: Boolean(err.fatalQuota.structural),
+        });
+        return {
+          ok: false,
+          status: Status.BLOCKED,
+          detail: `${err.fatalQuota.reason ?? "provider fatal"} (${err.fatalQuota.provider}/${err.fatalQuota.model}): ${err.fatalQuota.message ?? ""}`,
+        };
+      }
+
       if (err.quota) {
         await repos.resources.applyQuotaSignal(err.quota.provider, err.quota.model, err.quota);
         const resource = await repos.resources.get(err.quota.provider, err.quota.model);
@@ -472,13 +492,23 @@ export function createAdmission({
               detail: `quota retries exhausted (${QUOTA_RETRY_LIMIT}x): ${err.quota.provider}/${err.quota.model}: ${err.quota.message}`,
             };
           }
-          // The provider's reset time when it gave one, else one short
-          // window — the same rule the late-error path applies, so both
-          // entry points to a retry land on the same clock.
+          // The provider's reset time when it gave one, else the driver's
+          // price for one short window — rolling from the hit, fixed-time at
+          // its next wall-clock occurrence (POC-6 D63: a google RPD parked
+          // "one minute" comes back into the same refusal; parked at midnight
+          // Pacific it comes back into a fresh budget).
+          const driver = quotaDriverFor(err.quota.provider);
           const eta =
             resource?.next_available_at && resource.next_available_at > now()
               ? resource.next_available_at
-              : now() + brain.quotaResetShortMs;
+              : (driver.nextReset(
+                  {
+                    kind: brain?.quotaShortType ?? null,
+                    ms: brain?.quotaResetShortMs ?? null,
+                    fixedReset: brain?.quotaFixedReset ?? null,
+                  },
+                  { nowMs: now(), resetsAt: err.quota.resetsAt ?? null, lastSignalAt: now() },
+                ) ?? now() + brain.quotaResetShortMs);
           if (!resource?.next_available_at) {
             // Anchor the resource to the same clock: a QUOTA_EXHAUSTED row
             // without next_available_at is never released by the scheduler's
@@ -505,14 +535,31 @@ export function createAdmission({
           });
         }
 
+        // Non-retryable window (long/daily): park until the resource says
+        // it is back. Before D63 a signal without a clock parked with NO
+        // nextRetryAt — the task waited on nothing, and only a lucky
+        // resource flip could revive it. The driver prices the LONG window
+        // as the fallback: fixed-time at the next wall-clock reset, rolling
+        // from the hit, and a provider resetsAt always wins inside the
+        // driver (D51) — so both clocks agree when both exist.
+        const driver = quotaDriverFor(err.quota.provider);
+        const longEta = driver.nextReset(
+          {
+            kind: brain?.quotaLongType ?? null,
+            ms: brain?.quotaResetLongMs ?? null,
+            fixedReset: brain?.quotaFixedReset ?? null,
+          },
+          { nowMs: now(), resetsAt: err.quota.resetsAt ?? null, lastSignalAt: now() },
+        );
         log.warn("quota.parked", {
           task: task.id, exec: execution.id,
           provider: err.quota.provider, model: err.quota.model,
           windowKind: err.quota.rateLimitType ?? null,
           nextAvailableAt: resource?.next_available_at ?? null,
+          nextRetryAt: longEta,
         });
         return wait(Status.WAIT_QUOTA, `${err.quota.provider}/${err.quota.model}: ${err.quota.message}`, {
-          nextRetryAt: resource?.next_available_at ?? null,
+          nextRetryAt: resource?.next_available_at ?? longEta,
         });
       }
 

@@ -336,6 +336,21 @@ CREATE TABLE IF NOT EXISTS brains (
   -- informasi operator. NULL = belum diketahui (tidak pernah retry in place).
   quota_reset_short_ms INTEGER,
   quota_reset_long_ms  INTEGER,
+  -- D63 (POC-6 §5.1): tipe jendela memberi makna pada dua durasi di atas —
+  -- harian google adalah momen jam-tetap (quota_fixed_reset, sadar DST),
+  -- groq menggelinding dari konsumsi pertama, cerebras mengisi bucket. Tier,
+  -- laju, dan context window membuat Brain catatan jujur atas yang dijual
+  -- provider. NULL = belum diketahui; backfill migrasi dan defaults driver
+  -- mengisi baris/Brain baru dari satu tabel kebenaran (quota-drivers).
+  quota_tier               TEXT, -- kelas paket provider: free|free-trial|lite|pro|…
+  quota_short_type         TEXT CHECK (quota_short_type IN ('rolling','fixed-time','token-bucket','credits')),
+  quota_long_type          TEXT CHECK (quota_long_type IN ('rolling','fixed-time','token-bucket','credits','credits-anniversary')),
+  quota_fixed_reset        TEXT,  -- JSON {atHourLocal, timeZone, day?} untuk tipe fixed-time
+  rpm                      INTEGER,
+  rpd                      INTEGER,
+  tpm                      INTEGER,
+  tpd                      INTEGER,
+  context_window_tokens    INTEGER,
   level          TEXT NOT NULL DEFAULT 'normal'
                  CHECK (level IN ('low','normal','critical')),
   category       TEXT,

@@ -346,3 +346,54 @@ test("a per-minute refusal thrown at dispatch counts and blocks at the limit", a
   assert.equal(blocked.status, Status.BLOCKED);
   assert.match(blocked.wait_reason ?? "", /exhausted/);
 });
+
+// --- D63: provider drivers in the runtime paths ------------------------------
+
+test("a groq 413 structural wall blocks immediately — no window climbs it (D63)", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "groq-wall" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const path = (await h.repos.tasks.get(task.id)).workspace_path;
+  // The groq brain is not seeded; relabel the live execution so the late
+  // error classifies through the groq driver — exactly the measured D62
+  // shape: 413, x-should-retry:false, Limit/Requested in the body.
+  await h.store.run(`UPDATE executions SET model_provider = 'groq', model_id = 'qwen3.6-27b' WHERE id = ?`, [execution.id]);
+
+  await lateQuotaError(h, execution, "Request Entity Too Large: Limit 7000, Requested 20011");
+
+  const blocked = await h.repos.tasks.get(task.id);
+  assert.equal(blocked.status, Status.BLOCKED, "a structural wall is not waited out");
+  assert.match(blocked.wait_reason ?? "", /input-token window/);
+  assert.equal(blocked.quota_retries, 0, "the quota budget is not spent on a wall no window clears");
+  assert.equal(blocked.resource_retries, 0, "nor is the transient budget — five backoffs would end in the same refusal");
+  // No wedged resource either: the blocked tasks are the operator-visible
+  // evidence, not a QUOTA_EXHAUSTED row with no release clock.
+  assert.equal(await h.repos.resources.get("groq", "qwen3.6-27b"), null);
+  assert.equal(await h.repos.leases.get(path), null);
+});
+
+test("a clockless dispatch refusal on a long window parks at the driver's long ETA (D63)", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "glm-eta", modelPolicy: { preferred: ["glm-4.7"] } });
+
+  const quotaError = () => {
+    const err = new Error("HTTP 429");
+    err.status = 429;
+    // No resetsAt, no rateLimitType: the provider said nothing about time.
+    err.quota = { provider: "zai", model: "glm-4.7", status: 429, message: "quota exceeded" };
+    return err;
+  };
+  h.fake.failNextDispatch(quotaError());
+  await h.scheduler.notify();
+
+  const parked = await h.repos.tasks.get(task.id);
+  assert.equal(parked.status, Status.WAIT_QUOTA);
+  // Before D63 this parked with nextRetryAt null, which park() replaced with
+  // a 30s failure-count backoff — a weekly credits window released like a
+  // hiccup. The zai driver prices the LONG window: no cycle anchor known, so
+  // the conservative full window from now.
+  assert.equal(parked.next_retry_at, h.clock.now() + 7 * 24 * 3_600_000, "the driver's long window is the clock");
+});

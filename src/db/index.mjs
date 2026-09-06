@@ -11,6 +11,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { quotaDriverFor } from "../domain/quota-drivers/index.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SCHEMA = readFileSync(join(here, "schema.sql"), "utf8");
@@ -116,6 +117,48 @@ class SqliteStore {
     // belum pernah gagal karenanya.
     if (taskCols.length > 0 && !taskCols.includes("quota_retries")) {
       this.#db.exec(`ALTER TABLE tasks ADD COLUMN quota_retries INTEGER NOT NULL DEFAULT 0`);
+    }
+
+    // D63 (POC-6 §5.1): window TYPES, tier, laju, dan context window menemani
+    // dua durasi D51. Backfill lewat registry driver — tabel kebenaran yang
+    // sama dipakai brains.create() — supaya migrasi dan create tidak pernah
+    // berbeda pendapat (aturan D51: dua pintu, satu tabel). Durasi ms yang
+    // sudah di-patch operator TIDAK disentuh; yang diisi hanya kolom baru.
+    const brainCols3 = cols("brains");
+    const POC6_BRAIN_COLS = [
+      ["quota_tier", "TEXT"],
+      ["quota_short_type", "TEXT"],
+      ["quota_long_type", "TEXT"],
+      ["quota_fixed_reset", "TEXT"],
+      ["rpm", "INTEGER"],
+      ["rpd", "INTEGER"],
+      ["tpm", "INTEGER"],
+      ["tpd", "INTEGER"],
+      ["context_window_tokens", "INTEGER"],
+    ];
+    if (brainCols3.length > 0 && !brainCols3.includes("quota_tier")) {
+      for (const [name, type] of POC6_BRAIN_COLS) {
+        this.#db.exec(`ALTER TABLE brains ADD COLUMN ${name} ${type}`);
+      }
+      const rows = this.#db.prepare(`SELECT id, provider, model FROM brains`).all();
+      const backfill = this.#db.prepare(`
+        UPDATE brains SET quota_tier = ?, quota_short_type = ?, quota_long_type = ?, quota_fixed_reset = ?,
+                          rpm = ?, rpd = ?, tpm = ?, tpd = ?
+          WHERE id = ?`);
+      for (const row of rows) {
+        const d = quotaDriverFor(row.provider).defaults({ model: row.model });
+        backfill.run(
+          d.quotaTier,
+          d.shortType,
+          d.longType,
+          d.fixedReset ? JSON.stringify(d.fixedReset) : null,
+          d.rates.rpm,
+          d.rates.rpd,
+          d.rates.tpm,
+          d.rates.tpd,
+          row.id,
+        );
+      }
     }
 
     // D52: penghitung terpisah untuk penolakan transient (rate limit jendela

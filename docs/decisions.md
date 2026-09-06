@@ -2079,6 +2079,76 @@ Tidak diubah hari ini — mencatatnya supaya rotasi kunci berikutnya
 memindahkannya ke secret file seperti yang lain.
 
 
+## D63 — POC-6 fase 1: kuota per-provider jadi driver, bukan dua kolom ms
+
+**Masalah.** D51 memberi Brain dua durasi (`quota_reset_short_ms/long_ms`),
+dan itu menjawab "berapa lama jendelanya" — bukan "kapan ia buka lagi".
+Google mereset RPD **tengah malam Pasifik** (momen jam-tetap, sadar DST);
+groq menggelinding dari konsumsi pertama; cerebras mengisi bucket. Dua
+angka ms tidak bisa membedakan ketiganya, dan dinding yang BUKAN jendela
+(groq 413 struktural D62, cerebras 402) diparkir 10× WAIT_QUOTA /
+5× WAIT_RESOURCE padanya tidak akan pernah berubah jawabannya.
+
+**Keputusan.** Satu registry driver per provider
+(`src/domain/quota-drivers/`): `defaults({model})` (tier, dua jendela
+dengan TIPE, deskriptor jam-tetap, laju), `nextReset(window, ctx)` (aturan
+ETA tunggal: sinyal provider menang (D51, epoch detik dinormalisasi);
+fixed-time → kejadian jam-dinding berikutnya via `Intl`, sadar DST;
+token-bucket → pace maks satu jendela pendek; rolling/credits → anchor +
+ms, fallback konservatif), dan `classifyError({status,text})` (kosakata
+kuota generik D52 TIDAK boleh dipersempit driver — hanya boleh MENAMBAH
+pola fatal; 402/401 otomatis fatal). `genericDriver` = perilaku hari ini
+via `makeClassifier`, fallback provider tak dikenal.
+
+**Fakta yang dipegang tiap driver** (sumber di spec POC-6 §3):
+google free tier — RPM/RPD **per model** dari halaman rate limit AI Studio
+(2026-09-06: 2.5-FL 10/20, 3.1-FL & 3.5-FL 15/500, 3.7-Flash 5/20; TPM
+250rb seragam), harian = fixed-time tengah malam `America/Los_Angeles`.
+groq free — rolling 60 dtk/24 jam, **tpm 7000 = angka terukur, bukan 8000
+iklanan**; 413 "Limit N, Requested M" → fatal `structural:true`. cerebras
+free-trial — short **token-bucket** (pace cap 60 dtk). zai lite — credits
+5 jam rolling + 10rb/minggu **anniversary** (cycleAnchor tak diketahui
+controller → fallback konservatif). claude-code pro — fixed-time 5 jam +
+mingguan tapi jam anchor belum terukur → `fixedReset:null` (fallback
+rolling, tidak mengklaim jam yang tidak diketahui). mistral free — RPS+TPM
+per model, angka hanya ada di Admin Panel → laju null jujur; model pool
+magistral/codestral/mistral-small (sudah teregistrasi via AgentOS).
+
+**Skema.** `brains` bertambah 9 kolom (quota_tier, quota_short_type,
+quota_long_type dengan CHECK taksonomi, quota_fixed_reset JSON, rpm, rpd,
+tpm, tpd, context_window_tokens). Migrasi D63 menambah kolom dan
+**backfill dari registry** — satu sumber kebenaran dengan jalur create;
+patch operator eksplisit (kolom ms lama) TIDAK ditimpa. Resource
+`(provider, model)` dikunci `(provider, quota_tier)` secara konseptual:
+kuota milik paket, bukan Brain.
+
+**Perilaku baru yang terukur di jalur runtime** (regresi 2 test baru +
+16 test driver): late-error groq 413 → **BLOCKED langsung** dengan alasan
+yang menyebut perbaikan sebenarnya (bayar/prompt lebih kecil), budget
+retry tak tersentuh, resource TIDAK diwedge (task yang blocked adalah
+bukti yang dilihat operator — QUOTA_EXHAUSTED tanpa jam lepas tak pernah
+dilepas scheduler). Dispatch refusal tanpa jam di jendela panjang → parkir
+WAIT_QUOTA pada ETA jendela PANJANG driver (zai: 7 hari) — sebelumnya
+`nextRetryAt:null` lalu park() menggantinya backoff 30 dtk, jendela
+mingguan dilepas seperti cegukan. Gateway catch kini konsultasi driver
+saat gate generik meleset ("RESOURCE_EXHAUSTED" google tidak memuat
+"rate limit"/"429").
+
+**Test:** 436 → 454 (`quota-drivers.test.mjs` 16: registry, defaults
+per-model google, ETA rolling/fixed-time DST dua arah (fall-back
+2026-11-01 & spring-forward 2026-03-08)/token-bucket cap/anniversary,
+klasifikasi fatal 402/401/413, migrasi DB pra-D63 dengan backfill;
+`quota-retry.test.mjs` +2: 413 groq late-error BLOCKED, ETA panjang
+clockless).
+
+**Yang BELUM (fase 2+, spec POC-6 §8.2+):** `promptBudget(brain)` dan
+pipeline kompaksi/fragmentasi §6 — itu yang benar-benar menaikkan
+dinding groq; kolom UI baru (quotaReset di GET /api/work/brains sudah
+membawa tier/tipe/fixedReset/rates, tampilan menyusul); karakterisasi
+ulang angka mistral saat Admin Panel bisa dibaca; anchor jam claude-code
+5 jam belum terukur.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

@@ -28,6 +28,7 @@ import { nullLogger } from "../domain/logger.mjs";
 import { withPreamble } from "./instruction.mjs";
 import { usageFromMessage, isEmptyUsage } from "./session-events.mjs";
 import { COMPLETED_STATUSES } from "../domain/thinking-probe.mjs";
+import { quotaDriverFor } from "../domain/quota-drivers/index.mjs";
 
 export class GatewayContractError extends Error {
   constructor(message) {
@@ -43,13 +44,19 @@ const DISPATCH_METHODS = ["agent.run", "agent"];
 const PROTOCOL_MIN = 3;
 const PROTOCOL_MAX = 4;
 
+/**
+ * The text a gateway error is classified on. Quota details usually arrive
+ * nested inside a stringified error, so the quotes are escaped — unescape
+ * once here rather than writing patterns that anticipate every nesting level.
+ */
+export function gatewayErrorText(errorLike) {
+  const raw = typeof errorLike === "string" ? errorLike : JSON.stringify(errorLike ?? "");
+  return raw.replace(/\\"/g, '"');
+}
+
 /** Recognises a provider quota refusal inside a gateway error payload. */
 export function parseGatewayQuota(errorLike) {
-  const raw = typeof errorLike === "string" ? errorLike : JSON.stringify(errorLike ?? "");
-  // Quota details usually arrive nested inside a stringified error, so the
-  // quotes are escaped. Unescape before matching rather than writing patterns
-  // that have to anticipate every level of nesting.
-  const text = raw.replace(/\\"/g, '"');
+  const text = gatewayErrorText(errorLike);
   if (!/rate limit|too many requests|session limit|usage limit|429/i.test(text)) return null;
   const resetsAt = Number(text.match(/"?resetsAt"?\s*[:=]\s*(\d+)/)?.[1] ?? 0) || null;
   const rateLimitType = text.match(/"?rateLimitType"?\s*[:=]\s*"?([a-z_]+)"?/i)?.[1] ?? null;
@@ -609,10 +616,43 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
           raw: payload,
         };
       } catch (err) {
+        const errText = gatewayErrorText(err.gatewayError ?? err.message);
         const quota = parseGatewayQuota(err.gatewayError ?? err.message);
         if (quota) {
           err.status = 429;
           err.quota = { ...quota, provider: candidate.provider, model: candidate.model };
+        } else {
+          // POC-6 (D63): the gate above only knows the D52-era vocabulary,
+          // and it MISSES real refusals — google's "RESOURCE_EXHAUSTED" says
+          // neither "rate limit" nor "429". The provider driver classifies on
+          // the same unescaped text: a "quota" verdict widens err.quota
+          // exactly as the gate would have; a "fatal" verdict (groq's 413
+          // structural wall, a 402 from a spent trial) rides as err.fatalQuota
+          // for admission to block on instead of parking in WAIT_RUNTIME.
+          const verdict = quotaDriverFor(candidate.provider).classifyError({
+            status: err.status ?? null,
+            text: errText,
+          });
+          if (verdict?.kind === "quota") {
+            err.status = 429;
+            err.quota = {
+              status: 429,
+              resetsAt: verdict.resetsAt ?? null,
+              rateLimitType: verdict.rateLimitType ?? null,
+              message: errText.slice(0, 200),
+              retryAfterSeconds: null,
+              provider: candidate.provider,
+              model: candidate.model,
+            };
+          } else if (verdict?.kind === "fatal") {
+            err.fatalQuota = {
+              reason: verdict.reason ?? "provider fatal",
+              structural: Boolean(verdict.structural),
+              message: errText.slice(0, 200),
+              provider: candidate.provider,
+              model: candidate.model,
+            };
+          }
         }
         throw err;
       }

@@ -36,12 +36,11 @@ import { ExecutionStatus, Status, canTransition } from "../domain/state-machine.
 import {
   QUOTA_RETRY_LIMIT,
   RESOURCE_RETRY_LIMIT,
-  isQuotaErrorMessage,
   isRetryableWindow,
   isTransientRuntimeError,
-  parseQuotaReset,
   resourceRetryBackoffMs,
 } from "../domain/quota-windows.mjs";
+import { quotaDriverFor } from "../domain/quota-drivers/index.mjs";
 import { nullLogger } from "../domain/logger.mjs";
 
 /**
@@ -310,10 +309,21 @@ export function createSessionEventSink({
     // for models whose SHORT reset window is under ten minutes (D52; any
     // provider, not just per-minute ones) the task parks in WAIT_QUOTA for
     // exactly one window instead of dying, up to QUOTA_RETRY_LIMIT times.
-    const quota = isQuotaErrorMessage(message);
+    //
+    // POC-6 (D63): classification moved into the provider driver — the same
+    // generic vocabulary as before (a driver may only ADD to it), plus fatal
+    // patterns a window can never fix: groq's 413 "Limit N, Requested M"
+    // structural wall and any 402 payment_required. The driver also prices
+    // the retry ETA, so a fixed-time window (google RPD) parks until the real
+    // wall-clock reset instead of a guessed duration.
+    const driver = quotaDriverFor(execution.model_provider);
+    const verdict = driver.classifyError({ text: message });
+    const quota = verdict?.kind === "quota";
+    const providerFatal = verdict?.kind === "fatal" ? verdict : null;
     let retryable = false;
     if (quota) {
-      const { resetsAt, rateLimitType } = parseQuotaReset(message);
+      const resetsAt = verdict.resetsAt ?? null;
+      const rateLimitType = verdict.rateLimitType ?? null;
       const brain = brains ? await brains.forModel(execution.model_provider, execution.model_id) : null;
       const shortMs = brain?.quotaResetShortMs ?? null;
       retryable = isRetryableWindow(shortMs);
@@ -340,12 +350,15 @@ export function createSessionEventSink({
         const retries = current?.quota_retries ?? 0;
         if (retries < QUOTA_RETRY_LIMIT) {
           // The provider's own reset time wins when it gave one; otherwise
-          // wait exactly one short window — "tunggu 1× reset, coba lagi".
-          // The message timestamp can arrive as epoch seconds OR millis, so
-          // normalise BEFORE comparing to the clock: 1.7e9 seconds always
-          // looks "in the past" to a 1.7e12 millisecond now().
-          const resetsAtMs = resetsAt ? (resetsAt < 1e12 ? resetsAt * 1000 : resetsAt) : null;
-          const eta = resetsAtMs && resetsAtMs > now() ? resetsAtMs : now() + shortMs;
+          // the driver prices the window — rolling from the hit, fixed-time
+          // at its next wall-clock occurrence — never a bare guess. The
+          // signal clock arrives as epoch seconds OR millis, so the driver
+          // normalises before comparing to now().
+          const eta =
+            driver.nextReset(
+              { kind: brain?.quotaShortType ?? null, ms: shortMs },
+              { nowMs: now(), resetsAt: resetsAt ?? null, lastSignalAt: now() },
+            ) ?? now() + shortMs;
           const retryDetail = `quota retry ${retries + 1}/${QUOTA_RETRY_LIMIT}: ${message}`;
           await repos.executions.setStatus(runId, ExecutionStatus.FAILED, {
             result: `dispatch refused after accept: ${message}`,
@@ -392,6 +405,33 @@ export function createSessionEventSink({
         );
         return { handled: true, status: Status.BLOCKED, quotaRetriesExhausted: true };
       }
+    }
+
+    // Provider-fatal verdicts sit ABOVE the transient path, not inside it: a
+    // wall no window can climb (groq's 413 structural input limit, a 402 from
+    // a spent trial) parked as "runtime refused" burns five rounds of backoff
+    // that all end in the identical refusal — noise that looks like an outage.
+    // Block once, with the driver's reason naming the actual fix. No
+    // applyQuotaSignal here: the resource keeps its clock-driven state, and
+    // the blocked tasks in the queue are the visible evidence an operator
+    // acts on (wedges without a release clock are invisible by design —
+    // releaseExpiredQuota can't flip what has no next_available_at).
+    if (providerFatal) {
+      await blockLateError(
+        execution,
+        runId,
+        payload,
+        `${providerFatal.reason ?? "provider fatal"} (${execution.model_provider}/${execution.model_id}): ${message}`,
+        { providerFatal: true, structural: Boolean(providerFatal.structural) },
+      );
+      log.warn("quota.provider-fatal", {
+        task: execution.task_id, exec: runId,
+        provider: execution.model_provider, model: execution.model_id,
+        reason: providerFatal.reason ?? null,
+        structural: Boolean(providerFatal.structural),
+        error: String(message).slice(0, 300),
+      });
+      return { handled: true, status: Status.BLOCKED, providerFatal: true };
     }
 
     // D52: a late refusal that is TRANSIENT — a rate limit on a long window,

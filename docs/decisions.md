@@ -2040,6 +2040,45 @@ kandidat tetap pekerjaan tombol Probe terpisah. Cerebras juga tetap
 tertahan billing 402 — perbaikan pesan tidak mengubah dindingnya.
 
 
+## D62 — deep-dive groq & cerebras: dinding yang tidak hilang oleh reset
+
+**Groq — bukan rate limit yang bisa ditunggu, tapi ITPM vs ukuran prompt.**
+Probe langsung ke `api.groq.com` dari dalam container gateway (kunci
+tidak pernah dicetak): permintaan mungil **200 OK** dengan headroom
+besar (999/1000 request), tapi `x-ratelimit-limit-tokens: 8000`. Kirim
+prompt ~20rb token → **413** dengan pesan telak: `input tokens per
+minute (ITPM): Limit 7000, Requested 20011` untuk `qwen/qwen3.6-27b`,
+plus `x-should-retry: false`. Run gateway historis membawa prompt
+**10.408 token** — selalu di atas ITPM free/on-demand tier. Semua model
+groq di kunci ini terukur sama: 7000 (qwen3.6-27b, qwen3.8-27b) dan
+8000 (gpt-oss-20b/120b, safeguard); `qwen/qwen3-32b` tersedia tapi
+dindingnya sama. Jadi FailoverError "API rate limit reached" yang
+muncul di Test bukan jendela yang akan reset — D59 benar soal keluarga
+jendela groq (per-menit+harian ADA di API), tapi untuk dispatch agen
+dinding efektifnya adalah **ITPM < ukuran prompt, yang tidak pernah
+hilang**. Satu-satunya jalan: upgrade ke Dev Tier berbayar. Efek samping
+yang diterima: task yang dispatch ke Brain groq memakai kosakata
+"rate limit" dari FailoverError → parkir `WAIT_QUOTA` 10× lalu BLOCKED —
+jujur, walau boros.
+
+**Cerebras — level menyusut karena `reasoning:false`, bukan perubahan
+model.** `models.list` gateway melaporkan `reasoning: false` untuk
+`cerebras/qwen-3.8-27b` → agen mengiklankan `["off"]` saja. Probe awal
+yang mencatat kosakata off…high ternyata divalidasi terhadap model
+DEFAULT (zai/glm-4.7) — pelajaran D21 terulang di tingkat kosakata.
+Probe langsung tanpa level: **402 payment_required**
+(`x-should-retry: false`) — akun tanpa kredit. Brain
+`cerebras-qwen-3-8-27b` ditambal `thinking: null` (evidence diperbarui)
+supaya satu-satunya dinding adalah billing; Test kini melaporkan 402
+apa adanya, dan begitu kredit terisi brain langsung dispatchable tanpa
+level — level karakterisasi ulang lewat tombol Probe setelahnya.
+
+**Kunci yang bocor di config:** kunci cerebras ternyata tersimpan
+menulis di `openclaw.json` (groq sudah benar memakai file-secret).
+Tidak diubah hari ini — mencatatnya supaya rotasi kunci berikutnya
+memindahkannya ke secret file seperti yang lain.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

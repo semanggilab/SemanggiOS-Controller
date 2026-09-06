@@ -2188,17 +2188,18 @@ hanya sebagai pintasan "Copy from catalog" yang berlabel eksplisit.
 Field provider menunjuk driver yang memiliki label itu — peringatan
 jelas saat sebuah label akan jatuh ke generic.
 
-**Rev.2 (hari yang sama, laporan operator):** union cache-gateway saja
-ternyata kaku ke arah sebaliknya — model mistral SUDAH terdaftar di
-AgentOS tapi cache `gateway_models` belum di-refresh, jadi provider
-tidak muncul di dropdown walau drivernya ada (dan `models.list` live
-memang mengembalikan `mistral-custom/*` begitu di-refresh; cache-nya
-saja yang basi). Opsi provider kini union TIGA sumber: cache gateway +
-brain yang ada + **semua `providerKeys` driver**. Label yang belum ada
-di cache ditandai hint ("ketik label persis seperti terdaftar di
-AgentOS, atau tekan Refresh Models") — brain.provider harus sama dengan
-label gateway atau resolusi agen tidak akan pernah cocok (pelajaran
-D42); field model tetap bebas diketik (Combobox = input+datalist).
+**Rev.3 (masih hari yang sama, koreksi aturan operator):** union tiga
+sumber masih terlalu longgar — provider yang modelnya DIHAPUS dari
+AgentOS tetap muncul (phantom), dan cache yang harus di-refresh manual
+adalah sumber kekakuannya. Aturan final: dropdown provider = **(provider
+brain yang ada ∪ semua `providerKeys` driver) ∩ `models.list` LIVE**.
+Panel bertanya ke gateway sungguhan setiap dibuka (cache hanya cat
+pertama sebelum jawaban live tiba — D38 "jangan bertanya tiap kali
+dibuka" dilonggarkan atas instruksi operator, dengan efek samping cache
+menyembuhkan diri); hapus model dari AgentOS → providernya hilang dari
+form meski drivernya ada. Satu carve-out: label harness ACP
+(`claude-code`) — dispatchable tapi memang tidak pernah muncul di
+models.list; selain itu field tetap bebas diketik.
 
 **Test:** 454 → 456 (alias + katalog; migrasi D64 dengan baris selamat).
 Batas diketahui: tidak ada peringatan runtime saat brain provider

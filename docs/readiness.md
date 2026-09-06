@@ -2,7 +2,7 @@
 
 Ditinjau 2026-08-21; **diperbarui 2026-09-04** setelah migrasi state ke root `semanggios`, repair gateway, dan deploy `2026090401`. Aturan penilaian tidak berubah: sesuatu disebut siap kalau **terbukti hidup di cluster**, bukan kalau kodenya ada dan tesnya hijau. Unit test membuktikan logika, bukan kontrak dengan sistem lain. Sebagian besar temuan POC-3 dan POC-4 justru berupa selisih antara dokumen dan versi yang terpasang.
 
-**Keadaan saat ini:** `semanggi/agentos:2026090601`, `semanggi/work-controller:2026090405`, `semanggi/openclaw-gateway:2026083001`; klaster secara kontrak hanya melibatkan dua node — `kub01-01`/`kub01-02` berlabel `type=app` (semua placement `node.labels.type == app`), node lain tidak dilibatkan; 422 test controller lulus semua. Pembaruan terakhir 2026-09-06: whitelist proxy PUT docs + modal dokumen Command Center (D56), terbukti hidup di `agentos-src` tanpa rebuild image.
+**Keadaan saat ini:** `semanggi/agentos:2026090601`, `semanggi/work-controller:2026090405`, `semanggi/openclaw-gateway:2026083001`; klaster secara kontrak hanya melibatkan dua node — `kub01-01`/`kub01-02` berlabel `type=app` (semua placement `node.labels.type == app`), node lain tidak dilibatkan; 422 test controller lulus semua. Pembaruan terakhir 2026-09-06: whitelist proxy PUT docs + modal dokumen Command Center (D56) + copy-to-clipboard task-id/markdown dan Cancel modal, terbukti hidup di `agentos-src` tanpa rebuild image.
 
 ## Yang terbukti hidup
 
@@ -69,6 +69,7 @@ Ditinjau 2026-08-21; **diperbarui 2026-09-04** setelah migrasi state ke root `se
 | Whitelist proxy Semanggi ikut endpoint baru | `GET/PUT /work/projects/{id}/role-levels` ditambahkan ke ALLOWED di `app/api/semanggi/[...path]/route.ts` — ditemukan dari modal Edit yang gagal di cluster ("proxy does not expose"), terverifikasi 200 lewat jalur terautentikasi di image `2026090403` |
 | Whitelist proxy untuk PUT docs (D56) | Kegagalan kedua dari jenis yang sama: PUT `/work/projects/{id}/docs/{name}` ada di controller sejak D55 tapi tak terdaftar di proxy, setiap Edit/Save modal Command Center gagal 404 "does not expose PUT". Entri ALLOWED ditambahkan; terverifikasi 2026-09-06 di `agentos-src` (fork commit `97dd5b12`): probe project tak dikenal mencapai controller ("unknown project", bukan "does not expose"), dan round-trip PUT dokumen asli mengembalikan byte identik, 200 |
 | Modal dokumen Command Center (D56) | Edit/Save pindah ke header modal di sebelah judul (slot `actions` baru di `Modal`); scroll textarea dan pratinjau markdown tersinkron proporsional. Build standalone terautentikasi 2026-09-06 |
+| Copy-to-clipboard + Cancel modal dokumen | Icon copy di sebelah kanan setiap text task-id (Summary, TaskDialog, Command Center — termasuk baris task terdaftar, yang menyalin id task asli) dan di pojok kanan-atas setiap region markdown, menyalin source asli; tombol Cancel muncul/hilang bersama Save. `memory/blueprint.md` dan `memory/decisions.md` terverifikasi read-only dua lapis: GET melaporkan `dir=memory` (UI menyembunyikan Edit) dan PUT ditolak 400 oleh controller. `copyToClipboard` memakai fallback textarea karena UI dilayani HTTP polos non-localhost (tanpa `navigator.clipboard`). Terbukti di `agentos-src` fork `327531d0`, 2026-09-06 |
 | Suite controller | **422 test**, semua lulus, tanpa dependensi runtime |
 
 ## Yang masih menghalangi

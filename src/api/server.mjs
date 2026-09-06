@@ -2131,8 +2131,9 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       const parts = String(anyProbe.workspace).split("/");
       parts[parts.length - 1] = slug(provider); // ganti segmen provider terakhir
       workspace = parts.join("/");
+    } else {
+      workspace = `workspaces/probe/${slug(provider)}`;
     }
-    if (!workspace) return null;
 
     try {
       const created = await controller.runtime.createProbeAgent({ name: probeName, workspace, model: full });

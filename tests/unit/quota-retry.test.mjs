@@ -9,6 +9,7 @@ import { buildHarness, seedBasics, queuedTask } from "../helpers/harness.mjs";
 import { createSessionEventSink } from "../../src/runtime/session-events.mjs";
 import {
   QUOTA_RETRY_LIMIT,
+  QUOTA_WINDOWS_BY_PROVIDER,
   RESOURCE_RETRY_LIMIT,
   describeWindow,
   isQuotaErrorMessage,
@@ -94,6 +95,23 @@ test("reset metadata survives being embedded in an error string", () => {
   assert.equal(resetsAt, 1787113200);
   assert.equal(rateLimitType, "per_minute");
   assert.deepEqual(parseQuotaReset("no metadata here"), { resetsAt: null, rateLimitType: null });
+});
+
+test("groq and cerebras reset per-minute + daily, in Gemini's family (D59)", () => {
+  // They bill like Gemini: a wall that clears in 60 seconds must not take the
+  // 5-hour backoff path. Before D59 both rode the subscription package.
+  for (const provider of ["groq", "cerebras"]) {
+    assert.deepEqual(
+      QUOTA_WINDOWS_BY_PROVIDER[provider],
+      { shortMs: 60_000, longMs: 86_400_000 },
+      `${provider} follows the per-minute + daily schedule`,
+    );
+    assert.equal(isRetryableWindow(QUOTA_WINDOWS_BY_PROVIDER[provider].shortMs), true);
+  }
+  // The subscription family keeps its own schedule — this change moves
+  // providers between families, it does not redefine the families.
+  assert.deepEqual(QUOTA_WINDOWS_BY_PROVIDER.zai, { shortMs: 18_000_000, longMs: 604_800_000 });
+  assert.deepEqual(QUOTA_WINDOWS_BY_PROVIDER["claude-code"], { shortMs: 18_000_000, longMs: 604_800_000 });
 });
 
 test("windows render operator-facing labels", () => {

@@ -103,8 +103,12 @@ class SqliteStore {
       this.#db.exec(`ALTER TABLE brains ADD COLUMN quota_reset_long_ms INTEGER`);
       this.#db.exec(`
         UPDATE brains SET
-          quota_reset_short_ms = CASE provider WHEN 'google' THEN 60000 ELSE 18000000 END,
-          quota_reset_long_ms  = CASE provider WHEN 'google' THEN 86400000 ELSE 604800000 END
+          quota_reset_short_ms = CASE provider
+            WHEN 'google' THEN 60000 WHEN 'groq' THEN 60000 WHEN 'cerebras' THEN 60000
+            ELSE 18000000 END,
+          quota_reset_long_ms  = CASE provider
+            WHEN 'google' THEN 86400000 WHEN 'groq' THEN 86400000 WHEN 'cerebras' THEN 86400000
+            ELSE 604800000 END
       `);
     }
 

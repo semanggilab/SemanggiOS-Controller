@@ -1968,6 +1968,32 @@ untuk setiap dokumen yang termuat, dan bila controller suatu hari menolak
 sebuah nama lagi, kegagalannya tampil apa adanya lewat `saveError`.
 
 
+## D59 — groq dan cerebras pindah keluarga reset: per-menit + harian
+
+**Keputusan (2026-09-06, operator).** D51 menaruh groq di keluarga
+langganan (5 jam + mingguan) bersama zai/claude-code — saat itu groq
+hanya membawa QWEN dan belum pernah menabrak dindingnya. Operator
+meluruskan: kuota Groq **dan** Cerebras me-reset **per menit + per hari**,
+sama seperti Gemini. `QUOTA_WINDOWS_BY_PROVIDER` kini punya tiga anggota
+di keluarga per-menit+harian (`google`, `groq`, `cerebras`) dan dua di
+keluarga 5-jam+mingguan (`zai`, `claude-code`); backfill migrasi D51
+diperluas supaya DB yang migrasinya terlambat tidak berbeda pendapat
+dengan `create()`.
+
+**Konsekuensi perilaku yang disengaja:** kegagalan kuota groq/cerebras
+kini masuk kelas retry-in-place D52 (jendela terpendek < 10 menit →
+`WAIT_QUOTA` satu jendela, maksimum 10×), bukan lagi backoff `WAIT_RESOURCE`
+30 dtk→15 menit — dinding 60 detik memang tidak layak ditunggu dengan
+backoff 15 menit. Konsekuensi data: Brain groq/cerebras yang **sudah
+tersimpan** sebelum D59 masih memegang 5 jam + mingguan di
+`quota_reset_short_ms`/`quota_reset_long_ms`-nya (backfill lama sudah
+dijalankan cluster dan tidak ditulis ulang) — baris itu DIREKOMENDASI
+dipatch operator lewat `PATCH /api/work/brains/{id}` ke 60000/86400000;
+tabel default hanya mengikat Brain yang dibuat setelah D59. Cerebras
+tetap tertahan billing 402 (lihat readiness) — jendela ini menunggu
+kreditnya terisi, bukan sebaliknya.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

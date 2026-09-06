@@ -5,19 +5,21 @@
 // Tabel resources merekam keadaan SEKARANG (QUOTA_EXHAUSTED sampai kapan),
 // bukan karakter jendela kuotanya — dan sinyal provider tidak selalu datang
 // sebelum task pertama menabraknya. Jadwal reset adalah properti model di
-// sisi provider: google memakai jendela per-menit + harian, keluarga
-// berlangganan (zai/claude-code/groq-qwen) memakai 5 jam + mingguan. Menyimpan
+// sisi provider: google/groq/cerebras memakai jendela per-menit + harian,
+// keluarga berlangganan (zai/claude-code) memakai 5 jam + mingguan. Menyimpan
 // itu di Brain membuat kebijakan retry bisa memutuskan SEBELUM sinyal pertama
 // tiba, dan operator bisa melihatnya di halaman yang sama dengan modelnya.
 
 /** Jendela pendek dan panjang per provider, dalam milidetik. */
 export const QUOTA_WINDOWS_BY_PROVIDER = Object.freeze({
-  // Gemini: RPM (per menit) + kuota harian.
+  // Gemini / Groq / Cerebras: RPM (per menit) + kuota harian (D59 — groq dan
+  // cerebras dulu salah keluarga, ikut paket 5 jam + mingguan langganan).
   google: Object.freeze({ shortMs: 60_000, longMs: 24 * 3_600_000 }),
-  // GLM / Claude / QWEN(via groq): jendela 5 jam + mingguan.
+  groq: Object.freeze({ shortMs: 60_000, longMs: 24 * 3_600_000 }),
+  cerebras: Object.freeze({ shortMs: 60_000, longMs: 24 * 3_600_000 }),
+  // GLM / Claude: jendela 5 jam + mingguan.
   zai: Object.freeze({ shortMs: 5 * 3_600_000, longMs: 7 * 24 * 3_600_000 }),
   "claude-code": Object.freeze({ shortMs: 5 * 3_600_000, longMs: 7 * 24 * 3_600_000 }),
-  groq: Object.freeze({ shortMs: 5 * 3_600_000, longMs: 7 * 24 * 3_600_000 }),
 });
 
 /**

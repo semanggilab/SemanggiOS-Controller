@@ -401,10 +401,11 @@ CREATE TABLE IF NOT EXISTS project_role_levels (
 -- Baris hanya ada untuk sel grid yang sengaja dipaku. Kosong berarti "pakai
 -- default grid (DEFAULT_BRAIN_MAP), lalu kandidat level", yang tetap jalan.
 --
--- ON DELETE tidak dipakai: brains tidak pernah dihapus (hanya di-disable),
--- karena agen sudah terlanjur di-provision atas namanya. Yang bisa terjadi
--- adalah brain_id menunjuk Brain yang dimatikan — itu diperiksa saat resolusi
--- dan diperlakukan sebagai "tidak dipaku", bukan sebagai kegagalan.
+-- ON DELETE tidak dipakai: penghapusan brain lewat endpoint yang membersihkan
+-- pemakuannya secara eksplisit dan melaporkan sel mana yang kembali ke default
+-- (hapus diam-diam lewat FOREIGN KEY tidak memberi tahu operator apa yang
+-- berubah). Resolusi sendiri memperlakukan brain_id yang menunjuk Brain yang
+-- sudah tidak ada sama seperti yang dimatikan — "tidak dipaku", bukan gagal.
 CREATE TABLE IF NOT EXISTS brain_map (
   template   TEXT NOT NULL,
   role       TEXT NOT NULL,

@@ -355,6 +355,36 @@ export function createBrains(store, { now, shortId }) {
       );
       return row ? present(row) : null;
     },
+
+    /**
+     * Menghapus Brain dan pemakuan brain_map yang menunjuknya.
+     *
+     * Ini kebalikan asumsi lama "brains tidak pernah dihapus, hanya
+     * di-disable" (komentar brain_map di schema.sql): provider yang dicabut
+     * dari gateway meninggalkan Brain yang tidak akan pernah bisa dipakai
+     * lagi, dan menahannya tetap aktif hanya menyembunyikan baris mati di
+     * halaman. Sel grid yang memaku Brain ini dikembalikan ke keadaan tidak
+     * dipaku — semantik yang sama dengan yang sudah diberikan resolusi pada
+     * brain yang hilang — dan sel yang dilepas dilaporkan balik supaya
+     * operator tahu grid mana yang kembali ke default.
+     *
+     * Agen yang pernah di-provision untuknya TIDAK disentuh di sini: ia
+     * milik gateway, dan pencabutan provider mencabut agen di sana sebagai
+     * tindakan terpisah yang tercatat sendiri.
+     */
+    async delete(id) {
+      const before = await brains.get(id);
+      if (!before) throw new Error(`unknown brain ${id}`);
+      const clearedMappings = await store.all(
+        `SELECT template, role, level FROM brain_map WHERE brain_id = ?`,
+        [before.id],
+      );
+      if (clearedMappings.length) {
+        await store.run(`DELETE FROM brain_map WHERE brain_id = ?`, [before.id]);
+      }
+      await store.run(`DELETE FROM brains WHERE id = ?`, [before.id]);
+      return { brain: before, clearedMappings };
+    },
   };
 
   return brains;

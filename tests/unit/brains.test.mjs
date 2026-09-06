@@ -25,10 +25,10 @@ async function startApi(h) {
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const { port } = server.address();
-  const call = async (method, path, body) => {
+  const call = async (method, path, body, { token = TOKEN } = {}) => {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method,
-      headers: { authorization: `Bearer ${TOKEN}`, ...(body ? { "content-type": "application/json" } : {}) },
+      headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: res.status, body: await res.json().catch(() => ({})) };
@@ -402,4 +402,89 @@ test("update mode menolak nilai di luar interactive/acp/batch", async () => {
   );
   const ok = await h.brains.update(b.id, { mode: "interactive" });
   assert.equal(ok.mode, "interactive");
+});
+
+// --- deletion ---------------------------------------------------------------
+
+test("menghapus brain melepas pemakuannya dan melaporkan sel yang kembali ke default", async () => {
+  const h = await buildHarness();
+  const gone = await h.brains.create({
+    name: "retired-brain",
+    provider: "aliyuncs",
+    model: "qwen3.5-max",
+    level: Level.NORMAL,
+  });
+  const kept = await h.brains.create({
+    name: "staying-brain",
+    provider: "zai",
+    model: "glm-5.2",
+    level: Level.NORMAL,
+  });
+  await h.brainMap.set(
+    { template: "software", role: "builder", level: Level.NORMAL, brainId: gone.id, actor: "satria" },
+    { brains: h.brains },
+  );
+  await h.brainMap.set(
+    { template: "software", role: "builder", level: Level.NORMAL, brainId: kept.id, actor: "satria" },
+    { brains: h.brains },
+  );
+
+  const result = await h.brains.delete(gone.id);
+  assert.equal(result.brain.id, gone.id);
+  assert.deepEqual(result.clearedMappings, [], "pemakaian terakhir ditimpa oleh kept — tidak ada yang dilepas");
+
+  // Sel yang HANYA memaku brain yang dihapus harus dilepas dan dilaporkan.
+  await h.brainMap.set(
+    { template: "research", role: "writer", level: Level.NORMAL, brainId: kept.id, actor: "satria" },
+    { brains: h.brains },
+  );
+  const result2 = await h.brains.delete(kept.id);
+  assert.equal(result2.brain.id, kept.id);
+  assert.deepEqual(
+    result2.clearedMappings.map((m) => `${m.template}/${m.role}/${m.level}`),
+    ["software/builder/normal", "research/writer/normal"],
+  );
+  assert.equal(await h.brains.get(gone.id), null);
+  assert.equal(await h.brains.get(kept.id), null);
+  assert.equal((await h.brainMap.list({})).length, 0);
+});
+
+test("menghapus brain yang tidak ada ditolak", async () => {
+  const h = await buildHarness();
+  await assert.rejects(() => h.brains.delete("BRN-NOPE"), /unknown brain/);
+  await assert.rejects(() => h.brains.delete("no-such-name"), /unknown brain/);
+});
+
+test("DELETE /api/work/brains/{id} is admin-only and names what it cleared", async () => {
+  const h = await buildHarness();
+  const api = await startApi(h);
+  try {
+    const brain = await h.brains.create({
+      name: "api-deleted-brain",
+      provider: "aliyuncs",
+      model: "qwen3.5-max",
+      level: Level.NORMAL,
+    });
+    await h.brainMap.set(
+      { template: "content", role: "writer", level: Level.NORMAL, brainId: brain.id, actor: "satria" },
+      { brains: h.brains },
+    );
+
+    const { token } = await h.operators.create({ name: "budi", role: "operator" });
+    const forbidden = await api.call("DELETE", `/api/work/brains/${brain.id}`, undefined, { token });
+    assert.equal(forbidden.status, 403);
+
+    const unknown = await api.call("DELETE", "/api/work/brains/BRN-NOPE");
+    assert.equal(unknown.status, 404);
+
+    const ok = await api.call("DELETE", `/api/work/brains/${brain.id}`);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.brain.name, "api-deleted-brain");
+    assert.deepEqual(
+      ok.body.clearedMappings.map((m) => `${m.template}/${m.role}/${m.level}`),
+      ["content/writer/normal"],
+    );
+  } finally {
+    await api.close();
+  }
 });

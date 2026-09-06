@@ -1276,6 +1276,30 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     }
   });
 
+  // Deletion is the honest end for a Brain whose provider left the gateway.
+  // Disabling keeps a dead row on the page forever — the old assumption
+  // "brains are never deleted, only disabled" predates provider removal.
+  // The endpoint clears brain_map cells pinning the brain (the same
+  // semantics resolution already gives a missing brain: "not pinned") and
+  // reports which cells fell back to the default grid. Provisioned agents
+  // are left to the gateway, where they live. Admin-only like every other
+  // deletion: a removal must be vouched for by an identity.
+  route("DELETE", "/api/work/brains/{id}", async ({ id }, _b, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may delete brains");
+    try {
+      const { brain, clearedMappings } = await controller.brains.delete(id);
+      log.info("brain.deleted", {
+        brain: brain.name,
+        clearedMappings: clearedMappings.map((m) => `${m.template}/${m.role}/${m.level}`),
+        by: actor.name,
+      });
+      return { brain, clearedMappings };
+    } catch (err) {
+      if (String(err.message).startsWith("unknown brain")) throw notFound(err.message);
+      throw badRequest(err.message);
+    }
+  });
+
   /**
    * Pemetaan (template × profile × role) → level.
    *

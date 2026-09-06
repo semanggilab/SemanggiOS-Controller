@@ -86,3 +86,44 @@ export function mergeModelMap(resources, thinkingLevels) {
     }))
     .sort((a, b) => a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model));
 }
+
+/**
+ * Alasan sebuah baris Model Map TIDAK boleh dihapus (D67). Kosong = boleh.
+ *
+ * Aturan operatornya satu: model yang masih ada di models.list (katalog
+ * routing.json) tidak boleh dihapus dari halaman. Tiga penjaga lain menyusul
+ * dari integritas, bukan selera — masing-masing adalah cara penghapusan
+ * diam-diam membohongi seseorang:
+ *
+ *   - katalog: baris yang masih dirujuk models.list akan parkir task di
+ *     WAIT_RESOURCE begitu baris resource-nya hilang;
+ *   - seed resources.json: baris yang dihapus tapi masih ada di seed akan
+ *     HIDUP KEMBALI pada restart berikutnya — penghapusan yang tidak pernah
+ *     terjadi;
+ *   - brains: brain yang menunjuk model ini turun kelas diam-diam;
+ *   - eksekusi aktif: baris dihapus dari bawah task yang sedang berjalan.
+ *
+ * @param {{provider: string, model: string}} row baris Model Map.
+ * @param {Array<object>} catalog entries policy.catalogEntries().
+ * @param {Array<object>} seedResources seed resources.json yang dipakai boot.
+ * @param {Array<object>} brains baris brains.list().
+ * @param {number} activeCount eksekusi DISPATCHED/RUNNING pada model ini.
+ */
+export function modelDeleteBlockers(row, catalog, seedResources, brains, activeCount = 0) {
+  const provider = String(row.provider ?? "").trim().toLowerCase();
+  const model = String(row.model ?? "").trim().toLowerCase();
+  const same = (p, m) => String(p ?? "").trim().toLowerCase() === provider && String(m ?? "").trim().toLowerCase() === model;
+
+  const blockers = [];
+  for (const e of catalog ?? []) {
+    if (same(e.provider, e.model)) blockers.push(`models.list: ${e.name}`);
+  }
+  for (const s of seedResources ?? []) {
+    if (same(s.provider, s.model)) blockers.push("resources.json seed — the row returns on next restart");
+  }
+  for (const b of brains ?? []) {
+    if (same(b.provider, b.model)) blockers.push(`brain: ${b.name}`);
+  }
+  if (activeCount > 0) blockers.push(`${activeCount} active execution(s) on this model`);
+  return blockers;
+}

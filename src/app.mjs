@@ -83,5 +83,9 @@ export async function createController({
   const admission = createAdmission({ repos, events, policy, brains, runtime, config, now, log: log.child({ component: "admission" }) });
   const scheduler = createScheduler({ admission, repos, config: { log: log.child({ component: "scheduler" }), ...config }, now });
 
-  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, config, now, log, runtime };
+  // `resources` (seed resources.json) ikut dikembalikan: DELETE model-map
+  // (D67) harus tahu baris mana yang akan di-seed ulang pada boot berikutnya —
+  // menghapus baris yang masih ada di seed adalah penghapusan yang tidak
+  // pernah terjadi.
+  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, config, now, log, runtime, seedResources: resources };
 }

@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApi } from "../../src/api/server.mjs";
 import { createController } from "../../src/app.mjs";
-import { mergeModelMap } from "../../src/domain/model-map.mjs";
+import { mergeModelMap, modelDeleteBlockers } from "../../src/domain/model-map.mjs";
 import { buildHarness } from "../helpers/harness.mjs";
 
 const TOKEN = "controller-token-for-tests";
@@ -214,5 +214,77 @@ test("restart tidak menimpa suntingan operator pada thinking-levels", async () =
     await c2.store.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- DELETE /api/work/model-map (D67) ---------------------------------------------
+
+test("modelDeleteBlockers menyebut katalog, seed, brain, dan eksekusi aktif", () => {
+  const row = { provider: "Zai", model: "glm-5.2" };
+  const catalog = [{ name: "glm-5.2-high", provider: "zai", model: "glm-5.2" }];
+  const seed = [{ provider: "zai", model: "glm-5.2", concurrencyLimit: 1 }];
+  const brains = [{ name: "glm-5-2-max", provider: "zai", model: "GLM-5.2" }];
+
+  const blockers = modelDeleteBlockers(row, catalog, seed, brains, 2);
+  assert.equal(blockers.length, 4, "keempat rujukan memblokir, ejaan dibandingkan case-insensitive");
+  assert.ok(blockers.some((b) => b.startsWith("models.list: glm-5.2-high")));
+  assert.ok(blockers.some((b) => b.includes("resources.json seed")));
+  assert.ok(blockers.some((b) => b === "brain: glm-5-2-max"));
+  assert.ok(blockers.some((b) => b.includes("2 active execution")));
+
+  // Model yang tidak dirujuk siapa pun boleh dihapus — itu seluruh titiknya.
+  assert.deepEqual(
+    modelDeleteBlockers({ provider: "mistral", model: "pat-1" }, catalog, seed, brains, 0),
+    [],
+  );
+});
+
+test("DELETE model-map menghapus KEDUA sisi + event, dan menolak baris yang dirujuk", async () => {
+  const h = await buildHarness();
+  // Model uji: tidak di katalog SAMPLE_ROUTING, tidak di seed, tanpa brain.
+  await h.repos.resources.upsert({ provider: "mistral-custom", model: "pat-1", concurrencyLimit: 2 });
+  await h.thinkingLevels.upsert({ provider: "mistral-custom", model: "pat-1", levels: ["off"], effortMode: "guaranteed" });
+  // Model yang masih dirujuk katalog (zai/glm-5.2 = glm-5.2-high/max).
+  await h.repos.resources.upsert({ provider: "zai", model: "glm-5.2", concurrencyLimit: 2 });
+  // Model yang dirujuk SEBUAH BRAIN saja.
+  await h.repos.resources.upsert({ provider: "groq", model: "qwen/x-1", concurrencyLimit: 1 });
+  await h.brains.create({ name: "qwen-x-test", provider: "groq", model: "qwen/x-1", level: "normal" });
+
+  const api = await startApi(h);
+  try {
+    // GET membawa deleteBlockers per baris — UI tidak menebak aturannya sendiri.
+    const list = await api.call("GET", "/api/work/model-map");
+    assert.equal(list.status, 200);
+    const pat = list.body.models.find((m) => m.model === "pat-1");
+    const glm = list.body.models.find((m) => m.provider === "zai" && m.model === "glm-5.2");
+    const qwen = list.body.models.find((m) => m.model === "qwen/x-1");
+    assert.deepEqual(pat.deleteBlockers, [], "model tanpa rujukan boleh dihapus");
+    assert.ok(glm.deleteBlockers.some((b) => b.startsWith("models.list:")), "katalog memblokir");
+    assert.ok(qwen.deleteBlockers.some((b) => b.startsWith("brain:")), "brain memblokir");
+
+    const refused = await api.call("DELETE", "/api/work/model-map?provider=zai&model=glm-5.2");
+    assert.equal(refused.status, 400);
+    assert.ok(String(refused.body.error).includes("models.list"), "pesan menunjuk rujukan yang memblokir");
+    assert.ok((await h.repos.resources.get("zai", "glm-5.2")) != null, "yang ditolak tidak terhapus");
+
+    const brainRefused = await api.call("DELETE", "/api/work/model-map?provider=groq&model=qwen%2Fx-1");
+    assert.equal(brainRefused.status, 400);
+    assert.ok(String(brainRefused.body.error).includes("brain:"));
+
+    // Model id groq mengandung "/" — query param, bukan path segment.
+    const ok = await api.call("DELETE", "/api/work/model-map?provider=mistral-custom&model=pat-1");
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body.sides, ["resource", "thinking-levels"]);
+    assert.equal(await h.repos.resources.get("mistral-custom", "pat-1"), null, "sisi resource terhapus");
+    assert.equal(await h.thinkingLevels.get("mistral-custom", "pat-1"), null, "sisi terukur ikut terhapus");
+
+    const events = await h.events.list({ subjectId: "mistral-custom/pat-1" });
+    assert.ok(events.some((e) => e.kind === "resource.policy" && e.payload.change === "delete"));
+    assert.ok(events.some((e) => e.kind === "thinking-levels.updated" && e.payload.change === "delete"));
+
+    assert.equal((await api.call("DELETE", "/api/work/model-map?provider=zai&model=tidak-ada")).status, 404);
+    assert.equal((await api.call("DELETE", "/api/work/model-map")).status, 400, "tanpa identity ditolak");
+  } finally {
+    await api.close();
   }
 });

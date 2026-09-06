@@ -1103,6 +1103,20 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       );
     },
 
+    /**
+     * D67: hapus baris kebijakan (panggilan dari Model Map, setelah penjaga
+     * penghapusan lolos). Case-insensitive supaya ejaan dari sisi
+     * thinking-levels (yang ternormalisasi) tetap menemukan baris resource.
+     * Menghapus baris tidak menyentuh eksekusi — itu sebabnya eksekusi aktif
+     * adalah blocker penghapusan, bukan tanggung jawab DELETE.
+     */
+    async delete(provider, model) {
+      await store.run(
+        `DELETE FROM resources WHERE lower(provider) = lower(?) AND lower(model) = lower(?)`,
+        [provider, model],
+      );
+    },
+
     async list() {
       return (await store.all(`SELECT * FROM resources ORDER BY provider, model`)).map(hydrateResource);
     },

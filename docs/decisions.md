@@ -2322,3 +2322,60 @@ D66.
 **Test:** 460 → 467 (merge dua sisi + satu sisi, GET agregat, PATCH menjaga
 sinyal live + event + validasi, PUT thinking-levels + evidence wajib untuk
 preference, restart tidak menimpa suntingan operator).
+
+## D67 — Penghapusan baris Model Map + Brain, dan urutan menu Model Map
+
+**Masalah.** Model Map (D66) bisa menambah dan menyunting tapi tidak menghapus;
+Brains punya `DELETE /api/work/brains/{id}` di controller (dipakai membersihkan
+pemaku brain_map yang menggantung) tapi tidak pernah diekspos proxy AgentOS,
+jadi form Edit Brain tidak punya jalan keluar yang jujur untuk Brain yang
+provider-nya pergi. Menu: entri Model Map disisipkan setelah Brain Map, padahal
+urutan baca operator adalah Project → Model Map → Role Level Map — model
+mendahului role yang mengonsumsinya.
+
+**Keputusan.**
+
+1. `DELETE /api/work/model-map?provider=&model=` — admin-only, menghapus SATU
+   baris KEDUA sisinya (resources + thinking_levels). Menyisakan satu sisi
+   berarti baris yang baru dihapus muncul kembali sebagai baris "no resource
+   entry" — penghapusan setengah bukan penghapusan. Query param seperti PATCH
+   (model id groq mengandung "/"). Event `resource.policy` /
+   `thinking-levels.updated` dengan `change:"delete"` + bangunkan scheduler.
+2. Penolakan penghapusan adalah FAKTA SERVER, bukan tebakan klien:
+   `GET /api/work/model-map` membawa `deleteBlockers` per baris
+   (modelDeleteBlockers di domain/model-map.mjs), dan DELETE menolak dengan
+   alasan yang sama. Empat rujukan memblokir:
+   - katalog models.list (aturan operator: model yang masih dikatalogkan
+     tidak boleh dihapus dari halaman — task yang dirutekan ke sana akan
+     parkir WAIT_RESOURCE),
+   - seed `resources.json` (baris yang dihapus tapi masih di-seed akan HIDUP
+     KEMBALI pada restart berikutnya — boot seeding bersifat per-baris dan
+     idempoten; itu sebabnya app.mjs kini mengembalikan `seedResources`),
+   - brains yang menunjuk (provider, model) ini (turun kelas diam-diam),
+   - eksekusi DISPATCHED/RUNNING pada model ini (baris dihapus dari bawah
+     task yang berjalan).
+   UI cukup membaca `deleteBlockers` untuk men-disable tombol Delete —
+   aturan yang dihitung ulang di klien adalah tempat klien dan server
+   diam-diam berbeda pendapat.
+3. Form Edit Brain: tombol Delete (footer, varian danger) yang hanya aktif
+   bila brain TIDAK sedang dipakai — dipaku brain_map (per id) dan/atau
+   menjadi default grid DEFAULT_BRAIN_MAP (per nama slug; konstanta kode —
+   menghapus brain yang jadi default membuat sel tak terpaku jatuh ke
+   kandidat level tanpa jejak). Gate ini di UI; endpoint DELETE server tetap
+   menerima (membersihkan pemaku menggantung) sebagai jaring pengaman.
+   Proxy whitelist +`DELETE work/brains/{id}` (baru diekspos sekarang;
+   route controller sudah ada).
+4. Kedua form (Add/Edit Model, Add/Edit Brain) menaruh aksi di kanan bawah
+   (Delete | Cancel | Save) — aksi milik baris yang diedit form itu, bukan
+   judulnya. apply.sh: `patch_settings_model_map_position` memindahkan entri
+   menu Model Map ke antara Project dan Role Level Map; jangkar berbasis id
+   section (label di fork cluster sudah dua kali di-rename).
+
+**Yang tidak berubah.** Semantik `DELETE /api/work/brains/{id}` (clear-mappings)
+dan routing.json (Fase 3). Thinking-levels yang dihapus bersama resource-nya
+bisa ditulis ulang kapan saja lewat PUT/probe — pengukuran bukan alasan
+memblokir penghapusan.
+
+**Test:** 467 → 469 (modelDeleteBlockers murni; DELETE ujung-ke-ujung:
+menghapus kedua sisi + event, menolak katalog/brain dengan alasan, 404,
+identity wajib).

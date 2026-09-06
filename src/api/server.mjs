@@ -32,7 +32,7 @@ import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
 import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
-import { mergeModelMap } from "../domain/model-map.mjs";
+import { mergeModelMap, modelDeleteBlockers } from "../domain/model-map.mjs";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 
@@ -1255,11 +1255,84 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   // di sini: Brain adalah endpoint routing (model + thinking + mode), bukan
   // fakta model, dan grain-nya memang berbeda.
   route("GET", "/api/work/model-map", async () => {
-    const [resources, levels] = await Promise.all([
+    const [resources, levels, brainsList] = await Promise.all([
       repos.resources.list(),
       controller.thinkingLevels.list(),
+      controller.brains.list(),
     ]);
-    return { models: mergeModelMap(resources, levels) };
+    const catalog = controller.policy.catalogEntries();
+    // `deleteBlockers` ikut per baris (D67) supaya UI tidak perlu menebak
+    // aturan penghapusan dari tiga sumber lain — alasan penolakan adalah
+    // fakta server, dan menghitungnya ulang di klien adalah tempat
+    // keduanya diam-diam berbeda pendapat.
+    const rows = [];
+    for (const row of mergeModelMap(resources, levels)) {
+      const active = await repos.resources.activeCount(row.provider, row.model);
+      rows.push({ ...row, deleteBlockers: modelDeleteBlockers(row, catalog, controller.seedResources ?? [], brainsList, active) });
+    }
+    return { models: rows };
+  });
+
+  // D67: hapus SATU baris Model Map — kedua sisinya. Operator meminta
+  // "hapus model", bukan "hapus kebijakan tapi sisakan pengukuran" (atau
+  // sebaliknya); menyisakan satu sisi membuat baris yang baru saja dihapus
+  // muncul kembali sebagai baris satu sisi. Admin-only + event_log seperti
+  // tulis lain di halaman ini, dan menolak selama masih ada yang merujuk
+  // barisnya (models.list, seed resources.json, brains, eksekusi aktif) —
+  // penolakan diam-diam bukan penolakan.
+  //
+  // Provider/model di query params, bukan path segment — alasan yang sama
+  // dengan PATCH di bawah: model id groq mengandung "/".
+  route("DELETE", "/api/work/model-map", async (_p, _b, query, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may delete model rows");
+    const provider = String(query.get("provider") ?? "").trim();
+    const model = String(query.get("model") ?? "").trim();
+    if (!provider || !model) throw badRequest("provider and model query params are required");
+
+    const [resources, levels, brainsList] = await Promise.all([
+      repos.resources.list(),
+      controller.thinkingLevels.list(),
+      controller.brains.list(),
+    ]);
+    const key = (p, m) => `${String(p).trim().toLowerCase()}/${String(m).trim().toLowerCase()}`;
+    const wanted = key(provider, model);
+    const resource = resources.find((r) => key(r.provider, r.model) === wanted) ?? null;
+    const level = levels.find((t) => key(t.provider, t.model) === wanted) ?? null;
+    if (!resource && !level) throw notFound(`no model row for ${provider}/${model}`);
+
+    const blockers = modelDeleteBlockers(
+      { provider, model },
+      controller.policy.catalogEntries(),
+      controller.seedResources ?? [],
+      brainsList,
+      await repos.resources.activeCount(provider, model),
+    );
+    if (blockers.length > 0) {
+      throw badRequest(`cannot delete ${provider}/${model} — still referenced: ${blockers.join("; ")}`);
+    }
+
+    if (resource) {
+      await repos.resources.delete(resource.provider, resource.model);
+      await controller.events.append({
+        kind: EventKind.RESOURCE_POLICY,
+        subjectType: "resource",
+        subjectId: `${resource.provider}/${resource.model}`,
+        actor: actor?.name ?? "operator",
+        payload: { change: "delete", creditClass: resource.credit_class, concurrencyLimit: resource.concurrency_limit },
+      });
+    }
+    if (level) {
+      await controller.thinkingLevels.delete(level.provider, level.model);
+      await controller.events.append({
+        kind: EventKind.THINKING_LEVELS_UPDATED,
+        subjectType: "model",
+        subjectId: `${level.provider}/${level.model}`,
+        actor: actor?.name ?? "operator",
+        payload: { change: "delete", levels: level.levels },
+      });
+    }
+    await scheduler.notify(WakeReason.RESOURCE_CHANGED);
+    return { deleted: { provider, model }, sides: [resource && "resource", level && "thinking-levels"].filter(Boolean) };
   });
 
   /**

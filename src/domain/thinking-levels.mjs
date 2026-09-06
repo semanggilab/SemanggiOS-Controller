@@ -44,6 +44,18 @@ export function createThinkingLevels(store, { now } = {}) {
       return api.get(p, m);
     },
 
+    // D67: sisi pengukuran dari penghapusan baris Model Map. Fakta terukur
+    // tanpa baris resource tidak bermasalah, tetapi operator yang menghapus
+    // "model" dari halaman itu bermaksud menghapus keduanya — menyisakan
+    // baris satu sisi justru memunculkan kembali baris yang baru dihapus,
+    // kali ini sebagai baris "no resource entry".
+    async delete(provider, model) {
+      await store.run(`DELETE FROM thinking_levels WHERE provider = ? AND model = ?`, [
+        norm(provider),
+        norm(model),
+      ]);
+    },
+
     /**
      * Menyinkronkan DB dari `config/thinking-levels.json`.
      *

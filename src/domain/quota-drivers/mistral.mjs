@@ -19,6 +19,11 @@ const MONTH = 30 * 24 * 3_600_000;
 export const mistralDriver = {
   id: "mistral",
 
+  // The AgentOS models-config label for this pool is "mistral-custom" — the
+  // operator's name, not ours. Without this key those brains would ride the
+  // generic driver: null windows, no monthly-budget parking (D64).
+  providerKeys: ["mistral-custom"],
+
   defaults() {
     return {
       quotaTier: "free",

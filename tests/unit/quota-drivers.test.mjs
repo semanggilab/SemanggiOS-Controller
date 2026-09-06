@@ -14,6 +14,8 @@ import { DatabaseSync } from "node:sqlite";
 import { openStore } from "../../src/db/index.mjs";
 import {
   quotaDriverFor,
+  quotaDriverIdFor,
+  quotaDriverCatalog,
   googleDriver,
   groqDriver,
   cerebrasDriver,
@@ -38,6 +40,24 @@ test("quotaDriverFor returns the provider driver and falls back to generic", () 
   // provider is not a licence to lose quota parking.
   assert.equal(unknown.classifyError({ text: "rate limit exceeded" }).kind, "quota");
   assert.equal(unknown.classifyError({ status: 402, text: "anything" }).kind, "fatal");
+});
+
+// --- D64: resolution by alias, not name equality -------------------------------
+
+test("a gateway label that is not the driver id still finds its driver (D64)", () => {
+  // The live counterexample: the mistral pool is registered in AgentOS as
+  // "mistral-custom" — name equality would hand a real provider to the
+  // generic driver (null windows, no monthly-budget parking).
+  assert.equal(quotaDriverFor("mistral-custom"), mistralDriver);
+  assert.equal(quotaDriverFor("Mistral-Custom"), mistralDriver, "aliases are case-insensitive too");
+  assert.equal(quotaDriverIdFor("mistral-custom"), "mistral");
+  assert.equal(quotaDriverIdFor("label-tak-dikenal"), "generic");
+
+  // The catalog is what the operator sees: every label a driver answers to.
+  const mistral = quotaDriverCatalog().find((d) => d.id === "mistral");
+  assert.deepEqual(mistral.providerKeys, ["mistral", "mistral-custom"]);
+  assert.equal(mistral.tier, "free");
+  assert.ok(quotaDriverCatalog().length >= 6);
 });
 
 // --- defaults ---------------------------------------------------------------
@@ -282,6 +302,54 @@ test("a pre-D63 brains database gains the quota columns and backfills from drive
       const x = await store.get(`SELECT * FROM brains WHERE id = 'BRN-X'`);
       assert.equal(x.quota_tier, null, "an unknown provider backfills to honest nulls");
       assert.equal(x.quota_short_type, null);
+    } finally {
+      await store.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("D64 drops brains.category from a database that still has it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "semanggi-cat-mig-"));
+  const file = join(dir, "controller.db");
+  try {
+    const db = new DatabaseSync(file);
+    db.exec(`
+      CREATE TABLE brains (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL DEFAULT '',
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        thinking TEXT,
+        effort_mode TEXT NOT NULL DEFAULT 'guaranteed',
+        effort_evidence TEXT,
+        mode TEXT NOT NULL DEFAULT 'interactive',
+        acp_agent TEXT,
+        quota_reset_short_ms INTEGER,
+        quota_reset_long_ms INTEGER,
+        category TEXT,
+        level TEXT NOT NULL DEFAULT 'NORMAL',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    db.prepare(
+      `INSERT INTO brains (id, name, provider, model, category, level, created_at, updated_at)
+       VALUES ('BRN-C', 'punya-kategori', 'zai', 'glm-5.2', 'architecture', 'NORMAL', 1, 1)`,
+    ).run();
+    db.close();
+
+    const store = openStore({ location: file });
+    try {
+      const cols = (await store.all(`PRAGMA table_info(brains)`)).map((c) => c.name);
+      assert.equal(cols.includes("category"), false, "the ghost column must be gone, not ignored");
+      const row = await store.get(`SELECT * FROM brains WHERE id = 'BRN-C'`);
+      assert.equal(row.name, "punya-kategori", "the row survives the drop");
+      // D63 backfill ran on the same boot.
+      assert.equal(row.quota_tier, "lite");
     } finally {
       await store.close();
     }

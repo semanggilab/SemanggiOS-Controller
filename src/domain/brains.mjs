@@ -174,7 +174,6 @@ export function createBrains(store, { now, shortId }) {
     tpd: row.tpd ?? null,
     contextWindowTokens: row.context_window_tokens ?? null,
     level: row.level,
-    category: row.category,
     enabled: Boolean(row.enabled),
   });
 
@@ -266,7 +265,6 @@ export function createBrains(store, { now, shortId }) {
       tpd,
       contextWindowTokens,
       level = Level.NORMAL,
-      category = null,
       enabled = true,
     }) {
       if (!name) throw new Error("brain needs a name");
@@ -303,8 +301,8 @@ export function createBrains(store, { now, shortId }) {
                              effort_evidence, mode, acp_agent, quota_reset_short_ms, quota_reset_long_ms,
                              quota_tier, quota_short_type, quota_long_type, quota_fixed_reset,
                              rpm, rpd, tpm, tpd, context_window_tokens,
-                             level, category, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                             level, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, slug(name), description, provider, model, thinking, effortMode, effortEvidence,
          mode, acpAgent, short, long,
          tier, shortType, longType, fixedReset,
@@ -313,7 +311,7 @@ export function createBrains(store, { now, shortId }) {
          rateOrDriver(tpm, driverDefaults.rates.tpm, "tpm"),
          rateOrDriver(tpd, driverDefaults.rates.tpd, "tpd"),
          rateOrNull(contextWindowTokens, "contextWindowTokens", name),
-         level, category, enabled ? 1 : 0, now(), now()],
+         level, enabled ? 1 : 0, now(), now()],
       );
       return brains.get(id);
     },
@@ -326,11 +324,10 @@ export function createBrains(store, { now, shortId }) {
       return row ? present(row) : null;
     },
 
-    async list({ level, category, enabledOnly = false } = {}) {
+    async list({ level, enabledOnly = false } = {}) {
       const where = [];
       const params = [];
       if (level) { where.push("level = ?"); params.push(level); }
-      if (category) { where.push("category = ?"); params.push(category); }
       if (enabledOnly) where.push("enabled = 1");
       const rows = await store.all(
         `SELECT * FROM brains ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY level, name`,
@@ -382,7 +379,6 @@ export function createBrains(store, { now, shortId }) {
         if (!Object.values(Level).includes(patch.level)) throw new Error(`invalid level "${patch.level}"`);
         put("level", patch.level);
       }
-      if (patch.category !== undefined) put("category", patch.category);
       if (patch.enabled !== undefined) put("enabled", patch.enabled ? 1 : 0);
       if (patch.effortMode !== undefined) {
         if (!["guaranteed", "preference"].includes(patch.effortMode)) {
@@ -439,20 +435,15 @@ export function createBrains(store, { now, shortId }) {
     /**
      * Kandidat untuk sebuah level, yang aktif saja.
      *
-     * Tanpa `category`, SELURUH brain pada level itu adalah kandidat. Versi
-     * pertama menulis `category IS NULL OR category = ?` dengan parameter null —
-     * dan di SQL `category = NULL` tidak pernah benar, sehingga setiap brain
-     * yang punya kategori tersaring habis dan daftarnya selalu kosong.
-     * Kategori adalah penyempit opsional, bukan syarat.
+     * D64: penyaringan kategori dihapus — jalur dispatch sudah lama tidak
+     * mengoper kategori (Brain Map per template×role×level yang memutus),
+     * jadi ini murni pool per level. Sejarahnya: versi pertama menulis
+     * `category IS NULL OR category = ?` dengan parameter null, dan di SQL
+     * `category = NULL` tidak pernah benar — setiap brain berkategori
+     * tersaring habis. Kolomnya kini benar-benar tidak ada.
      */
-    async candidatesFor({ level, category = null }) {
-      const rows = category
-        ? await store.all(
-            `SELECT * FROM brains WHERE enabled = 1 AND level = ?
-               AND (category = ? OR category IS NULL) ORDER BY name`,
-            [level, category],
-          )
-        : await store.all(`SELECT * FROM brains WHERE enabled = 1 AND level = ? ORDER BY name`, [level]);
+    async candidatesFor({ level }) {
+      const rows = await store.all(`SELECT * FROM brains WHERE enabled = 1 AND level = ? ORDER BY name`, [level]);
       return rows.map(present);
     },
 
@@ -522,7 +513,7 @@ export function brainsFromRoutingConfig(routing = {}) {
         // adalah Brain critical, meski ia juga muncul di jalur normal.
         const rank = { low: 0, normal: 1, critical: 2 };
         const prev = levelOf.get(n);
-        if (!prev || rank[routeClass] > rank[prev.level]) levelOf.set(n, { level: routeClass, category });
+        if (!prev || rank[routeClass] > rank[prev]) levelOf.set(n, routeClass);
       }
     }
   }
@@ -541,8 +532,7 @@ export function brainsFromRoutingConfig(routing = {}) {
       effortEvidence: entry.effortEvidence ?? null,
       mode: entry.mode ?? "interactive",
       acpAgent: entry.acpAgent ?? null,
-      level: placed?.level ?? Level.NORMAL,
-      category: placed?.category ?? null,
+      level: placed ?? Level.NORMAL,
     });
   }
   return out;

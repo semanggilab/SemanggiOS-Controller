@@ -171,27 +171,24 @@ test("kandidat disaring per level dan hanya yang aktif", async () => {
   assert.deepEqual(critical.map((x) => x.name), ["a"], "yang dimatikan tidak boleh ikut terpilih");
 });
 
-test("kategori menyempitkan kandidat, bukan menjadi syarat", async () => {
-  // Ditemukan hidup: versi pertama memakai `category = NULL` yang di SQL tidak
-  // pernah benar, sehingga setiap brain berkategori tersaring habis dan daftar
-  // kandidat selalu kosong.
+test("D64: kategori sudah tidak ada — kandidat adalah pool per level", async () => {
+  // Kolom category dihapus karena jalur dispatch tidak pernah mengoper
+  // kategori (Brain Map template×role×level yang memutus). Test ini menjaga
+  // penghapusannya: create dengan category tidak lagi dikenali, dan
+  // candidatesFor tidak punya parameter penyaring kategori sama sekali.
   const h = await buildHarness();
-  await h.brains.create({ name: "berkategori", provider: "zai", model: "glm-5.2", thinking: "high", level: Level.NORMAL, category: "coding" });
+  await h.brains.create({ name: "eks-kategori", provider: "zai", model: "glm-5.2", thinking: "high", level: Level.NORMAL });
   await h.brains.create({ name: "umum", provider: "zai", model: "glm-5.1", thinking: "low", level: Level.NORMAL });
 
-  const mine = (list) => list.filter((x) => ["berkategori", "umum"].includes(x.name)).map((x) => x.name).sort();
-
-  assert.deepEqual(mine(await h.brains.candidatesFor({ level: Level.NORMAL })), ["berkategori", "umum"]);
-  assert.deepEqual(
-    mine(await h.brains.candidatesFor({ level: Level.NORMAL, category: "coding" })),
-    ["berkategori", "umum"],
-    "yang tanpa kategori tetap ikut",
-  );
-  assert.deepEqual(
-    mine(await h.brains.candidatesFor({ level: Level.NORMAL, category: "research" })),
-    ["umum"],
-    "yang berkategori lain tersaring",
-  );
+  const mine = (list) => list.filter((x) => ["eks-kategori", "umum"].includes(x.name)).map((x) => x.name).sort();
+  assert.deepEqual(mine(await h.brains.candidatesFor({ level: Level.NORMAL })), ["eks-kategori", "umum"]);
+  // Sejarahnya: versi pertama filter kategori memakai `category = NULL` yang
+  // di SQL tidak pernah benar — brain berkategori tersaring habis. Kini
+  // parameternya sendiri sudah tidak ada; mengirimnya tidak berbuat apa-apa.
+  assert.deepEqual(mine(await h.brains.candidatesFor({ level: Level.NORMAL, category: "anything" })), [
+    "eks-kategori",
+    "umum",
+  ]);
 });
 
 // --- migrasi dari katalog ----------------------------------------------------

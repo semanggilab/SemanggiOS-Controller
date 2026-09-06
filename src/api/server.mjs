@@ -23,6 +23,7 @@ import {
   resolveLevel,
 } from "../domain/brains.mjs";
 import { DEFAULT_BRAIN_MAP } from "../domain/brain-map.mjs";
+import { quotaDriverCatalog, quotaDriverIdFor } from "../domain/quota-drivers/index.mjs";
 import { buildPlan, ROLE_CATEGORY } from "../domain/decompose.mjs";
 import { EventKind } from "../domain/events.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
@@ -1226,7 +1227,6 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   route("GET", "/api/work/brains", async (_p, _b, query) => {
     const list = await controller.brains.list({
       level: query.get("level") ?? undefined,
-      category: query.get("category") ?? undefined,
       enabledOnly: query.get("enabled") === "true",
     });
     // Ketersediaan datang dari tabel resources, bukan dari Brain: satu model
@@ -1239,6 +1239,10 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       // hanya menampilkan apa yang scheduler akan lakukan.
       out.push({
         ...b,
+        // D64: driver mana yang mengklasifikasi kuota brain ini — "generic"
+        // berarti tanpa fakta provider (jendela null, ETA tebakan). Ditaruh
+        // di sini supaya UI form dan halaman Brain membaca satu sumber.
+        quotaDriver: quotaDriverIdFor(b.provider),
         availability: resource?.availability ?? "UNKNOWN",
         nextAvailableAt: resource?.next_available_at ?? null,
         quotaReset: {
@@ -1268,6 +1272,11 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     }
     return { brains: out };
   });
+
+  // D64: registry yang di atas — label gateway mana dijawab driver mana.
+  // Form Brain memakai ini untuk mengannonkan provider yang jatuh ke generic
+  // (label "mistral-custom" tanpa alias adalah brain berjendela-null).
+  route("GET", "/api/work/quota-drivers", async () => ({ drivers: quotaDriverCatalog() }));
 
   route("POST", "/api/work/brains", async (_p, body, _q, actor) => {
     if (actor?.role !== "admin") throw forbidden("only an admin may define brains");
@@ -1423,7 +1432,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       rolesNotInAgentOs: ROLES_NOT_IN_AGENTOS,
       levels: ["low", "normal", "critical"],
       defaults: DEFAULT_BRAIN_MAP,
-      brains: brains.map((b) => ({ id: b.id, name: b.name, level: b.level, category: b.category ?? null })),
+      brains: brains.map((b) => ({ id: b.id, name: b.name, level: b.level })),
       mappings: mappings.map((m) => {
         const brain = byId.get(m.brainId) ?? null;
         return {

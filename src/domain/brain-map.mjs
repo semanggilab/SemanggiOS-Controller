@@ -175,7 +175,7 @@ export function createBrainMap(store, { now } = {}) {
      * Dengan kunci per level, memilih Brain demikian adalah keputusan eksplisit
      * operator — jadi ia dipakai, dan peringatannya ikut bersamanya.
      */
-    async resolve({ template, role, level, brains, category = null } = {}) {
+    async resolve({ template, role, level, brains } = {}) {
       const l = norm(level);
       let rejected = null;
 
@@ -213,7 +213,9 @@ export function createBrainMap(store, { now } = {}) {
           rejected ?? `default grid "${defaultName}" tidak tersedia (tidak ada atau dimatikan); jatuh ke kandidat level`;
       }
 
-      const candidates = await brains.candidatesFor({ level: l, category: category ?? undefined });
+      // D64: kandidat level tanpa penyaringan kategori — resolve tidak pernah
+      // menerima kategori sejak grid (template, role, level) yang memutus.
+      const candidates = await brains.candidatesFor({ level: l });
       if (candidates.length > 0) {
         return { brain: candidates[0], source: "level", reason: rejected, belowLevel: undefined };
       }

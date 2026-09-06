@@ -161,6 +161,15 @@ class SqliteStore {
       }
     }
 
+    // D64: `brains.category` dihapus. Sejak Brain Map per (template, role,
+    // level) jalur dispatch tidak pernah mengoper kategori ke resolve —
+    // penyaringan kategori di fallback sudah mati di jalur hidup, dan kolomnya
+    // hanya menambah field form yang tampak berarti padahal tidak. DROP,
+    // bukan diabaikan: kolom hantu mengundang dipakai lagi lupa-lupa ingat.
+    if (brainCols3.length > 0 && brainCols3.includes("category")) {
+      this.#db.exec(`ALTER TABLE brains DROP COLUMN category`);
+    }
+
     // D52: penghitung terpisah untuk penolakan transient (rate limit jendela
     // panjang, UNAVAILABLE) di jalur late-error — batas dan backoff-nya
     // berbeda dari quota_retries.

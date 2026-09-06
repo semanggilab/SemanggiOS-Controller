@@ -353,7 +353,10 @@ CREATE TABLE IF NOT EXISTS brains (
   context_window_tokens    INTEGER,
   level          TEXT NOT NULL DEFAULT 'normal'
                  CHECK (level IN ('low','normal','critical')),
-  category       TEXT,
+  -- D64: `category` dihapus. Jalur dispatch (brainMap.resolve) tidak pernah
+  -- mengoper kategori sejak Brain Map per (template, role, level) — lapisan
+  -- fallback level tidak lagi menyaring per kategori, dan kolom ini hanya
+  -- tersisa sebagai field form yang menyesatkan.
   enabled        INTEGER NOT NULL DEFAULT 1,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL

@@ -330,6 +330,33 @@ test("testAgent keeps surfacing object-shaped wait refusals too", async () => {
   await rt.close();
 });
 
+// Measured live on groq/qwen (rate-limited free tier): agent.wait answers
+// "timeout" while the run is still queued, and the real verdict — the
+// FailoverError — only arrives on the THIRD wait, ~90s in. Stopping at the
+// first timeout read as "possible hang" and hid an honest rate-limit report.
+test("testAgent re-waits through timeouts until the run's real verdict arrives", async () => {
+  const answers = [
+    { status: "timeout", timeoutPhase: "gateway_draining" },
+    { status: "timeout", timeoutPhase: "gateway_draining" },
+    { status: "error", endedAt: 2, error: "FailoverError: ⚠️ API rate limit reached. Please try again later." },
+  ];
+  let n = 0;
+  const { FakeWS } = fakeSocketFactory({
+    methods: ["agent.run", "connect", "agents.list", "agent.wait"],
+    onRequest: (frame) => {
+      if (frame.method === "agent.wait") return { ok: true, payload: answers[Math.min(n++, answers.length - 1)] };
+      if (frame.method === "agent.run") return { ok: true, payload: { runId: "run-1" } };
+      return { ok: true, payload: {} };
+    },
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const res = await rt.testAgent({ agentId: "a1", timeoutMs: 120_000 });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /API rate limit reached/);
+  assert.doesNotMatch(res.error, /possible hang/);
+  await rt.close();
+});
+
 test("testAgent reports a run that never finishes as unusable, not as OK", async () => {
   const { FakeWS } = brainTestFactory("timeout");
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });

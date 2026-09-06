@@ -673,7 +673,7 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
      * only a status the gateway uses for a normally finished run passes;
      * everything else is reported with its reason.
      */
-    async testAgent({ agentId, thinking = null, timeoutMs = 45_000 }) {
+    async testAgent({ agentId, thinking = null, timeoutMs = 120_000 }) {
       await connect();
       const startedAt = Date.now();
       const key = `agent:${agentId}:semanggi-test:${randomUUID()}`;
@@ -688,10 +688,26 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
           ...(thinking ? { thinking } : {}),
         });
         const runId = dispatched?.runId ?? dispatched?.id;
-        const waited = hello?.features?.methods?.includes("agent.wait")
-          ? await request("agent.wait", { runId }, { timeoutMs })
-          : { status: "unsupported" };
-        const status = waited.status ?? "unknown";
+        // The gateway's agent.watch stops after ~30s and answers status
+        // "timeout" — measured on groq/qwen rate-limited runs, the real
+        // verdict ("error: FailoverError: API rate limit reached") only
+        // surfaces on a LATER wait. Giving up after the first timeout
+        // conflated "still queued" with "hung" and reported a rate-limited
+        // provider as a possible hang. Re-wait while the gateway keeps
+        // answering timeout, bounded by the caller's window.
+        let waited = { status: "unknown" };
+        let status = "unknown";
+        if (hello?.features?.methods?.includes("agent.wait")) {
+          const maxWaits = Math.max(1, Math.floor(timeoutMs / 25_000));
+          for (let attempt = 0; attempt < maxWaits && Date.now() - startedAt < timeoutMs; attempt += 1) {
+            waited = await request("agent.wait", { runId }, { timeoutMs });
+            status = waited.status ?? "unknown";
+            if (status !== "timeout") break;
+          }
+        } else {
+          waited = { status: "unsupported" };
+          status = "unsupported";
+        }
         const latencyMs = Date.now() - startedAt;
         if (COMPLETED_STATUSES.has(status)) {
           return { ok: true, status, latencyMs, raw: waited };
@@ -705,9 +721,10 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
         // outage.
         const waitDetail =
           typeof waited?.error === "string" ? waited.error : waited?.error?.message ?? null;
+        const waitedFor = Math.round((Date.now() - startedAt) / 1000);
         const error =
           status === "timeout"
-            ? `run did not finish within ${timeoutMs}ms — treated as unusable (possible hang)`
+            ? `run had not finished after ${waitedFor}s of waiting (the gateway kept answering "timeout" while it watched) — treated as unusable (possible hang)`
             : status === "unsupported"
               ? "this gateway does not support agent.wait — the run was dispatched but its completion could not be confirmed"
               : `run did not complete normally (status: ${status})${waitDetail ? ` — ${waitDetail}` : ""}`;

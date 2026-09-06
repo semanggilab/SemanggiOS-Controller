@@ -2136,7 +2136,9 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     }
 
     try {
+      log.info("brain.test-provisioning", { probeName, workspace, full });
       const created = await controller.runtime.createProbeAgent({ name: probeName, workspace, model: full });
+      log.info("brain.test-provisioned", { agentId: created.id });
       return created.id;
     } catch (err) {
       log.error("brain.test-provision-failed", { provider, model, error: err.message });

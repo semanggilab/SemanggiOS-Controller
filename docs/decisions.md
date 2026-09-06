@@ -2149,6 +2149,51 @@ ulang angka mistral saat Admin Panel bisa dibaca; anchor jam claude-code
 5 jam belum terukur.
 
 
+## D64 — resolusi driver lewat alias label, dan `brains.category` dihapus
+
+**Nama provider bukan kontrak.** `brains.provider` adalah LABEL yang
+dipilih operator saat mendaftarkan models-config di gateway — bukan nama
+kanonik. Bukti hidupnya: pool mistral terdaftar di AgentOS sebagai
+`mistral-custom`. Resolusi D63 membandingkan `provider === id driver`,
+jadi label itu jatuh senyap ke `genericDriver` — jendela null, tanpa
+parkir anggaran bulanan, TANPA peringatan apa pun. Keputusan: setiap
+driver mendeklarasikan `providerKeys` (label gateway yang dijawabnya);
+`quotaDriverFor` mencocokkan case-insensitive terhadap id + kumpulan
+kunci itu. Sinyal struktural yang sesungguhnya adalah host baseUrl
+provider (`api.mistral.ai` tidak bisa berbohong tentang dirinya), tapi
+`models.list` tidak membawa baseUrl (diverifikasi di cache hidup:
+provider, model, name, reasoning, available saja) — jadi whitelist host
+menyusul bila gateway mengeksposnya; sampai itu, tabel alias adalah
+mekanismenya dan hanya boleh berisi label yang benar-benar terlihat di
+`models.list`. Permukaan baru: `GET /api/work/quota-drivers` (katalog
+label→driver) dan anotasi `quotaDriver` per brain di `GET /api/work/brains`.
+
+**`brains.category` dihapus (DROP COLUMN, migrasi D64).** Alasannya
+fakta, bukan selera: sejak Brain Map per (template, role, level) (D45),
+jalur dispatch tidak pernah mengoper kategori ke `brainMap.resolve` —
+kedua pemanggil resolve (server role-levels & brain-map preview) hanya
+mengirim template/role/level. Penyaringan `category` di lapisan fallback
+kandidat adalah kode mati, dan field form-nya menampilkan sesuatu yang
+tampak berarti padahal tidak pernah dibaca. `candidatesFor` kini pool
+murni per level; penyemaian dari katalog routing berhenti menurunkan
+kategori. Task/plan-step `category` (untuk RoutingPolicy) tidak tersentuh
+— itu semantik berbeda yang masih hidup.
+
+**Form Brain bersumber dari registry hidup.** Opsi provider/model kini
+dari cache `gateway_models` + provider/model brain yang sudah ada
+(claude-code adalah harness ACP dan tidak pernah muncul di models.list —
+tanpa brain yang ada, brain claude jadi tak bisa disunting). Katalog
+routing statis keluar dari union opsi (sumber kesan "fix"); ia tetap
+hanya sebagai pintasan "Copy from catalog" yang berlabel eksplisit.
+Field provider menunjuk driver yang memiliki label itu — peringatan
+jelas saat sebuah label akan jatuh ke generic.
+
+**Test:** 454 → 456 (alias + katalog; migrasi D64 dengan baris selamat).
+Batas diketahui: tidak ada peringatan runtime saat brain provider
+menangkap generic driver oleh label tak dikenal — anotasi ada di API/UI,
+deteksi otomatis menyusul bila dibutuhkan.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

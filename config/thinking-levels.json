@@ -47,10 +47,24 @@
     },
     {
       "provider": "google",
+      "model": "gemini-2.5-flash-lite",
+      "levels": ["off", "minimal", "low", "medium", "adaptive", "high"],
+      "effortMode": "preference",
+      "evidence": "gemini flash family: accepted, ignored"
+    },
+    {
+      "provider": "google",
       "model": "gemini-3.1-flash-lite",
       "levels": ["off", "minimal", "low", "medium", "adaptive", "high"],
       "effortMode": "preference",
       "evidence": "n=3: off 533 vs high 316 output tokens, spread 9-479 — accepted, ignored"
+    },
+    {
+      "provider": "google",
+      "model": "gemini-3.5-flash-lite",
+      "levels": ["off", "minimal", "low", "medium", "adaptive", "high"],
+      "effortMode": "preference",
+      "evidence": "gemini flash family: accepted, ignored"
     },
     {
       "provider": "groq",

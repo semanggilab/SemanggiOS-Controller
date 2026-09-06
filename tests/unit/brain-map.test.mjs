@@ -56,8 +56,8 @@ test("pemaku per level dipakai apa adanya, dan Brain di bawah level sel ditandai
   });
 
   assert.equal(picked.source, "pinned");
-  assert.equal(picked.brain.name, "murah");
-  assert.equal(picked.belowLevel, true, "penurunan eksplisit harus terlihat, bukan diam-diam");
+  assert.equal(picked.candidates[0].brain.name, "murah");
+  assert.equal(picked.candidates[0].belowLevel, true, "penurunan eksplisit harus terlihat, bukan diam-diam");
 
   // Sel level lain tidak ikut-ikutan: pemaku tidak tumpah ke sel sebelah.
   const sebelah = await h.brainMap.resolve({
@@ -80,8 +80,8 @@ test("pemaku yang setara atau lebih tinggi dari level dipakai tanpa tanda belowL
 
   const picked = await h.brainMap.resolve({ template: "software", role: "builder", level: Level.NORMAL, brains: h.brains });
   assert.equal(picked.source, "pinned");
-  assert.equal(picked.brain.name, "pilihan-a");
-  assert.notEqual(picked.belowLevel, true);
+  assert.equal(picked.candidates[0].brain.name, "pilihan-a");
+  assert.notEqual(picked.candidates[0].belowLevel, true);
 
   // Membayar lebih atas kemauan sendiri boleh; yang dilarang hanya turun diam-diam.
   const naik = await h.brains.create({ name: "lebih-tinggi", provider: "zai", model: "glm-5.2", thinking: "max", level: Level.CRITICAL });
@@ -112,7 +112,7 @@ test("melepas pemaku mengembalikan sel ke default grid, lalu kandidat level", as
     { brains: h.brains },
   );
   await h.brainMap.clear({ template: "software", role: "builder", level: Level.NORMAL });
-  assert.equal(await h.brainMap.get("software", "builder", Level.NORMAL), null);
+  assert.deepEqual(await h.brainMap.getCell("software", "builder", Level.NORMAL), []);
 
   // Default grid (DEFAULT_BRAIN_MAP) mengambil alih sel yang tidak dipaku —
   // asalkan Brain-nya hidup di instance ini.
@@ -123,6 +123,135 @@ test("melepas pemaku mengembalikan sel ke default grid, lalu kandidat level", as
     brains: h.brains,
   });
   assert.ok(["default", "level"].includes(picked.source), `sumber tak terduga: ${picked.source}`);
+});
+
+// --- daftar terurut (D68) -----------------------------------------------------
+
+test("sel memegang daftar terurut; anggota hidup pertama menang, names membawa semuanya", async () => {
+  const h = await buildHarness();
+  const pertama = await h.brains.create({ name: "utama", provider: "zai", model: "glm-5.2", thinking: "high", level: Level.NORMAL });
+  const kedua = await h.brains.create({ name: "cadangan", provider: "aliyuncs", model: "qwen3.5-max", level: Level.NORMAL });
+
+  await h.brainMap.set(
+    { template: "software", role: "builder", level: Level.NORMAL, brainIds: [pertama.id, kedua.id] },
+    { brains: h.brains },
+  );
+  const cell = await h.brainMap.getCell("software", "builder", Level.NORMAL);
+  assert.deepEqual(
+    cell.map((m) => [m.position, m.brainId]),
+    [[0, pertama.id], [1, kedua.id]],
+    "urutan disimpan sebagai posisi, ditulis ulang dari 0",
+  );
+
+  const picked = await h.brainMap.resolve({
+    template: "software",
+    role: "builder",
+    level: Level.NORMAL,
+    brains: h.brains,
+  });
+  assert.equal(picked.source, "pinned");
+  assert.equal(picked.candidates[0].brain.name, "utama");
+  assert.deepEqual(picked.names, ["utama", "cadangan"], "preferred membawa seluruh daftar, bukan pemenang saja");
+  assert.deepEqual(picked.skipped, [], "semua anggota hidup — tidak ada yang diskip");
+});
+
+test("anggota yang dimatikan diskip dengan alasan, tapi tetap di names — fail-back otomatis", async () => {
+  const h = await buildHarness();
+  const utama = await h.brains.create({ name: "sering-habis", provider: "zai", model: "glm-5.2", thinking: "high", level: Level.NORMAL });
+  const cadangan = await h.brains.create({ name: "penengah", provider: "aliyuncs", model: "qwen3.5-max", level: Level.NORMAL });
+  await h.brainMap.set(
+    { template: "software", role: "builder", level: Level.NORMAL, brainIds: [utama.id, cadangan.id] },
+    { brains: h.brains },
+  );
+
+  // Mematikan anggota pertama SETELAH disetel boleh: itu keadaan hidup, bukan
+  // konfigurasi. Resolve melompat ke cadangan dan melaporkan kenapa.
+  await h.brains.update(utama.id, { enabled: false });
+  const picked = await h.brainMap.resolve({
+    template: "software",
+    role: "builder",
+    level: Level.NORMAL,
+    brains: h.brains,
+  });
+  assert.equal(picked.candidates[0].brain.name, "penengah");
+  assert.deepEqual(
+    picked.skipped.map((s) => [s.name, s.reason]),
+    [["sering-habis", "dimatikan"]],
+  );
+  // Nama yang dimatikan TETAK di names: begitu dihidupkan lagi, ia menang
+  // kembali tanpa ada yang menyentuh sel — itulah fail-back tanpa penunjuk.
+  assert.deepEqual(picked.names, ["sering-habis", "penengah"]);
+
+  await h.brains.update(utama.id, { enabled: true });
+  const revived = await h.brainMap.resolve({
+    template: "software",
+    role: "builder",
+    level: Level.NORMAL,
+    brains: h.brains,
+  });
+  assert.equal(revived.candidates[0].brain.name, "sering-habis", "pemulihan otomatis kembali ke urutan awal");
+});
+
+test("seluruh daftar dimatikan ditolak saat disetel — sel yang tidak pernah jalan", async () => {
+  const h = await buildHarness();
+  const hidup = await h.brains.create({ name: "hidup", provider: "zai", model: "glm-5.2", level: Level.NORMAL });
+  const mati = await h.brains.create({ name: "mati", provider: "zai", model: "glm-5.1", level: Level.NORMAL });
+  await h.brains.update(mati.id, { enabled: false });
+
+  await assert.rejects(
+    () =>
+      h.brainMap.set(
+        { template: "software", role: "builder", level: Level.NORMAL, brainIds: [mati.id] },
+        { brains: h.brains },
+      ),
+    /disabled/,
+    "list satu-anggota yang mati adalah sel yang tidak pernah berjalan",
+  );
+  // Anggota mati di TENGAH daftar diperbolehkan — ia diskip saat resolve.
+  await h.brainMap.set(
+    { template: "software", role: "builder", level: Level.NORMAL, brainIds: [hidup.id, mati.id] },
+    { brains: h.brains },
+  );
+  const picked = await h.brainMap.resolve({ template: "software", role: "builder", level: Level.NORMAL, brains: h.brains });
+  assert.equal(picked.candidates.length, 1);
+});
+
+test("anggota kembar dan anggota tak dikenal ditolak saat disetel", async () => {
+  const h = await buildHarness();
+  const a = await h.brains.create({ name: "kembar", provider: "zai", model: "glm-5.2", level: Level.NORMAL });
+  await assert.rejects(
+    () =>
+      h.brainMap.set(
+        { template: "software", role: "builder", level: Level.NORMAL, brainIds: [a.id, a.id] },
+        { brains: h.brains },
+      ),
+    /duplicate/,
+    "daftar failover menyebut tiap peer sekali — kembar hanya memalsukan panjangnya",
+  );
+  await assert.rejects(
+    () =>
+      h.brainMap.set(
+        { template: "software", role: "builder", level: Level.NORMAL, brainIds: ["BRN-NGACO"] },
+        { brains: h.brains },
+      ),
+    /unknown brain/,
+  );
+});
+
+test("sel tanpa pemaku dan tanpa default hidup memakai seluruh pool level sebagai daftar", async () => {
+  const h = await buildHarness();
+  // tester/critical: default grid-nya "qwen-high", yang tidak disemai harness
+  // ini → jatuh ke pool level. Pool penuh jadi names: sel yang tak pernah
+  // disentuh operator tetap punya rantai failover, bukan satu nama.
+  const picked = await h.brainMap.resolve({
+    template: "software",
+    role: "tester",
+    level: Level.CRITICAL,
+    brains: h.brains,
+  });
+  assert.equal(picked.source, "level");
+  assert.ok(picked.names.length >= 1);
+  assert.equal(picked.names.length, picked.candidates.length, "pool level tidak menyembunyikan anggota");
 });
 
 // --- dekomposisi -------------------------------------------------------------
@@ -309,6 +438,85 @@ test("PUT membaca body — role-levels dan brain-map sama-sama bergantung padany
     });
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.equal(res.body.level, "critical");
+  } finally {
+    await api.close();
+  }
+});
+
+test("PUT brain-map menyimpan daftar terurut, dan urutannya sampai ke preferred task", async () => {
+  const h = await buildHarness();
+  const { project } = await seedBasics(h);
+  for (const role of ["analyst", "architect", "builder", "reviewer", "tester", "learner"]) {
+    await h.repos.workers.create({ role, agentRef: `w-${role}`, projectAccess: [project.id] });
+  }
+  const utama = await h.brains.create({ name: "list-utama", provider: "zai", model: "glm-5.2", thinking: "high", level: Level.NORMAL });
+  const cadangan = await h.brains.create({ name: "list-cadangan", provider: "aliyuncs", model: "qwen3.5-max", level: Level.NORMAL });
+  const api = await startApi(h);
+  try {
+    const put = await api.call("PUT", "/api/work/brain-map", {
+      template: "software",
+      role: "builder",
+      level: "normal",
+      brainIds: [utama.id, cadangan.id],
+    });
+    assert.equal(put.status, 200, JSON.stringify(put.body));
+    assert.deepEqual(put.body.mapping.map((m) => m.brainId), [utama.id, cadangan.id]);
+
+    const get = await api.call("GET", "/api/work/brain-map?template=software");
+    const cell = get.body.mappings.find((m) => m.role === "builder" && m.level === "normal");
+    assert.deepEqual(
+      cell.brains.map((b) => b.brainName),
+      ["list-utama", "list-cadangan"],
+      "GET mengelompokkan baris jadi sel dengan daftar terurut",
+    );
+
+    // End-to-end: dekomposisi membawa seluruh daftar ke model_policy.preferred
+    // — admission yang memilih anggota hidup pertama per dispatch (D68).
+    const res = await api.call("POST", "/api/work/control/message", {
+      text: "task bangun layanan pemesanan dengan NestJS",
+      projectId: project.id,
+      template: "software",
+    });
+    assert.equal(res.body.created, true, JSON.stringify(res.body).slice(0, 300));
+    const builder = res.body.tasks.find((t) => t.role === "builder");
+    assert.deepEqual(builder.brainList.slice(0, 2), ["list-utama", "list-cadangan"]);
+    const task = await h.repos.tasks.get(builder.taskId);
+    assert.deepEqual(
+      task.model_policy.preferred.slice(0, 2),
+      ["list-utama", "list-cadangan"],
+      "preferred membawa rantai failover, bukan pemenang saja",
+    );
+
+    // Clear lewat [] — dibedakan dari field yang tidak dikirim.
+    const cleared = await api.call("PUT", "/api/work/brain-map", {
+      template: "software",
+      role: "builder",
+      level: "normal",
+      brainIds: [],
+    });
+    assert.equal(cleared.status, 200);
+    assert.equal((await h.brainMap.getCell("software", "builder", "normal")).length, 0);
+  } finally {
+    await api.close();
+  }
+});
+
+test("PUT brain-map menolak daftar kembar tanpa menyentuh sel yang ada", async () => {
+  const h = await buildHarness();
+  const a = await h.brains.create({ name: "asli", provider: "zai", model: "glm-5.2", level: Level.NORMAL });
+  const b = await h.brains.create({ name: "kembar-put", provider: "aliyuncs", model: "qwen3.5-max", level: Level.NORMAL });
+  const api = await startApi(h);
+  try {
+    await api.call("PUT", "/api/work/brain-map", {
+      template: "software", role: "builder", level: "normal", brainIds: [a.id],
+    });
+    const dup = await api.call("PUT", "/api/work/brain-map", {
+      template: "software", role: "builder", level: "normal", brainIds: [b.id, b.id],
+    });
+    assert.equal(dup.status, 400);
+    assert.match(dup.body.error ?? "", /duplicate/);
+    const cell = await h.brainMap.getCell("software", "builder", "normal");
+    assert.deepEqual(cell.map((m) => m.brainId), [a.id], "sel yang ditolak tidak berubah");
   } finally {
     await api.close();
   }

@@ -63,6 +63,9 @@ const presentPlanStep = (s) => ({
   deliverable: s.deliverable,
   title: s.title,
   brain: s.brain?.name ?? null,
+  // D68: the full ordered list, so "which brain" answers include the failover
+  // chain, not just today's first survivor.
+  brainList: s.brainNames ?? (s.brain ? [s.brain.name] : []),
   brainSource: s.brainSource ?? null,
   brainNote: s.brainNote ?? null,
   after: s.after,
@@ -532,20 +535,25 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       // resolves it — project override > global override > builtin
       // (template, profile) default > the project's own profile level.
       const level = resolveLevel({ template, role, profile, overrides: globalOverrides, projectOverrides });
+      // D68: a cell holds an ordered failover list; the first LIVE member is
+      // what runs right now, and the rest are named so the modal can say
+      // "glm-5-2-max, failover: qwen-high" instead of hiding the chain.
       const pick = await controller.brainMap.resolve({
         template,
         role,
         level,
         brains: controller.brains,
       });
+      const first = pick.candidates[0]?.brain ?? null;
       rolesOut.push({
         role,
         level,
         roleMapDefault: resolveLevel({ template, role, profile, overrides: globalOverrides }),
         projectOverride: projectOverrides[role] ?? null,
-        brain: pick.brain ? { id: pick.brain.id, name: pick.brain.name } : null,
+        brain: first ? { id: first.id, name: first.name } : null,
         brainSource: pick.source,
         brainNote: pick.reason,
+        brainPeers: pick.names.filter((n) => n !== first?.name),
       });
     }
     return {
@@ -1573,16 +1581,45 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
 
   // --- brain map ------------------------------------------------------------
   //
-  // Pemetaan (template × role × level) → Brain tertentu. Melengkapi
+  // Pemetaan (template × role × level) → DAFTAR Brain terurut. Melengkapi
   // role-levels, tidak menggantikannya: yang satu memutuskan seberapa mahal
-  // role boleh berpikir, yang ini memutuskan Brain mana pada level itu.
-  // Halamannya grid dengan dropdown per kolom level; sel yang tidak dipaku
-  // memakai default grid (DEFAULT_BRAIN_MAP), lalu kandidat level.
+  // role boleh berpikir, yang ini memutuskan Brain mana pada level itu, dan
+  // urutan apa kalau yang pertama tumbang (D68). Sel yang tidak dipaku
+  // memakai default grid (DEFAULT_BRAIN_MAP), lalu pool level.
   route("GET", "/api/work/brain-map", async (_p, _b, query) => {
     const template = query.get("template");
-    const mappings = await controller.brainMap.list({ template: template ?? undefined });
+    const rows = await controller.brainMap.list({ template: template ?? undefined });
     const brains = await controller.brains.list({ enabledOnly: true });
     const byId = new Map(brains.map((b) => [b.id, b]));
+
+    // Satu sel = satu entri `mappings`, membawa daftar anggota terurut.
+    // Bentuk per-anggota meniru baris lama (brainName/brainLevel/belowLevel/
+    // stale) supaya maknanya tidak berubah — hanya kardinalitasnya.
+    const cellKey = (r) => `${r.template}/${r.role}/${r.level}`;
+    const cells = new Map();
+    for (const r of rows) {
+      const key = cellKey(r);
+      if (!cells.has(key)) {
+        cells.set(key, { template: r.template, role: r.role, level: r.level, brains: [], updatedAt: r.updatedAt });
+      }
+      const cell = cells.get(key);
+      cell.updatedAt = Math.max(cell.updatedAt, r.updatedAt);
+      const brain = byId.get(r.brainId) ?? null;
+      cell.brains.push({
+        position: r.position,
+        brainId: r.brainId,
+        brainName: brain?.name ?? null,
+        brainLevel: brain?.level ?? null,
+        // `belowLevel`: Brain yang klasifikasinya di bawah level selnya.
+        // Dengan kunci per level itu keputusan eksplisit operator — dipakai,
+        // tetapi ditandai supaya tidak ada penurunan yang tidak disadari.
+        belowLevel: brain ? LEVEL_RANK[brain.level] < LEVEL_RANK[r.level] : false,
+        // `stale` berarti: baris ini ada di halaman tetapi tidak akan pernah
+        // dipakai. Menampilkannya tanpa tanda persis kelas kesalahan agen
+        // `config-only` di D32 — terlihat benar, tidak pernah berjalan.
+        stale: !brain,
+      });
+    }
 
     return {
       // Role yang tersedia per template, apa pun profilenya.
@@ -1593,22 +1630,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       levels: ["low", "normal", "critical"],
       defaults: DEFAULT_BRAIN_MAP,
       brains: brains.map((b) => ({ id: b.id, name: b.name, level: b.level })),
-      mappings: mappings.map((m) => {
-        const brain = byId.get(m.brainId) ?? null;
-        return {
-          ...m,
-          brainName: brain?.name ?? null,
-          brainLevel: brain?.level ?? null,
-          // `belowLevel`: Brain yang klasifikasinya di bawah level selnya.
-          // Dengan kunci per level itu keputusan eksplisit operator — dipakai,
-          // tetapi ditandai supaya tidak ada penurunan yang tidak disadari.
-          belowLevel: brain ? LEVEL_RANK[brain.level] < LEVEL_RANK[m.level] : false,
-          // `stale` berarti: baris ini ada di halaman tetapi tidak akan pernah
-          // dipakai. Menampilkannya tanpa tanda persis kelas kesalahan agen
-          // `config-only` di D32 — terlihat benar, tidak pernah berjalan.
-          stale: !brain,
-        };
-      }),
+      mappings: [...cells.values()],
     };
   });
 
@@ -1617,19 +1639,26 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     const { template, role, level } = body;
     if (!template || !role || !level) throw badRequest("template, role and level are required");
     if (!["low", "normal", "critical"].includes(level)) throw badRequest(`invalid level "${level}"`);
-    // `brainId: null` melepas pemaku. Dibedakan dari field yang tidak dikirim
-    // supaya "lepaskan" tidak terbaca sebagai "biarkan".
-    if (body.brainId === null) {
+    // `brainIds: []`/null melepas pemaku. Dibedakan dari field yang tidak
+    // dikirim supaya "lepaskan" tidak terbaca sebagai "biarkan". `brainId`
+    // skalar (UI lama) diterima sebagai list satu-anggota.
+    const clearing = body.brainIds === null || (Array.isArray(body.brainIds) && body.brainIds.length === 0);
+    const hasLegacy = body.brainIds === undefined && body.brainId !== undefined && body.brainId !== null;
+    if (body.brainIds === undefined && !hasLegacy) {
+      throw badRequest("brainIds (ordered array) is required; send [] to clear the cell");
+    }
+    if (clearing) {
       const cleared = await controller.brainMap.clear({ template, role, level });
       log.info("brain-map.cleared", { template, role, level, by: actor.name });
       return { mapping: cleared };
     }
+    const brainIds = hasLegacy ? [body.brainId] : body.brainIds;
     try {
       const mapping = await controller.brainMap.set(
-        { template, role, level, brainId: body.brainId, actor: actor.name },
+        { template, role, level, brainIds, actor: actor.name },
         { brains: controller.brains },
       );
-      log.info("brain-map.set", { template, role, level, brain: body.brainId, by: actor.name });
+      log.info("brain-map.set", { template, role, level, brains: brainIds, by: actor.name });
       return { mapping };
     } catch (err) {
       throw badRequest(err.message);
@@ -1711,6 +1740,27 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       };
     }
     const immediate = wantsImmediateRun(text);
+    // Level + daftar Brain per role, resolusi yang sama dengan dekomposisi
+    // (D68): task terdaftar dari dokumen membawa daftar failover penuh,
+    // bukan kategori routing yang harus menebak lewat config. Item tanpa
+    // role yang dikenal tetap terdaftar — preferred-nya kosong dan admission
+    // yang melaporkan jujur kalau memang tidak ada jalur.
+    const template = String(project.template ?? "software").toLowerCase();
+    const profile = String(project.profile ?? "balanced").toLowerCase();
+    const overrideRows = await controller.store.all(
+      `SELECT role, level FROM role_levels WHERE template = ? AND profile = ?`,
+      [template, profile],
+    );
+    const overrides = Object.fromEntries(overrideRows.map((r) => [r.role, r.level]));
+    const projectOverrides = Object.fromEntries(
+      (await repos.projects.roleLevels.list(projectId)).map((r) => [r.role, r.level]),
+    );
+    const namesByRole = new Map();
+    for (const role of new Set(items.map((i) => i.role).filter(Boolean))) {
+      const level = resolveLevel({ template, role, profile, overrides, projectOverrides });
+      const pick = await controller.brainMap.resolve({ template, role, level, brains: controller.brains });
+      namesByRole.set(role, { level, names: pick.names });
+    }
     const idByLocal = new Map();
     const registered = [];
     for (const item of items) {
@@ -1718,13 +1768,18 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       // ditulis top-down, jadi referensi maju (kalau ada) dibuang, bukan
       // dibuat menggantung ke id yang tidak ada.
       const dependsOn = item.deps.map((d) => idByLocal.get(d)).filter(Boolean);
+      const resolvedRole = item.role ? namesByRole.get(item.role) : undefined;
       const task = await repos.tasks.create({
         projectId,
         workerId: worker.id,
         title: item.title.slice(0, 120),
         description: item.description ?? item.title,
         workspacePath: root,
-        modelPolicy: item.role && ROLE_CATEGORY[item.role] ? { category: ROLE_CATEGORY[item.role] } : {},
+        modelPolicy: {
+          ...(item.role && ROLE_CATEGORY[item.role] ? { category: ROLE_CATEGORY[item.role] } : {}),
+          ...(resolvedRole ? { class: resolvedRole.level } : {}),
+          ...(resolvedRole && resolvedRole.names.length > 0 ? { preferred: resolvedRole.names } : {}),
+        },
         dependsOn,
       });
       idByLocal.set(item.localId, task.id);
@@ -1977,9 +2032,11 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       levelFor: (role) => resolveLevel({ template, role, profile, overrides, projectOverrides }),
     });
 
-    // Brain per fase diselesaikan SEBELUM satu task pun dibuat. Membuat dulu
-    // lalu menemukan bahwa separuhnya tidak punya Brain akan meninggalkan
-    // rencana setengah jadi yang harus dibersihkan tangan.
+    // Daftar Brain per fase diselesaikan SEBELUM satu task pun dibuat. Membuat
+    // dulu lalu menemukan bahwa separuhnya tidak punya Brain akan meninggalkan
+    // rencana setengah jadi yang harus dibersihkan tangan. "Tidak punya" kini
+    // berarti tidak ada anggota hidup sama sekali — daftar dengan semua anggota
+    // tumbang jatuh ke lapisan default/pool seperti biasa.
     const resolved = [];
     for (const step of plan) {
       const pick = await controller.brainMap.resolve({
@@ -1987,9 +2044,14 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         role: step.role,
         level: step.level,
         brains: controller.brains,
-        category: step.category,
       });
-      resolved.push({ ...step, brain: pick.brain, brainSource: pick.source, brainNote: pick.reason });
+      resolved.push({
+        ...step,
+        brain: pick.candidates[0]?.brain ?? null,
+        brainSource: pick.source,
+        brainNote: pick.reason,
+        brainNames: pick.names,
+      });
     }
 
     const unresolved = resolved.filter((s) => !s.brain);
@@ -2049,7 +2111,10 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         modelPolicy: {
           category: step.category ?? undefined,
           class: step.level,
-          ...(step.brain ? { preferred: [step.brain.name] } : {}),
+          // D68: seluruh daftar terurut, bukan Brain tunggal — admission
+          // memilih anggota hidup pertama per percobaan dispatch, jadi
+          // failover dan fail-back terjadi tanpa keadaan tersimpan.
+          preferred: step.brainNames,
         },
         dependsOn,
       });
@@ -2060,7 +2125,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         subjectType: "task",
         subjectId: task.id,
         actor: actor?.name ?? "operator",
-        payload: { role: step.role, level: step.level, brain: step.brain?.name ?? null, dependsOn, request: text },
+        payload: { role: step.role, level: step.level, brain: step.brain?.name ?? null, brains: step.brainNames, dependsOn, request: text },
       });
     }
 

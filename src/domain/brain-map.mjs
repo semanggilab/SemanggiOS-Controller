@@ -1,17 +1,32 @@
-// Brain Map: pemetaan (template AgentOS × role × level) → Brain tertentu.
+// Brain Map: pemetaan (template AgentOS × role × level) → DAFTAR Brain terurut.
 //
 // KENAPA INI TERPISAH DARI role_levels
 //
 // Keduanya menjawab pertanyaan yang berbeda dan sama-sama perlu:
 //
 //   role_levels  "seberapa mahal role ini boleh berpikir?"   → low|normal|critical
-//   brain_map    "di level itu, Brain yang MANA?"            → satu Brain bernama
+//   brain_map    "di level itu, Brain yang MANA?"            → daftar Brain bernama,
+//                                                               urutan = urutan coba
 //
 // Tanpa brain_map, pilihan jatuh ke kandidat pertama pada level tersebut. Itu
 // tidak salah — levelnya tetap dihormati — tetapi operator tidak bisa
 // mengendalikannya, dan urutan kandidat berasal dari berkas routing yang hanya
 // bisa diubah lewat deploy. Halaman Brain Map ada supaya keputusan itu bisa
 // dipindahkan ke orang yang menjalankan projectnya.
+//
+// KENAPA DAFTAR TERURUT, BUKAN SATU BRAIN (D68)
+//
+// Satu pemaku berarti satu titik kegagalan: Brain itu habis kuota → task
+// parkir, padahal ada peer setara di sebelahnya. Daftar terurut membuat sel
+// memegang rencana failover operator: anggota pertama yang hidup menang.
+//
+// Urutan dievaluasi ulang pada TIAP percobaan dispatch — tidak ada penunjuk
+// tersimpan ("sedang di anggota ke-i") yang pernah direset. Itu desain, bukan
+// kelalaian: penunjuk yang bertahan membuat task lama menolak Brain yang
+// sudah sembuh (fail-back tidak pernah terjadi) dan butuh aturan reset
+// tambahan. Evaluasi per-dispatch memberi keduanya gratis: pemilihan selalu
+// anggota hidup PERTAMA, jadi pemulihan otomatis kembali ke urutan awal, dan
+// "reset saat task baru" menjadi korolari, bukan aturan tersendiri.
 //
 // KENAPA KUNCINYA PER LEVEL, BUKAN PER ROLE SAJA
 //
@@ -85,71 +100,94 @@ export const DEFAULT_BRAIN_MAP = Object.freeze({
 });
 
 export function createBrainMap(store, { now } = {}) {
+  const present = (r) => ({
+    template: r.template,
+    role: r.role,
+    level: r.level,
+    position: r.position,
+    brainId: r.brain_id,
+    actor: r.actor,
+    updatedAt: r.updated_at,
+  });
+
   const api = {
-    /** Semua pemaku, apa adanya. */
+    /** Semua baris anggota, apa adanya, terurut per sel lalu posisi. */
     async list({ template } = {}) {
       const rows = template
-        ? await store.all(`SELECT * FROM brain_map WHERE template = ? ORDER BY role, level`, [norm(template)])
-        : await store.all(`SELECT * FROM brain_map ORDER BY template, role, level`);
-      return rows.map((r) => ({
-        template: r.template,
-        role: r.role,
-        level: r.level,
-        brainId: r.brain_id,
-        actor: r.actor,
-        updatedAt: r.updated_at,
-      }));
+        ? await store.all(
+            `SELECT * FROM brain_map WHERE template = ? ORDER BY role, level, position`,
+            [norm(template)],
+          )
+        : await store.all(`SELECT * FROM brain_map ORDER BY template, role, level, position`);
+      return rows.map(present);
     },
 
-    async get(template, role, level) {
-      const row = await store.get(`SELECT * FROM brain_map WHERE template = ? AND role = ? AND level = ?`, [
-        norm(template),
-        norm(role),
-        norm(level),
-      ]);
-      return row
-        ? {
-            template: row.template,
-            role: row.role,
-            level: row.level,
-            brainId: row.brain_id,
-            actor: row.actor,
-            updatedAt: row.updated_at,
-          }
-        : null;
+    /** Daftar terurut milik satu sel; kosong berarti sel tidak dipaku. */
+    async getCell(template, role, level) {
+      const rows = await store.all(
+        `SELECT * FROM brain_map WHERE template = ? AND role = ? AND level = ? ORDER BY position`,
+        [norm(template), norm(role), norm(level)],
+      );
+      return rows.map(present);
     },
 
     /**
-     * Paku sebuah (template, role, level) ke sebuah Brain.
+     * Tulis daftar terurut untuk sebuah (template, role, level).
      *
-     * `brainId` harus sudah ada dan aktif: memaku ke Brain yang dimatikan
-     * menghasilkan konfigurasi yang tampak benar di halaman dan tidak pernah
-     * terpilih saat dispatch — kelas kesalahan yang sama dengan agen
-     * `config-only` di D32, dan sama sulitnya dilihat.
+     * `brainIds` adalah array terurut (index 0 = dicoba pertama); `brainId`
+     * skalar diterima sebagai list satu-anggota — jalur lama yang membuat
+     * migrasi UI tidak harus atomik.
+     *
+     * Validasi saat disetel, bukan saat dispatch:
+     *   - setiap anggota harus sudah ada (unknown → tolak)
+     *   - tidak boleh ada anggota kembar
+     *   - SELURUH daftar tidak boleh dimatikan — sel demikian tidak pernah
+     *     jalan, kelas kesalahan yang sama dengan agen `config-only` di D32.
+     *     Anggota tunggal yang dimatikan tetap ditolak (list satu-anggota
+     *     semua-mati); anggota dimatikan DI TENGAH daftar diperbolehkan:
+     *     ia diskip saat resolve dan hidup kembali begitu diaktifkan.
      */
-    async set({ template, role, level, brainId, actor = "operator" }, { brains } = {}) {
+    async set({ template, role, level, brainId, brainIds, actor = "operator" }, { brains } = {}) {
       const t = norm(template);
       const r = norm(role);
       const l = norm(level);
-      if (!t || !r || !l || !brainId) throw new Error("template, role, level and brainId are required");
+      if (!t || !r || !l) throw new Error("template, role and level are required");
       if (!(l in RANK)) throw new Error(`invalid level "${level}"`);
-      if (brains) {
-        const brain = await brains.get(brainId);
-        if (!brain) throw new Error(`unknown brain "${brainId}"`);
-        if (!brain.enabled) {
+      const raw = brainId != null ? [brainId] : brainIds;
+      if (!Array.isArray(raw) || raw.length === 0) {
+        throw new Error("brainIds (ordered, non-empty) is required — send [] or null via the API to clear");
+      }
+      const resolved = [];
+      if (!brains) {
+        resolved.push(...raw.map((id) => ({ id, name: String(id), enabled: true })));
+      } else {
+        for (const id of raw) {
+          const brain = await brains.get(id);
+          if (!brain) throw new Error(`unknown brain "${id}"`);
+          if (resolved.some((b) => b.id === brain.id)) {
+            throw new Error(`duplicate brain "${brain.name}" — a failover list names each peer once`);
+          }
+          resolved.push(brain);
+        }
+        if (resolved.every((b) => !b.enabled)) {
           throw new Error(
-            `brain "${brain.name}" is disabled; pinning it would produce a mapping that never runs`,
+            `every brain in the list is disabled (${resolved.map((b) => b.name).join(", ")}); ` +
+              "the cell would never run",
           );
         }
-        brainId = brain.id;
       }
-      await store.run(
-        `INSERT INTO brain_map (template, role, level, brain_id, actor, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(template, role, level) DO UPDATE SET brain_id = excluded.brain_id,
-           actor = excluded.actor, updated_at = excluded.updated_at`,
-        [t, r, l, brainId, actor, now()],
-      );
-      return api.get(t, r, l);
+      await store.tx(async () => {
+        await store.run(`DELETE FROM brain_map WHERE template = ? AND role = ? AND level = ?`, [t, r, l]);
+        let position = 0;
+        for (const brain of resolved) {
+          await store.run(
+            `INSERT INTO brain_map (template, role, level, position, brain_id, actor, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [t, r, l, position++, brain.id, actor, now()],
+          );
+        }
+      });
+      return api.getCell(t, r, l);
     },
 
     /** Lepas pemaku. Sel kembali ke default grid, lalu kandidat level. */
@@ -163,13 +201,22 @@ export function createBrainMap(store, { now } = {}) {
     },
 
     /**
-     * Brain efektif untuk sebuah (template, role, level).
+     * Daftar kandidat terurut untuk sebuah (template, role, level).
      *
-     * @returns {{brain, source, reason, belowLevel}} `source` salah satu dari:
-     *   `pinned`      operator memaku sel grid ini
-     *   `default`     belum dipaku; default grid (DEFAULT_BRAIN_MAP)
-     *   `level`       tidak dipaku dan tanpa default; kandidat pertama level
-     *   `unresolved`  tidak ada kandidat sama sekali — task akan WAIT_RESOURCE
+     * @returns {{source, candidates, skipped, names, reason}}
+     *   `source` salah satu dari:
+     *     `pinned`      sel grid ini punya daftar operator
+     *     `default`     belum dipaku; default grid (DEFAULT_BRAIN_MAP)
+     *     `level`       tidak dipaku dan tanpa default; pool level (urut nama)
+     *     `unresolved`  tidak ada kandidat sama sekali — task akan WAIT_RESOURCE
+     *
+     * `candidates` = anggota hidup (ada + enabled) pada urutannya, masing-masing
+     * membawa `belowLevel`. `skipped` = anggota daftar yang tidak bisa melayani
+     * sekarang beserta alasannya — dipakai untuk menegaskan kenapa failover
+     * turun, bukan untuk menghapus anggota (fail-back otomatis begitu ia hidup).
+     * `names` = urutan NAMA untuk model_policy.preferred: seluruh anggota yang
+     * barisnya masih ada, termasuk yang dimatikan — admission yang memutuskan
+     * siapa yang hidup, per percobaan dispatch.
      *
      * `belowLevel` menandai Brain yang klasifikasinya di bawah level sel.
      * Dengan kunci per level, memilih Brain demikian adalah keputusan eksplisit
@@ -177,23 +224,34 @@ export function createBrainMap(store, { now } = {}) {
      */
     async resolve({ template, role, level, brains } = {}) {
       const l = norm(level);
-      let rejected = null;
+      const notes = [];
+      const skipped = [];
 
-      const pinned = await api.get(template, role, l);
-      if (pinned) {
-        const brain = await brains.get(pinned.brainId);
-        if (!brain) {
-          rejected = `brain "${pinned.brainId}" yang dipaku sudah tidak ada`;
-        } else if (!brain.enabled) {
-          rejected = `brain "${brain.name}" yang dipaku sedang dimatikan`;
-        } else {
-          return {
-            brain,
-            source: "pinned",
-            reason: null,
-            belowLevel: RANK[brain.level] < RANK[l] || undefined,
-          };
+      const members = await api.getCell(template, role, l);
+      if (members.length > 0) {
+        const candidates = [];
+        const names = [];
+        for (const m of members) {
+          const brain = await brains.get(m.brainId);
+          if (!brain) {
+            // brains.delete() membersihkan pemaku, jadi baris menggantung hanya
+            // lahir dari tangan di DB — tetap dilaporkan, bukan ditelan.
+            skipped.push({ position: m.position, name: m.brainId, reason: "brain tidak ada" });
+            continue;
+          }
+          names.push(brain.name);
+          if (!brain.enabled) {
+            skipped.push({ position: m.position, name: brain.name, reason: "dimatikan" });
+            continue;
+          }
+          candidates.push({ brain, position: m.position, belowLevel: RANK[brain.level] < RANK[l] || undefined });
         }
+        if (candidates.length > 0) {
+          return { source: "pinned", candidates, skipped, names, reason: null };
+        }
+        notes.push(
+          `seluruh pemaku tidak tersedia: ${skipped.map((s) => `${s.name} (${s.reason})`).join(", ")}`,
+        );
       }
 
       // Lapisan default grid. Hanya Brain yang benar-benar hidup: default
@@ -203,27 +261,36 @@ export function createBrainMap(store, { now } = {}) {
         const brain = await brains.get(defaultName);
         if (brain?.enabled) {
           return {
-            brain,
             source: "default",
-            reason: rejected,
-            belowLevel: RANK[brain.level] < RANK[l] || undefined,
+            candidates: [{ brain, position: 0, belowLevel: RANK[brain.level] < RANK[l] || undefined }],
+            skipped,
+            names: [brain.name],
+            reason: notes[0] ?? null,
           };
         }
-        rejected =
-          rejected ?? `default grid "${defaultName}" tidak tersedia (tidak ada atau dimatikan); jatuh ke kandidat level`;
+        notes.push(notes[0] ?? `default grid "${defaultName}" tidak tersedia (tidak ada atau dimatikan); jatuh ke kandidat level`);
       }
 
-      // D64: kandidat level tanpa penyaringan kategori — resolve tidak pernah
+      // D64: pool level tanpa penyaringan kategori — resolve tidak pernah
       // menerima kategori sejak grid (template, role, level) yang memutus.
-      const candidates = await brains.candidatesFor({ level: l });
-      if (candidates.length > 0) {
-        return { brain: candidates[0], source: "level", reason: rejected, belowLevel: undefined };
+      // Seluruh pool jadi daftar: failover berlaku juga untuk sel yang tidak
+      // pernah disentuh operator.
+      const pool = await brains.candidatesFor({ level: l });
+      if (pool.length > 0) {
+        return {
+          source: "level",
+          candidates: pool.map((brain) => ({ brain, belowLevel: undefined })),
+          skipped,
+          names: pool.map((b) => b.name),
+          reason: notes[0] ?? null,
+        };
       }
       return {
-        brain: null,
         source: "unresolved",
-        reason: rejected ?? `tidak ada Brain aktif pada level ${l}`,
-        belowLevel: undefined,
+        candidates: [],
+        skipped,
+        names: [],
+        reason: notes[0] ?? `tidak ada Brain aktif pada level ${l}`,
       };
     },
   };

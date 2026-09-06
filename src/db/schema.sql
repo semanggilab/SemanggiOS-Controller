@@ -411,16 +411,23 @@ CREATE TABLE IF NOT EXISTS project_role_levels (
 -- Tanpa brain_map, pilihan jatuh ke default grid, lalu kandidat pertama level
 -- — benar secara level, tetapi tidak bisa dikendalikan operator.
 --
+-- D68: satu sel memegang DAFTAR Brain terurut (failover peer), bukan satu.
+-- Baris = satu anggota pada posisi tertentu; `position` menentukan urutan
+-- coba saat dispatch (anggota pertama yang hidup menang, diturunkan ulang
+-- pada TIAP percobaan dispatch — tanpa penunjuk tersimpan yang bisa basi).
+--
 -- Kunci per LEVEL: halamannya grid (template × role × level) dan setiap sel
 -- adalah keputusan eksplisit operator untuk level itu. Brain yang
 -- klasifikasinya di bawah level sel tetap boleh dipaku — peringatannya
 -- (`belowLevel`) ikut di resolusi, bukan penolakan diam-diam.
 --
--- Baris hanya ada untuk sel grid yang sengaja dipaku. Kosong berarti "pakai
--- default grid (DEFAULT_BRAIN_MAP), lalu kandidat level", yang tetap jalan.
+-- Sel tanpa baris memakai default grid (DEFAULT_BRAIN_MAP, satu nama),
+-- lalu kandidat level — yang tetap berjalan.
 --
 -- ON DELETE tidak dipakai: penghapusan brain lewat endpoint yang membersihkan
--- pemakuannya secara eksplisit dan melaporkan sel mana yang kembali ke default
+-- pemakuannya secara eksplisit dan melaporkan sel mana yang kembali ke default.
+-- Posisi boleh berlobang setelah penghapusan: urutan dibaca ORDER BY position,
+-- dan penulisan ulang sel selalu menomori dari 0.
 -- (hapus diam-diam lewat FOREIGN KEY tidak memberi tahu operator apa yang
 -- berubah). Resolusi sendiri memperlakukan brain_id yang menunjuk Brain yang
 -- sudah tidak ada sama seperti yang dimatikan — "tidak dipaku", bukan gagal.
@@ -428,10 +435,11 @@ CREATE TABLE IF NOT EXISTS brain_map (
   template   TEXT NOT NULL,
   role       TEXT NOT NULL,
   level      TEXT NOT NULL CHECK (level IN ('low','normal','critical')),
+  position   INTEGER NOT NULL DEFAULT 0,
   brain_id   TEXT NOT NULL,
   actor      TEXT NOT NULL DEFAULT 'operator',
   updated_at INTEGER NOT NULL,
-  PRIMARY KEY (template, role, level)
+  PRIMARY KEY (template, role, level, position)
 );
 
 CREATE INDEX IF NOT EXISTS idx_brain_map_brain ON brain_map(brain_id);

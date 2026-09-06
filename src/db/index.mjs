@@ -253,6 +253,31 @@ class SqliteStore {
         CREATE INDEX IF NOT EXISTS idx_brain_map_brain ON brain_map(brain_id);
       `);
     }
+
+    // D68: sel brain_map memegang daftar Brain terurut (failover peer).
+    // Pemaku tunggal era sebelumnya menjadi list satu-anggota pada posisi 0 —
+    // semantik lama ("sel ini memakai Brain X") bertahan persis, hanya
+    // bentuknya yang mendapat sumbu urutan.
+    const brainMapCols2 = cols("brain_map");
+    if (brainMapCols2.length > 0 && !brainMapCols2.includes("position")) {
+      this.#db.exec(`
+        ALTER TABLE brain_map RENAME TO brain_map_legacy;
+        CREATE TABLE brain_map (
+          template   TEXT NOT NULL,
+          role       TEXT NOT NULL,
+          level      TEXT NOT NULL CHECK (level IN ('low','normal','critical')),
+          position   INTEGER NOT NULL DEFAULT 0,
+          brain_id   TEXT NOT NULL,
+          actor      TEXT NOT NULL DEFAULT 'operator',
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (template, role, level, position)
+        );
+        INSERT INTO brain_map (template, role, level, position, brain_id, actor, updated_at)
+          SELECT template, role, level, 0, brain_id, actor, updated_at FROM brain_map_legacy;
+        DROP TABLE brain_map_legacy;
+        CREATE INDEX IF NOT EXISTS idx_brain_map_brain ON brain_map(brain_id);
+      `);
+    }
   }
 
   async all(sql, params = []) {

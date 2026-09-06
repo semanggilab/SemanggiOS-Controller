@@ -2379,3 +2379,69 @@ memblokir penghapusan.
 **Test:** 467 → 469 (modelDeleteBlockers murni; DELETE ujung-ke-ujung:
 menghapus kedua sisi + event, menolak katalog/brain dengan alasan, 404,
 identity wajib).
+
+## D68 — Brain Map memegang daftar failover terurut; selection diturunkan per percobaan dispatch
+
+**Masalah.** Satu sel brain_map memaku SATU Brain — satu titik kegagalan:
+Brain itu habis kuota/UNAVAILABLE → task parkir padahal ada peer setara. Rencana
+operator (fase 2 mereka; dokumen lama menyebut fase 3) adalah daftar peer per
+sel dengan usul asli: penunjuk tersimpan per task ("sedang di anggota ke-i",
+i++ saat gagal, reset saat task baru/restart). Penunjuk yang bertahan membuat
+task lama menolak Brain yang sudah sembuh — fail-back tidak pernah terjadi
+tanpa aturan reset tambahan, dan tiap aturan reset adalah keadaan baru yang
+bisa basi.
+
+**Keputusan.**
+
+1. Skema: baris brain_map kini (template, role, level, **position**, brain_id),
+   PK + position. Migrasi membentuk ulang tabel; pemaku tunggal lama menjadi
+   list satu-anggota posisi 0 — semantik lama bertahan persis. Posisi boleh
+   berlobang setelah brains.delete (urutan dibaca ORDER BY position; penulisan
+   sel selalu menomori dari 0).
+2. `set()` menerima `brainIds[]` terurut (`brainId` skalar = list satu-anggota,
+   jalur lama). Ditolak saat disetel: anggota tak dikenal, anggota kembar,
+   dan daftar yang SELURUHNYA dimatikan (sel yang tidak pernah jalan — kelas
+   `config-only` D32; list satu-anggota yang mati kena aturan yang sama).
+   Anggota dimatikan DI TENGAH daftar diperbolehkan: itu keadaan hidup, bukan
+   konfigurasi — diskip saat resolve dengan alasan, tetap di `names`, dan
+   menang kembali begitu dihidupkan.
+3. Selection TIDAK disimpan sama sekali. `resolve()` mengembalikan
+   `candidates` (anggota hidup terurut) + `skipped` (alasan per anggota) +
+   `names` (urutan untuk preferred, termasuk yang dimatikan). Task membawa
+   `names` di `model_policy.preferred`; admission SUDAH berjalan melewati
+   preferred secara berurutan (D42) dan memilih penyintas pertama — evaluasi
+   ulang per percobaan dispatch memberi failover DAN fail-back gratis, dan
+   "reset saat task baru" menjadi korolari, bukan aturan tersendiri. Parkir
+   kuota memakai ETA terkecil lintas anggota (perilaku admission yang sudah
+   ada, kini menjangkau seluruh rantai sel). Dispatch log membawa
+   `preferredIndex` — "menang di posisi 2 dari 4" adalah cerita jujur saat
+   pilihan pertama tumbang.
+4. Lapisan resolusi tidak berubah urutannya: pemaku → default grid
+   (list satu-anggota) → pool level. Yang berubah: pool level kini menjadi
+   DAFTAR penuh (urut nama) — sel yang tak pernah disentuh operator pun punya
+   rantai failover, bukan satu nama. `routing.json` routes tetap hidup hanya
+   untuk task ber-kategori-tanpa-preferred (buatan API tangan); setelah
+   registerTasksFromDoc ikut membawa preferred (bawah), tidak ada lagi
+   permukaan Semanggi yang membuat task begitu.
+5. GET brain-map mengelompokkan baris jadi sel (`mappings[].brains[]` dengan
+   position/belowLevel/stale per anggota). PUT menerima `brainIds[]`;
+   `[]`/null melepas sel. UI: sel menampilkan daftar bernomor (chip per
+   anggota) dan modal editor dengan baris bernomor ↑/↓/× — bukan chip inline
+   dan bukan drag-and-drop: URUTAN adalah seluruh makna sel ini, jadi
+   kontrolnya harus membuat posisi terlihat dan disengaja. Project Role Level
+   modal menampilkan rantai sebagai "+N" (tooltip urutan penuh); langkah
+   rencana Control page juga.
+6. registerTasksFromDoc (pendaftaran dari docs/tasks.md) kini meresolusi
+   level + daftar Brain per role dengan aturan yang sama dengan dekomposisi —
+   task dokumen membawa rantai failover, bukan kategori routing yang menebak
+   lewat config.
+
+**Yang tidak berubah.** Aturan belowLevel (peringatan, bukan penolakan);
+default grid tidak menghidupkan Brain yang dimatikan; brains.delete tetap
+membersihkan keanggotaan; D67 delete gate kini membaca KEANGGOTAAN sel (query
+brain_id tak berubah, hanya kardinalitasnya).
+
+**Test:** 469 → 476 (daftar terurut tersimpan + names membawa seluruhnya;
+anggota dimatikan diskip dengan alasan + fail-back otomatis; seluruh daftar
+mati/kembar/tak dikenal ditolak; pool level jadi daftar penuh; PUT end-to-end
+terurut sampai ke preferred task; PUT kembar ditolak tanpa menyentuh sel).

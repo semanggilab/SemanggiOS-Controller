@@ -156,17 +156,25 @@ export function createAdmission({
   // makes the Settings → Brain page the real owner of routing (D35); the
   // routing.json catalog remains the fallback for names that are not brains
   // (e.g. an explicit model typed in Slack).
+  //
+  // D68: preferred is an ORDERED failover list (brain_map cell). The walk
+  // below already preserves order and takes the first survivor — that IS the
+  // per-dispatch-attempt selection: no stored pointer, free fail-back. Each
+  // candidate carries the index it held in the operator's list so dispatch
+  // logs can say "won position 2 of 4", which is the honest story when the
+  // first-choice brain was down.
   async function resolveModelCandidates(task) {
     const explicit = task.model_policy?.preferred;
     if (!brains || !Array.isArray(explicit) || explicit.length === 0) return policy.resolve(task);
 
     const candidates = [];
     const unmapped = [];
-    for (const name of explicit) {
+    for (const [index, name] of explicit.entries()) {
       const brain = await brains.get(name);
       if (brain?.enabled) {
         candidates.push({
           logical: brain.name,
+          preferredIndex: index,
           provider: brain.provider,
           model: brain.model,
           ...(brain.thinking ? { thinking: brain.thinking } : {}),
@@ -412,6 +420,9 @@ export function createAdmission({
         effortMode: plan.candidate.effortMode ?? "guaranteed",
         mode: plan.candidate.mode ?? "interactive",
         logical: plan.candidate.logical ?? null,
+        // D68: posisi dalam daftar failover operator saat ini terpilih —
+        // 0 berarti pilihan pertama; >0 berarti failover sedang bekerja.
+        preferredIndex: plan.candidate.preferredIndex ?? null,
         acpAgent: plan.candidate.acpAgent ?? null,
         sessionMode: task.session_policy,
         workspace: plan.workspacePath,

@@ -36,13 +36,15 @@ export async function createPrepareTask(controller, { projectId, text, actor = "
     (await controller.repos.projects.roleLevels.list(projectId)).map((r) => [r.role, r.level]),
   );
   const level = resolveLevel({ template, role: "analyst", profile, overrides, projectOverrides });
+  // D68: daftar terurut, bukan satu Brain — preferred membawa seluruhnya dan
+  // admission yang memilih anggota hidup pertama per percobaan dispatch.
   const pick = await controller.brainMap.resolve({
     template,
     role: "analyst",
     level,
     brains: controller.brains,
-    category: ROLE_CATEGORY.analyst,
   });
+  const brain = pick.candidates[0]?.brain ?? null;
 
   const worker = await controller.repos.workers.match({ projectId, role: "analyst" });
   if (!worker) {
@@ -53,7 +55,7 @@ export async function createPrepareTask(controller, { projectId, text, actor = "
         "daftarkan worker analyst dengan akses ke project tersebut lebih dulu.",
     };
   }
-  if (!pick.brain) {
+  if (!brain) {
     return {
       ok: false,
       reason: `Tidak ada Brain untuk analyst (${level}) — tetapkan di halaman Brain Map lebih dulu.`,
@@ -71,7 +73,7 @@ export async function createPrepareTask(controller, { projectId, text, actor = "
     modelPolicy: {
       category: ROLE_CATEGORY.analyst,
       class: level,
-      preferred: [pick.brain.name],
+      preferred: pick.names,
     },
   });
   await controller.repos.tasks.setStatus(task.id, Status.QUEUED, { actor });
@@ -80,8 +82,9 @@ export async function createPrepareTask(controller, { projectId, text, actor = "
     task: task.id,
     project: projectId,
     level,
-    brain: pick.brain.name,
+    brain: brain.name,
+    preferred: pick.names,
     by: actor,
   });
-  return { ok: true, task, level, brain: pick.brain };
+  return { ok: true, task, level, brain, preferred: pick.names };
 }

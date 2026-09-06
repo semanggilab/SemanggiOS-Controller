@@ -154,8 +154,13 @@ test("default grid Brain Map menengahi saat sel tidak dipaku, tapi tidak menghid
     brains: h.brains,
   });
   assert.equal(viaDefault.source, "default", "sel tanpa pemaku jatuh ke default grid");
-  assert.equal(viaDefault.brain.name, "glm-5-2-max");
-  assert.equal(viaDefault.belowLevel, true, "glm-5-2-max berkelas normal di sini — harus terlihat, bukan ditolak");
+  assert.equal(viaDefault.candidates[0].brain.name, "glm-5-2-max");
+  assert.equal(
+    viaDefault.candidates[0].belowLevel,
+    true,
+    "glm-5-2-max berkelas normal di sini — harus terlihat, bukan ditolak",
+  );
+  assert.deepEqual(viaDefault.names, ["glm-5-2-max"], "default grid adalah list satu-anggota");
 
   await h.brains.update(seeded.id, { enabled: false });
   const afterDisable = await h.brainMap.resolve({

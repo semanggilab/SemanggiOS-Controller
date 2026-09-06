@@ -1994,6 +1994,41 @@ tetap tertahan billing 402 (lihat readiness) — jendela ini menunggu
 kreditnya terisi, bukan sebaliknya.
 
 
+## D61 — Test Brain harus mengatakan MENGAPA run gagal: error agent.wait bentuk string ikut dibaca
+
+**Temuan (2026-09-06, halaman /settings Brain).** Tiga Brain gagal test
+dengan dua penyakit berbeda yang tampak sama di UI:
+
+- `qwen-high`/`qwen-medium` — armada TIDAK punya agen bermodel
+  `groq/qwen/qwen3.6-27b` (agents.list: hanya `main`, `sdmk-kader-*`,
+  probe cerebras). Pesan "Connection test needs an existing agent
+  bound…" itu JUJUR; tidak ada yang bisa diuji tanpa agen. Agen probe
+  `sem-workspaces-probe-groq-groq-qwen-qwen3-6-27b` lalu diprovision di
+  `workspaces/probe/groq` memakai `scripts/provision-agents.mjs`
+  (identitas controller membawa operator.admin sejak 2026-08-21).
+- `cerebras-qwen-3-8-27b` — dispatch DITERIMA lalu run ditolak:
+  `Thinking level "high" is not supported for cerebras/qwen-3.8-27b.
+  Use one of: off.` Agen probe cerebras kini hanya mengiklankan
+  `["off"]` — kosakata off…high yang tercatat di readiness adalah hasil
+  probe sebelum agen itu berubah. Test-nya benar gagal; yang salah adalah
+  pesannya.
+
+**Bug yang diperbaiki:** `agent.wait` menyampaikan penolakan run dalam
+dua bentuk — string polos (terukur: kasus cerebras di atas) atau objek
+`{message}`. `testAgent` hanya membaca bentuk objek, sehingga setiap
+penolakan bentuk string terdegradasi jadi "run did not complete
+normally" dan operator kehilangan satu-satunya kalimat yang menjelaskan
+penyebabnya: penolakan level thinking terbaca seperti outage. Kini kedua
+bentuk dibaca.
+
+**Batas yang tetap:** Test mengirim level thinking hanya untuk Brain
+`guaranteed` — itulah jalur yang dipakai dispatch nyata (D31); untuk
+`preference` level tidak pernah dikirim, jadi mengujinya berarti
+mengukur jalur yang tidak pernah dipakai. Karakterisasi level lintas
+kandidat tetap pekerjaan tombol Probe terpisah. Cerebras juga tetap
+tertahan billing 402 — perbaikan pesan tidak mengubah dindingnya.
+
+
 ## Open questions for phase 4+
 
 1. ~~**Approval bridge for ACP tasks.**~~ **Resolved.** The interposer ships in gateway image `2026081905` and the controller exposes the endpoints it calls (`POST /api/work/approvals`, `GET /api/work/approvals/{id}`). Remaining gap, inherited from POC-3: Claude Code does not raise a permission request for `Bash`, so shell commands are not yet gated. The lever is a `settings.json` in the harness `$HOME`; until that lands, L2/L3 shell classification is dead code.

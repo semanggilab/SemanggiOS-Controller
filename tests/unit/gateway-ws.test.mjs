@@ -264,13 +264,19 @@ test("a refusal arriving after the accept is surfaced with the execution id", as
 // cannot distinguish "accepted" from "ran to completion" is worse than no
 // test — it manufactures confidence.
 
-function brainTestFactory(waitStatus) {
+function brainTestFactory(waitStatusOrPayload) {
   return fakeSocketFactory({
     // Advertise agent.wait like the pinned gateway does, or testAgent skips
     // the wait and the scenario never runs.
     methods: ["agent.run", "connect", "agents.list", "agent.wait"],
     onRequest: (frame) => {
-      if (frame.method === "agent.wait") return { ok: true, payload: { status: waitStatus } };
+      if (frame.method === "agent.wait") {
+        // A bare status string builds {status}; anything else (an error
+        // payload in either wire shape) passes through as-is.
+        const payload =
+          typeof waitStatusOrPayload === "string" ? { status: waitStatusOrPayload } : waitStatusOrPayload;
+        return { ok: true, payload };
+      }
       if (frame.method === "agent.run") return { ok: true, payload: { runId: "run-1" } };
       return { ok: true, payload: {} };
     },
@@ -292,6 +298,35 @@ test("testAgent reports a run refused at start as a failure, with the reason", a
   const res = await rt.testAgent({ agentId: "a1", thinking: "max" });
   assert.equal(res.ok, false, "an accepted-but-refused run must not read as OK");
   assert.match(res.error, /did not complete normally/);
+  await rt.close();
+});
+
+// Measured live on cerebras: agent.wait answers refused runs with the error
+// as a PLAIN STRING, not {message}. The old extraction read only the object
+// shape, so the Settings page showed "run did not complete normally" while
+// the one useful sentence — the thinking-level rejection — sat unread in raw.
+test("testAgent surfaces a string-shaped wait refusal, e.g. a thinking-level rejection", async () => {
+  const { FakeWS } = brainTestFactory({
+    status: "error",
+    error: 'Error: Thinking level "high" is not supported for cerebras/qwen-3.8-27b. Use one of: off.',
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const res = await rt.testAgent({ agentId: "a1", thinking: "high" });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /did not complete normally/);
+  assert.match(res.error, /Thinking level "high" is not supported/);
+  await rt.close();
+});
+
+test("testAgent keeps surfacing object-shaped wait refusals too", async () => {
+  const { FakeWS } = brainTestFactory({
+    status: "error",
+    error: { code: "PROVIDER_ERROR", message: "HTTP 402 payment required" },
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const res = await rt.testAgent({ agentId: "a1" });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /HTTP 402 payment required/);
   await rt.close();
 });
 

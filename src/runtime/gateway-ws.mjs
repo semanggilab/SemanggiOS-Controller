@@ -696,12 +696,21 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
         if (COMPLETED_STATUSES.has(status)) {
           return { ok: true, status, latencyMs, raw: waited };
         }
+        // The refusal detail arrives in two shapes on the wire: a plain string
+        // (measured: cerebras run refused with 'Thinking level "high" is not
+        // supported … Use one of: off.') or an object with .message. Reading
+        // only the object shape made every string refusal degrade to the
+        // generic "run did not complete normally" — the operator lost the one
+        // sentence that said WHY, and a thinking-level rejection read like an
+        // outage.
+        const waitDetail =
+          typeof waited?.error === "string" ? waited.error : waited?.error?.message ?? null;
         const error =
           status === "timeout"
             ? `run did not finish within ${timeoutMs}ms — treated as unusable (possible hang)`
             : status === "unsupported"
               ? "this gateway does not support agent.wait — the run was dispatched but its completion could not be confirmed"
-              : `run did not complete normally (status: ${status})${waited?.error?.message ? ` — ${waited.error.message}` : ""}`;
+              : `run did not complete normally (status: ${status})${waitDetail ? ` — ${waitDetail}` : ""}`;
         return { ok: false, status, latencyMs, error, raw: waited };
       } catch (err) {
         return {

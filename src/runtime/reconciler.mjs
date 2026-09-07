@@ -31,6 +31,7 @@
 //     operator reads the recorded evidence.
 import { Status, ExecutionStatus } from "../domain/state-machine.mjs";
 import { EventKind } from "../domain/events.mjs";
+import { applyRuntimeFailure } from "../domain/retry.mjs";
 
 // Exported because the settle API endpoint answers the same question the
 // reconciler does — "this execution is final, so where does the task stand?"
@@ -53,6 +54,11 @@ export function createReconciler({
   // The session-event sink's applyDescribe(execution, session) — the single
   // owner of the describe→COMPLETE mapping, shared with nothing.
   applyDescribe = null,
+  // D75: the shared runtime-failure verdict — describe saying failed/killed/
+  // timeout under a still-DISPATCHED task recovers it NOW instead of waiting
+  // for the watchdog's 30-minute silence (the fast path TASK-4CA0D674 never
+  // had: it sat DISPATCHED dead for 30 minutes before anyone looked).
+  applyFailure = null,
   config = {},
   now = () => Date.now(),
   log = { info() {}, warn() {}, error() {} },
@@ -106,7 +112,7 @@ export function createReconciler({
    * one describe per piece of possibly-live work — not per task in the DB.
    */
   async function reconcileOnce() {
-    const outcome = { settled: [], alive: [], stragglers: [], unknown: [] };
+    const outcome = { settled: [], alive: [], stragglers: [], recovered: [], unknown: [] };
     const describeSession = typeof applyDescribe === "function" ? applyDescribe : null;
 
     for (const status of [Status.DISPATCHED, Status.RUNNING, Status.WAIT_HUMAN, Status.BLOCKED]) {
@@ -147,9 +153,28 @@ export function createReconciler({
             continue;
           }
         }
-        // killed/failed/timeout: evidence only. A DISPATCHED task here will
-        // be parked by the watchdog's own describe+abort confirmation with a
-        // truthful reason; a BLOCKED one is already where a human decides.
+
+        // D75: gateway terminal evidence under a task still claiming to be
+        // live is a dead run discovered EARLY — apply the shared retry verdict
+        // now (requeue with backoff, budget-bounded) rather than letting the
+        // task sit DISPATCHED-dead for the watchdog's 30-minute silence.
+        // BLOCKED tasks are deliberately untouched: condemned rows are a
+        // human's decision (D72), and BLOCKED → QUEUED has no legal edge.
+        if (
+          ["failed", "killed", "timeout"].includes(session.status) &&
+          typeof applyFailure === "function" &&
+          [Status.DISPATCHED, Status.RUNNING].includes(status)
+        ) {
+          const result = await applyFailure(execution, task, session);
+          outcome.recovered.push({
+            executionId: execution.id,
+            sessionStatus: session.status,
+            recovery: result ?? "noop",
+          });
+          continue;
+        }
+        // Other terminal statuses under BLOCKED: evidence for the operator —
+        // the reconciler rescues, humans condemn.
       }
     }
 

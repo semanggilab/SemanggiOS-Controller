@@ -10,6 +10,8 @@ import { createGatewayRuntime } from "./runtime/gateway-ws.mjs";
 import { createAgentOSRuntime } from "./runtime/agentos.mjs";
 import { createReconciler } from "./runtime/reconciler.mjs";
 import { createSessionEventSink } from "./runtime/session-events.mjs";
+import { applyRuntimeFailure } from "./domain/retry.mjs";
+import { cleanUploads } from "./domain/workspace-files.mjs";
 import { createSlackSurface } from "./interface/slack.mjs";
 import { createSlackApp } from "./interface/slack-app.mjs";
 import { WakeReason } from "./scheduler/scheduler.mjs";
@@ -86,6 +88,12 @@ async function main() {
       maxRunning: Number(process.env.SEMANGGI_MAX_RUNNING ?? 8),
       leaseTtlMs: Number(process.env.SEMANGGI_LEASE_TTL_MS ?? 15 * 60 * 1000),
       watchdogMs: Number(process.env.SEMANGGI_WATCHDOG_MS ?? 30_000),
+      // D75: anggaran auto-retry run yang mati abnormal (domain/retry.mjs) —
+      // satu anggaran untuk watchdog, sink, dan reconciler.
+      runtimeRetryLimit: Number(process.env.SEMANGGI_RUNTIME_RETRY_LIMIT ?? 2),
+      runtimeRetryWindowMs: Number(process.env.SEMANGGI_RUNTIME_RETRY_WINDOW_MS ?? 6 * 60 * 60 * 1000),
+      runtimeRetryBaseMs: Number(process.env.SEMANGGI_RUNTIME_RETRY_BASE_MS ?? 30_000),
+      runtimeRetryMaxMs: Number(process.env.SEMANGGI_RUNTIME_RETRY_MAX_MS ?? 15 * 60 * 1000),
     },
   });
 
@@ -116,6 +124,8 @@ async function main() {
     // D51: the late-error quota branch reads each model's reset schedule
     // from the brains table to decide wait-one-window vs block.
     brains: controller.brains,
+    // D75: shared retry budget with the watchdog and the reconciler.
+    config: controller.config,
     log: log.child({ component: "session-events" }),
   });
 
@@ -130,6 +140,18 @@ async function main() {
     events: controller.events,
     runtime,
     applyDescribe: (execution, session) => sessionEvents.applyDescribe(execution, session),
+    // D75: the fast recovery path — describe terminal under a still-live
+    // claim requeues NOW, not after the watchdog's 30-minute silence.
+    applyFailure: async (execution, task, session) =>
+      applyRuntimeFailure(
+        { repos: controller.repos, events: controller.events, config: controller.config, log, now: controller.now },
+        {
+          task,
+          execution,
+          cause: `gateway session: ${session?.status ?? "unknown"}`,
+          source: "reconciler",
+        },
+      ),
     config: { blockedScanWindowMs: Number(process.env.SEMANGGI_BLOCKED_SCAN_MS ?? 24 * 60 * 60 * 1000) },
     log: log.child({ component: "reconciler" }),
   });
@@ -196,7 +218,7 @@ async function main() {
     void (async () => {
       try {
         const out = await reconciler.reconcileOnce();
-        if (out.settled.length > 0 || out.stragglers.length > 0) {
+        if (out.settled.length > 0 || out.stragglers.length > 0 || out.recovered.length > 0) {
           await controller.scheduler.notify(WakeReason.TASK_FINISHED);
         }
       } catch (err) {
@@ -205,6 +227,28 @@ async function main() {
     })();
   }, Number(process.env.SEMANGGI_RECONCILE_MS ?? 20_000));
   reconcileTimer.unref?.();
+
+  // D76: penyapu lampiran. Agen diinstruksikan menghapus tmp/uploads/ segera
+  // setelah memuatnya, tapi instruksi bukan jaminan — TTL inilah yang
+  // deterministik. Satu jam sekali cukup: TTL-nya 24 jam, beberapa menit
+  // kelebihan umur tidak mengubah apa pun.
+  const uploadTtlMs = Number(process.env.SEMANGGI_UPLOAD_TTL_MS ?? 24 * 60 * 60 * 1000);
+  const uploadSweep = async () => {
+    try {
+      for (const project of await controller.repos.projects.list()) {
+        if (!project.workspace_path) continue;
+        const removed = await cleanUploads(project.workspace_path, uploadTtlMs);
+        if (removed.length > 0) {
+          log.info("uploads.swept", { project: project.id, removed: removed.length, paths: removed.slice(0, 5) });
+        }
+      }
+    } catch (err) {
+      console.error(`upload sweep failed: ${err.message}`);
+    }
+  };
+  const uploadTimer = setInterval(() => void uploadSweep(), 60 * 60 * 1000);
+  uploadTimer.unref?.();
+  void uploadSweep();
 
   const shutdown = () => {
     clearInterval(reconcileTimer);

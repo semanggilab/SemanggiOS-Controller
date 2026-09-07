@@ -10,6 +10,7 @@
 // to guarantee a single dispatcher.
 import { ExecutionStatus, Status } from "../domain/state-machine.mjs";
 import { nullLogger } from "../domain/logger.mjs";
+import { applyRuntimeFailure } from "../domain/retry.mjs";
 
 export const WakeReason = Object.freeze({
   TASK_CREATED: "task.created",
@@ -22,7 +23,7 @@ export const WakeReason = Object.freeze({
   MANUAL: "manual",
 });
 
-export function createScheduler({ admission, repos, config = {}, now = () => Date.now() }) {
+export function createScheduler({ admission, repos, events = null, config = {}, now = () => Date.now() }) {
   const watchdogMs = config.watchdogMs ?? 30_000;
   // How long a dispatched execution may stay quiet before it is reclaimed
   // (D20). Deliberately generous: a long reasoning turn is normal, and
@@ -194,22 +195,21 @@ export function createScheduler({ admission, repos, config = {}, now = () => Dat
         const detail =
           `no runtime event for ${Math.round(quietForMs / 1000)}s` +
           ` (${gatewayVerdict}${stopConfirmed === "unverified" ? "not verified" : stopConfirmed})`;
-        await repos.executions.setStatus(execution.id, ExecutionStatus.BLOCKED, { result: detail });
-        if (task) {
-          await repos.tasks.setStatus(task.id, Status.BLOCKED, { reason: detail, actor: "dispatch-watchdog" });
-          if (task.workspace_path) {
-            const lease = await repos.leases.get(task.workspace_path);
-            if (lease?.execution_id === execution.id) {
-              await repos.leases.release(task.workspace_path, { executionId: execution.id, actor: "dispatch-watchdog" });
-            }
-          }
-        }
+        // D75: a confirmed-dead run is transient failure, not a verdict on the
+        // work — requeue with backoff instead of parking BLOCKED for a human.
+        // The budget lives in retry.mjs; when it runs out, THAT is the point
+        // where a human is genuinely needed and BLOCKED is where the task goes.
+        const outcome = await applyRuntimeFailure(
+          { repos, events, config, log, now },
+          { task, execution, cause: detail, source: "dispatch-watchdog" },
+        );
         log.warn("dispatch.timeout", {
           task: task?.id ?? null, exec: execution.id,
           provider: execution.model_provider, model: execution.model_id,
           silentForMs: quietForMs,
           workspace: task?.workspace_path ?? null,
           stopConfirmed,
+          recovery: outcome,
         });
         reclaimed.push(execution.id);
       } catch (err) {

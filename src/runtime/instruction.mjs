@@ -42,6 +42,16 @@ function effortLine(brain) {
  */
 export const deliverablesDirFor = (taskId) => `deliverables/${taskId}`;
 
+/** Rujukan tmp/uploads/ yang disebut sebuah instruksi task (D76). */
+export function extractUploadRefs(text) {
+  const out = [];
+  for (const m of String(text ?? "").matchAll(/tmp\/uploads\/[A-Za-z0-9._\-/]+/g)) {
+    const ref = m[0].replace(/[.,;:)]+$/, "");
+    if (!out.includes(ref)) out.push(ref);
+  }
+  return out;
+}
+
 /**
  * Baris pembuka preamble — penanda stabil bahwa sebuah pesan dibungkus oleh
  * controller. Dipakai transkrip untuk menyaring gema `user` dari dispatch
@@ -75,6 +85,17 @@ export function buildPreamble({ task, brain = null, role = null, workspacePath =
   }
 
   lines.push(`Tulis hasil ke: ${deliverablesDirFor(task.id)}/`);
+
+  // Lampiran operator (D76): hidupnya menit, bukan permanen. Instruksi
+  // eksplisit menghapus SEGERA setelah dimuat — satu-satunya tempat agen bisa
+  // tahu bahwa berkas ini beda kontrak dengan docs/ — dan penyapu TTL di
+  // main.mjs menutup celah bila instruksi tidak dijalankan.
+  const uploadRefs = extractUploadRefs(task.description);
+  if (uploadRefs.length > 0) {
+    lines.push(
+      `Lampiran sementara (HAPUS segera setelah selesai dibaca/dimuat — itu bukan bagian workspace): ${uploadRefs.join(", ")}.`,
+    );
+  }
 
   // Mode lease menentukan apakah repo boleh disentuh. Ini satu-satunya tempat
   // agen bisa mengetahuinya — lease adalah pembukuan controller, tidak terlihat

@@ -89,6 +89,9 @@ export async function createController({
   const scheduler = createScheduler({
     admission,
     repos,
+    // D75: the watchdog's dead-run verdict writes an audit event, same as the
+    // sink and reconciler paths — one budget, one trail.
+    events,
     config: { log: log.child({ component: "scheduler" }), gatewayHooks, ...config },
     now,
   });

@@ -2566,38 +2566,30 @@ Seluruh keputusan itu tinggal di SATU fungsi (`resolveWorkspaceFile`) yang punya
 
 **Test:** 494 → 508 (deliverable path di balasan+files+instruksi, larangan `docs/review.md`, vonis gateway dalam alasan parkir).
 
-## D75 — Dua kegagalan `pnpm test` adalah baseline, dan koreksi terhadap D70
+## D75 — Auto-recovery run yang mati abnormal: requeue beranggaran, BLOCKED hanya saat anggaran habis
 
-Dua butir terbuka POC-7 ditutup dengan pengukuran; salah satunya membatalkan klaim D70 sendiri.
+**Permintaan operator, dan diagnosis yang mendukungnya:** run yang mati di gateway (TASK-4CA0D674: proyeksi sesi `failed`, "The agent run failed before producing a reply") adalah kondisi transien — bug internal, crash, kill dari luar — yang menurutnya layak ditangani controller sendiri, bukan diparkir BLOCKED menunggu manusia menekan "continue". Dua tahun kebiasaan lama: setiap kematian run (watchdog D20, end event dengan stopReason buruk, bahkan kematian yang dikonfirmasi describe) berakhir di BLOCKED; mesin backoff-antrian hanya hidup untuk kegagalan ADMISSION (D51/D52), tidak pernah untuk kegagalan RUNTIME.
 
-### Suite tes hulu: 1061/1063, dan angka 2 itu sinyal
+**Keputusan:** satu vonis bersama di `domain/retry.mjs` (`applyRuntimeFailure`), dipakai tiga permukaan penemu kematian supaya tidak bisa berselisih pendapat:
 
-`pnpm test` di pohon fork (container sekali-pakai, heap 3072 MB) menghasilkan `tests 1063, pass 1061, fail 2`. Kedua kegagalan ada di `tests/openclaw-boundary-safety.test.ts` dan berupa asersi teks pada berkas sumber — persis dua berkas yang `apply.sh` memang ubah:
+- **watchdog** (diam 30 menit + describe/abort mengonfirmasi mati),
+- **sink** (end event live dengan stopReason selain stop/end_turn),
+- **reconciler** (describe `failed`/`killed`/`timeout` di bawah task yang masih mengaku DISPATCHED/RUNNING — **jalur cepat**: pemulihan terjadi dalam pass 20 detik, bukan menunggu diam 30 menit; TASK-4CA0D674 duduk mati 30 menit karena jalur ini belum ada).
 
-- `sidebar exposes config-driven mission and admin navigation routes` → `/type SidebarSection = "overview" \| "operations" \| "system";/`, digagalkan oleh sisipan `"semanggi"` dari `patch_sidebar`.
-- `settings control center exposes hash navigation for subpages` → `/const settingsSectionGroups = \["Core", "OpenClaw", "Workspace", "System"\] as const;/`, digagalkan oleh sisipan `"Semanggi"` dari `patch_settings`.
+Vonis: eksekusi FAILED (kebenaran tentang PERCOBAAN itu), task → **QUEUED** lewat tepi baru `DISPATCHED/RUNNING → QUEUED` yang mensyaratkan `reason:"auto-retry"` (marker audit; assertTransition menolak tanpa itu) + backoff jadwal yang sama dengan admission (30 dtk → 15 mnt). Re-dispatch berikutnya otomatis memilih anggota rantai failover yang hidup (D68) — "realokasi gateway" yang diminta. Tepi state machine, bukan revisi: revisi adalah keputusan manusia dengan konteks; ini pemundtahan mekanis atas percobaan yang sama.
 
-Keduanya adalah pernyataan hulu bahwa navigasinya **persis** milik hulu; fork mana pun yang menambah satu section menggagalkannya. **Keputusan: biarkan gagal, dan jadikan angkanya baseline.** `pnpm test` pada fork MUST menghasilkan tepat dua kegagalan dengan tepat dua nama itu — tiga berarti ada yang lain rusak.
+**Anggaran (anti-loop):** `SEMANGGI_RUNTIME_RETRY_LIMIT` (default 2) requeue per task dalam jendela `SEMANGGI_RUNTIME_RETRY_WINDOW_MS` — dihitung dari `recentFailures`, penghitung windowed yang sama dengan backoff admission. Habis anggaran → BLOCKED dengan alasan menyebut rentetan kematian; di situlah manusia memang dibutuhkan. **Jendela default 6 jam, bukan 1** — tes anggaran menemukannya: satu siklus kematian = 30 menit diam + backoff, tiga kematian sudah >90 menit; jendela 1 jam melupakan kegagalan pertama sebelum ketiga terjadi dan anggaran tak pernah terpicu (cacat desain yang lolos review, ditangkap tes).
 
-**Alternatif yang ditolak:** menambal kedua regex lewat `apply.sh`. Itu menambah dua jangkar pada berkas **tes** hulu — permukaan rebase baru yang harus dijaga selamanya — demi menyembunyikan sinyal yang justru berguna. Menyembunyikan kegagalan yang bisa dijelaskan lebih mahal daripada menjelaskannya sekali di sini.
+**Yang TETAP di luar auto-retry, sadar:** abort operator (CANCELLED — vonis, bukan kegagalan), penolakan definitif provider 401/402/413-struktural (deterministik; D51/D52), dan task yang sudah BLOCKED (baris terkutuk milik manusia, D72; BLOCKED → QUEUED tanpa revisi tetap ilegal). `killed` DI-retry dengan anggaran yang sama — permintaan eksplisit operator ("service dipaksa mati dari luar"); risiko restart-vs-inten-operator dimitigasi oleh fakta bahwa jalur stop controller sendiri memparkir task saat itu juga (watchdog tidak pernah melihatnya).
 
-### Koreksi D70: celah scope tidak menyentuh gerbang izin ACP
+**Tes:** 508 → 515 (requeue + backoff + lease lepas; anggaran habis → BLOCKED; abort tetap CANCELLED; end buruk → requeue; jalur cepat reconciler; jendela 6 jam).
 
-D70 menulis bahwa hilangnya `operator.approvals`/`operator.questions` "bersinggungan dengan §6.2 butir 1" (gerbang izin ACP). **Itu salah.** Diperiksa ke sumber:
+## D76 — Lampiran operator: tmp/uploads/, dihapus setelah dimuat, dijamin jam
 
-- Tidak ada satu pun route AgentOS yang memakai `exec.approval.resolve` atau `question.resolve` di preflight.
-- Controller tidak pernah memanggil keduanya (`grep` di `src/` kosong); approval Semanggi hidup di tabel controller sendiri (`WAIT_HUMAN` + API approval).
-- `docs/permission-bridge-design.md` **sudah menolak** jalur exec-approval gateway sejak awal: pencarian `exec.approval` di dist `@openclaw/acpx` mengembalikan nol kecocokan, dan opsi yang dipilih adalah interposer ACP (opsi C) — yang tidak pernah menyentuh mekanisme itu.
+**Alur:** tombol paperclip di composer → unggah multi-berkas (berurutan, laporan per berkas) → `POST /work/projects/{id}/uploads?name=` dengan **bytes mentah** (octet-stream) → disimpan ke `<workspace>/tmp/uploads/<basename-tersuci>` (batas 8 MB, nama dilucuti path) → rujukan `@tmp/uploads/<nama>` disisipkan ke composer → agen membacanya di sandbox-nya.
 
-Jadi gerbang izin ACP **tidak** bergantung pada scope tersebut, dan menambahkannya tidak akan memajukan §6.2 butir 1 satu langkah pun.
+**Penghapusan "segera setelah dibaca" dua lapis:** (1) preamble dispatch (buildPreamble) menginstruksikan agen menghapus berkas yang dirujuk instruksinya segera setelah selesai dibaca/dimuat — satu-satunya tempat agen bisa tahu bahwa berkas ini beda kontrak dengan docs/; (2) penyapu TTL di main.mjs (tiap jam, `SEMANGGI_UPLOAD_TTL_MS` default 24 jam) menghapus sisa apa pun — instruksi bukan jaminan, jam yang deterministik.
 
-**Yang benar-benar terpengaruh hanya `operator.pairing`**, yang menggerbangi `device.pair.list` dan `device.pair.approve` (`app/api/runtime/issues`, `app/api/settings/gateway`). Scope yang benar-benar dipegang, dibaca dari gateway: `gateway-client` → `operator.write, operator.admin`; `cli` → `operator.admin`.
+**Batas yang disengaja:** tmp/uploads adalah akar BACA tambahan (viewer + rujukan /doc bisa membukanya) tetapi TIDAK masuk listing "@" — listing itu untuk dokumen proyek yang permanen; lampiran hidupnya menit. Dispatcher controller menyimpan body unggahan sebagai `__raw` Buffer sebelum utf8-decode bisa merusaknya; proxy AgentOS meneruskan arrayBuffer + content-type octet-stream apa adanya ( jalur JSON tidak berubah). Nama sama menimpa — lampiran bersifat sekali-pakai, versioning bukan kontraknya. Rujukan upload di /doc kini lolos resolusi (akar baca), mengalir ke instruksi seperti berkas lain.
 
-Dampaknya sempit dan terpisah antara yang terukur dan yang diturunkan:
-
-- **Terukur:** membaca daftar device tetap jalan — `POST /api/runtime/issues {action:"reviewDevices"}` menjawab **200**, karena ia `securityClass: "read"`, identitasnya jatuh ke `unknown` (bukan `denied`), dan isinya datang dari fallback CLI.
-- **Diturunkan, belum diukur:** `device.pair.approve` adalah mutasi ber-scope yang tidak dipegang, jadi ia SHOULD ditolak. Tidak diuji: menyetujui pairing adalah aksi kepercayaan, dan `pending: 0` — tidak ada yang bisa disetujui tanpa lebih dulu membuat device baru.
-
-**Keputusan: jangan tambahkan scope tanpa jalur yang memakainya.** Satu-satunya kemampuan yang hilang adalah menyetujui pairing device baru **dari dalam UI AgentOS**; `openclaw devices approve` di host tetap ada dan tidak lewat preflight. Bila operator memang menginginkannya, tambahkan `operator.pairing` **saja** — prosedurnya di `semanggi-poc7-agentos-077-upgrade-development-spec.md` §11.3. Scope yang diberikan "untuk jaga-jaga" adalah kepercayaan yang diberikan tanpa alasan.
-
-**Pelajaran yang sama untuk ketiga kalinya (D34, D38, D41, dan sekarang ini):** kontrak hulu MUST diverifikasi dengan menelusuri pemakainya, bukan dari tabel deklarasinya. Tabel `OPENCLAW_STATIC_METHOD_SCOPES` menyebut scope untuk metode yang, ternyata, tidak dipanggil siapa pun di pohon ini.
+**Tes:** dalam 515 (bytes biner utuh end-to-end melalui HTTP; sanitasi nama traversal→basename; tolak kosong/oversize; baca oke + tidak muncul di listing; janitor hanya yang lewat TTL; preamble memerintahkan penghapusan hanya bila ada rujukan).

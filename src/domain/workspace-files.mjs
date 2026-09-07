@@ -21,7 +21,7 @@
 // tulis hanya untuk `.md`. Yang dijaga tetap sama — tidak ada permintaan yang
 // bisa menunjuk ke luar workspace project.
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
 /** Akar yang boleh dijelajah. Konstanta; tidak pernah datang dari request. */
@@ -58,8 +58,12 @@ export function resolveWorkspaceFile(workspacePath, requested) {
   if (raw.startsWith("/")) return { ok: false, reason: "path harus relatif terhadap workspace project" };
 
   const root = raw.split("/")[0];
-  if (!FILE_ROOTS.includes(root)) {
-    return { ok: false, reason: `hanya ${FILE_ROOTS.map((d) => `${d}/`).join(", ")} yang bisa dibuka` };
+  // tmp/uploads adalah akar BACA tambahan (D76): lampiran chat bisa dibuka di
+  // viewer dan dirujuk /doc, tetapi TIDAK masuk pencarian "@" — listing itu
+  // untuk dokumen proyek yang permanen, dan lampiran hidupnya menit.
+  const isUpload = raw === UPLOAD_DIR || raw.startsWith(`${UPLOAD_DIR}/`);
+  if (!FILE_ROOTS.includes(root) && !isUpload) {
+    return { ok: false, reason: `hanya ${FILE_ROOTS.map((d) => `${d}/`).join(", ")} dan ${UPLOAD_DIR}/ yang bisa dibuka` };
   }
 
   const base = resolve(workspacePath);
@@ -147,4 +151,73 @@ export async function readWorkspaceFile(absolute) {
     return { binary: true, content: null, size: buffer.length };
   }
   return { binary: false, content: buffer.toString("utf8"), size: buffer.length };
+}
+
+// --- unggahan operator (D76) --------------------------------------------------
+//
+// Lampiran chat HIDUP di workspace hanya sampai task yang membacanya selesai
+// memuatnya. Direktori khusus tmp/uploads — bukan docs/ atau deliverables/ —
+// supaya dua kontrak yang sudah ada tidak berubah: listing "@" hanya menunjuk
+// dokumen proyek yang permanen, dan agen tidak mengira lampiran itu bagian
+// dari workspace yang boleh dirujuk lusa.
+
+/** Batas ukuran per berkas. Cukup untuk PDF/laporan; jauh di bawah apa yang
+ *  bisa dipakai untuk mengisi NFS dengan sebuah kotak chat. */
+export const UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
+
+export const UPLOAD_DIR = "tmp/uploads";
+
+/**
+ * Menulis satu unggahan. Nama disucikan menjadi BASENAME polos: operator
+ * tidak pernah punya alasan meletakkan path di nama berkas, dan mengizinkan
+ * "/" atau ".." di sana adalah menulis ke mana saja di workspace.
+ *
+ * @returns {{ok: true, path: string, size: number} | {ok: false, reason: string}}
+ */
+export async function saveUpload(workspacePath, requestedName, bytes) {
+  const name = String(requestedName ?? "")
+    .split(/[\\/]/)
+    .pop()
+    .replace(/[\u0000-\u001f]/g, "")
+    .trim();
+  if (!name || name === "." || name === "..") return { ok: false, reason: "nama berkas kosong atau tidak sah" };
+  if (!Buffer.isBuffer(bytes) || bytes.length === 0) return { ok: false, reason: "berkas kosong" };
+  if (bytes.length > UPLOAD_MAX_BYTES) {
+    return { ok: false, reason: `berkas ${Math.round(bytes.length / 1024)}KB melebihi batas ${UPLOAD_MAX_BYTES / 1024 / 1024}MB` };
+  }
+  const dir = resolve(workspacePath, UPLOAD_DIR);
+  await mkdir(dir, { recursive: true });
+  const target = resolve(dir, name);
+  await writeFile(target, bytes);
+  return { ok: true, path: `${UPLOAD_DIR}/${name}`, size: bytes.length };
+}
+
+/**
+ * Penyapu kedaluwarsa — pengaman kalau agen lupa menghapus setelah memuat
+ * (instruksinya eksplisit, tapi "instruksi" bukan jaminan; deterministik yang
+ * sejati adalah jam). Mengembalikan daftar path yang dihapus untuk diaudit.
+ */
+export async function cleanUploads(workspacePath, ttlMs, now = () => Date.now()) {
+  const dir = resolve(workspacePath, UPLOAD_DIR);
+  let entries;
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const removed = [];
+  for (const entry of entries) {
+    const target = resolve(dir, entry);
+    try {
+      const info = await stat(target);
+      if (!info.isFile()) continue;
+      if (now() - info.mtimeMs > ttlMs) {
+        await rm(target);
+        removed.push(`${UPLOAD_DIR}/${entry}`);
+      }
+    } catch {
+      // Hilang di antara readdir dan stat — sudah tidak ada, selesai.
+    }
+  }
+  return removed;
 }

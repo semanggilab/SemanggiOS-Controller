@@ -687,3 +687,42 @@ test("applyDescribe ignores everything but positive 'done' evidence", async () =
   assert.equal((await sink.applyDescribe(execution, { status: "done" })).handled, false);
   assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE);
 });
+
+// ── D75: abnormal run end = auto-retry, bukan parkir ────────────────────────
+
+test("a run that ends badly requeues the task with backoff (D75)", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "died mid-run" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sink = await sinkFor(h);
+
+  await sink.handle("agent", {
+    runId: execution.id, stream: "lifecycle", sessionKey: "k",
+    data: { phase: "end", stopReason: "error", startedAt: 1, endedAt: 2 },
+  });
+  const after = await h.repos.tasks.get(task.id);
+  assert.equal(after.status, Status.QUEUED, "abnormal end auto-retries instead of parking");
+  assert.match(after.wait_reason ?? "", /run ended: error/);
+  assert.ok(after.next_retry_at > h.clock.now(), "retry scheduled behind backoff");
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.FAILED);
+  // The lease is free: the retry takes it again through admission.
+  assert.equal(await h.repos.leases.get(task.workspace_path), null);
+});
+
+test("an operator abort still CANCELS — auto-retry never overrules intent", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "operator stopped" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sink = await sinkFor(h);
+
+  await sink.handle("agent", {
+    runId: execution.id, stream: "lifecycle", sessionKey: "k",
+    data: { phase: "end", stopReason: "stop", aborted: true },
+  });
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.CANCELLED,
+    "abort is a verdict, not a transient failure");
+});

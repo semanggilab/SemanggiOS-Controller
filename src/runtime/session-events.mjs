@@ -33,6 +33,7 @@
 // error.
 import { EventKind } from "../domain/events.mjs";
 import { ExecutionStatus, Status, canTransition } from "../domain/state-machine.mjs";
+import { applyRuntimeFailure } from "../domain/retry.mjs";
 import {
   QUOTA_RETRY_LIMIT,
   RESOURCE_RETRY_LIMIT,
@@ -134,6 +135,10 @@ export function createSessionEventSink({
   // seeding a brain — a null brains means quota refusals take the old
   // always-block path, which is still correct for every non-retryable case.
   brains = null,
+  // D75: runtime-failure retry budget (see domain/retry.mjs), threaded from
+  // the controller's config so the watchdog, this sink and the reconciler
+  // count against ONE budget.
+  config = {},
   now = () => Date.now(),
   log = nullLogger,
 }) {
@@ -260,6 +265,30 @@ export function createSessionEventSink({
     const storedIsOurOwnKey = typeof execution.session_ref === "string" && execution.session_ref.startsWith("agent:");
     if (payload?.sessionId && (!execution.session_ref || storedIsOurOwnKey)) {
       await repos.executions.update(runId, { session_ref: payload.sessionId });
+    }
+
+    // D75: a run that ended abnormally (anything but a clean stop or an
+    // operator abort) is a transient failure, not a verdict on the work — the
+    // shared retry verdict requeues it with backoff instead of parking BLOCKED
+    // for a human to press continue (operator request: auto-recovery). When
+    // the budget is exhausted, retry.mjs itself parks BLOCKED and names the
+    // streak.
+    if (
+      verdict.execution === ExecutionStatus.FAILED &&
+      verdict.task === Status.BLOCKED &&
+      !data?.aborted
+    ) {
+      const outcome = await applyRuntimeFailure(
+        { repos, events, config, log, now },
+        { task: { id: execution.task_id }, execution, cause: `run ended: ${verdict.reason}`, source: "sessions.subscribe" },
+      );
+      await scheduler?.notify?.("RUN_ENDED");
+      log.info("run.ended", {
+        task: execution.task_id, exec: runId,
+        provider: execution.model_provider, model: execution.model_id,
+        stopReason: verdict.reason, recovery: outcome,
+      });
+      return { handled: true, recovery: outcome };
     }
 
     return finalizeRun(execution, verdict, {

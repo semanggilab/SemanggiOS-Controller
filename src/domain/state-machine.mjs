@@ -100,6 +100,13 @@ const TRANSITIONS = new Map(
       Status.COMPLETE,
       Status.WAIT_QUOTA,
       Status.WAIT_RESOURCE,
+      // D75: a run that died abnormally (gateway failure/kill, silent death)
+      // goes straight back to the queue as an AUTO-retry — bounded by a retry
+      // budget and backoff, decided in retry.mjs. Reaching QUEUED from a live
+      // state used to be impossible, which forced every dead run into BLOCKED
+      // for a human to move — recovery work the controller can do itself
+      // (operator request: "dead run gateway" should auto-recover).
+      Status.QUEUED,
       Status.BLOCKED,
       Status.FAILED,
       Status.CANCELLED,
@@ -107,7 +114,7 @@ const TRANSITIONS = new Map(
     // RUNNING → WAIT_HUMAN is the permission pause: the interposer holds a tool
     // call mid-turn, so the run is alive but waiting on a person. It returns to
     // RUNNING on approval (POC-3 E3), which is why this is not a terminal exit.
-    RUNNING: [Status.WAIT_HUMAN, Status.COMPLETE, Status.BLOCKED, Status.FAILED, Status.CANCELLED],
+    RUNNING: [Status.WAIT_HUMAN, Status.COMPLETE, Status.QUEUED, Status.BLOCKED, Status.FAILED, Status.CANCELLED],
     // BLOCKED is where the watchdog parks a task on ABSENCE of evidence, not on
     // evidence of failure — its own comment says the run may have completed on
     // the gateway while the event was lost. When the run's real end then
@@ -137,6 +144,13 @@ export function assertTransition(from, to, { reason } = {}) {
   }
   if ((from === Status.COMPLETE || from === Status.FAILED) && to === Status.QUEUED && reason !== "revision") {
     throw new Error(`re-queueing a ${from} task requires a revision (spec induk §5.2)`);
+  }
+  // D75: requeue from a LIVE state is the auto-recovery verdict, and only that.
+  // A bare "QUEUED" write from DISPATCHED/RUNNING without the marker would be
+  // an unauditable state change — the event log must be able to say WHY a task
+  // that was supposedly running is suddenly queued again.
+  if ((from === Status.DISPATCHED || from === Status.RUNNING) && to === Status.QUEUED && reason !== "auto-retry") {
+    throw new Error(`re-queueing a ${from} task requires reason "auto-retry" (D75)`);
   }
   return to;
 }

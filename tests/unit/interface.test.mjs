@@ -311,6 +311,37 @@ test("the pass is self-gating: finalized or keyless executions are not described
   assert.equal(out.settled.length, 0);
 });
 
+test("describe terminal under a live claim recovers NOW — not after 30 minutes of silence (D75)", async () => {
+  // TASK-4CA0D674's missing fast path: the gateway knew the run `failed` at
+  // 05:19; the task sat DISPATCHED-dead until the watchdog's 30-minute mark.
+  // The reconciler now applies the shared retry verdict the moment describe
+  // hands it terminal evidence.
+  const { h, task, execution } = await dispatched();
+  const { applyRuntimeFailure } = await import("../../src/domain/retry.mjs");
+  const rec = createReconciler({
+    repos: h.repos,
+    events: h.events,
+    runtime: {
+      describeSession: async () => ({ status: "failed", startedAt: 1, endedAt: 2 }),
+      abortRun: async () => ({ ok: true, aborted: false, status: "no-active-run" }),
+    },
+    applyDescribe: async () => ({ handled: false }),
+    applyFailure: (exec, t, session) =>
+      applyRuntimeFailure(
+        { repos: h.repos, events: h.events, log: { info() {}, warn() {} }, now: h.clock.now },
+        { task: t, execution: exec, cause: `gateway session: ${session.status}`, source: "reconciler" },
+      ),
+    now: h.clock.now,
+  });
+
+  const out = await rec.reconcileOnce();
+  assert.equal(out.recovered.length, 1);
+  assert.equal(out.recovered[0].recovery, "requeued");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED);
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.FAILED);
+  assert.match((await h.repos.tasks.get(task.id)).wait_reason ?? "", /gateway session: failed/);
+});
+
 // --- the chat surface must be reachable --------------------------------------
 // It was implemented and wired into main.mjs but had no route, so nothing could
 // ever call it. An interface with no door is not an interface.

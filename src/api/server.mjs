@@ -39,6 +39,9 @@ import {
   listWorkspaceFiles,
   readWorkspaceFile,
   resolveWorkspaceFile,
+  saveUpload,
+  UPLOAD_DIR,
+  UPLOAD_MAX_BYTES,
 } from "../domain/workspace-files.mjs";
 import { createDocTask } from "../domain/doc-task.mjs";
 import { readFileSync } from "node:fs";
@@ -580,6 +583,34 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     });
     log.info("project.doc-updated", { project: id, doc: target.relative, size: body.content.length, by });
     return { path: target.relative, exists: true, editable: true, size: body.content.length };
+  });
+
+  // Lampiran operator → tmp/uploads/ (D76). Body adalah BYTES MENTAH, bukan
+  // JSON — dispatcher menyimpannya di body.__raw karena utf8-decode akan
+  // merusak berkas biner sebelum route ini sempat melihatnya. Satu berkas per
+  // permintaan; UI mengunggah berurutan sehingga kegagalan satu berkas bisa
+  // dilaporkan per berkas, bukan sebagai satu kegagalan massal.
+  route("POST", "/api/work/projects/{id}/uploads", async ({ id }, body, query, actor) => {
+    const project = await repos.projects.get(id);
+    if (!project) throw notFound(`unknown project ${id}`);
+    const bytes = body?.__raw;
+    const name = String(query.get("name") ?? "");
+    if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw badRequest("berkas kosong");
+    if (bytes.length > UPLOAD_MAX_BYTES) {
+      throw badRequest(`berkas melebihi batas ${UPLOAD_MAX_BYTES / 1024 / 1024}MB`);
+    }
+    const saved = await saveUpload(project.workspace_path, name, bytes);
+    if (!saved.ok) throw badRequest(saved.reason);
+    const by = actor?.kind === "operator" ? actor.name : String(query.get("user") ?? "agentos-ui");
+    await controller.events.append({
+      kind: "project.upload-created",
+      subjectType: "project",
+      subjectId: id,
+      actor: by,
+      payload: { path: saved.path, size: saved.size },
+    });
+    log.info("project.upload-created", { project: id, path: saved.path, size: saved.size, by });
+    return saved;
   });
 
   // Project-level Role Level overrides (Settings → Project → Edit modal).
@@ -2872,14 +2903,22 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     if (["POST", "PATCH", "PUT", "DELETE"].includes(req.method)) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
-      const raw = Buffer.concat(chunks).toString("utf8");
-      if (raw.length > 0) {
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          res.writeHead(400, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "invalid JSON body" }));
-          return;
+      const buf = Buffer.concat(chunks);
+      // Uploads carry RAW BYTES, and utf8-decoding them would corrupt any
+      // binary file before the route ever sees it. The route reads
+      // `body.__raw` — see the uploads route for why the flag exists at all.
+      if (req.method === "POST" && /\/uploads\/?$/.test(url.pathname)) {
+        body = { __raw: buf };
+      } else {
+        const raw = buf.toString("utf8");
+        if (raw.length > 0) {
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid JSON body" }));
+            return;
+          }
         }
       }
     }

@@ -11,7 +11,7 @@ import { Status, ExecutionStatus } from "../../src/domain/state-machine.mjs";
 
 const HOUR = 60 * 60 * 1000;
 
-test("a silent dispatch is reclaimed, and the lease released", async () => {
+test("a silent dispatch is reclaimed, the lease released, and the task auto-retried", async () => {
   const clock = new Clock(1_000_000);
   const h = await buildHarness({ clock });
   const { project, worker } = await seedBasics(h);
@@ -27,10 +27,16 @@ test("a silent dispatch is reclaimed, and the lease released", async () => {
   const reclaimed = await h.scheduler.reclaimStalledDispatches();
 
   assert.deepEqual(reclaimed, [execution.id]);
-  // BLOCKED, not FAILED: nobody has evidence the work failed — the run may even
-  // have finished while the event was lost.
-  assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED);
-  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.BLOCKED);
+  // D75: a confirmed-dead run is a transient failure, not a verdict on the
+  // work — the execution records the attempt's truth (FAILED, cause named),
+  // and the task goes back to QUEUED for the next dispatch (a fresh session,
+  // possibly another Brain from the failover chain). BLOCKED is reserved for
+  // a task that has exhausted its retry budget (see below).
+  const after = await h.repos.tasks.get(task.id);
+  assert.equal(after.status, Status.QUEUED);
+  assert.match(after.wait_reason ?? "", /retrying in/, "the wait line names the backoff");
+  assert.ok(after.next_retry_at > clock.now(), "the retry is scheduled, not immediate");
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.FAILED);
   assert.equal(await h.repos.leases.get(path), null, "lease released so the project can move");
 });
 
@@ -64,7 +70,9 @@ test("reclaiming frees the project so the next task runs", async () => {
   await h.scheduler.reclaimStalledDispatches();
   await h.scheduler.notify();
 
-  assert.equal((await h.repos.tasks.get(first.id)).status, Status.BLOCKED);
+  // First is QUEUED behind its 30s retry backoff — which is exactly what lets
+  // the second task take the freed workspace instead of the retried first.
+  assert.equal((await h.repos.tasks.get(first.id)).status, Status.QUEUED);
   assert.equal((await h.repos.tasks.get(second.id)).status, Status.DISPATCHED, "the project moves again");
 });
 
@@ -105,7 +113,7 @@ test("the watchdog runs on every scheduler pass, not only on demand", async () =
   clock.advance(HOUR);
   await h.scheduler.notify();
 
-  assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED, "dead run auto-retried (D75)");
   const pass = h.scheduler.lastPasses?.().at(-1) ?? null;
   if (pass) assert.ok(Array.isArray(pass.stalledReclaimed));
 });
@@ -274,11 +282,13 @@ test("a streaming run is never stalled, however old (TASK-E2854DB9 shape)", asyn
   assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED);
 
   // Now it really goes quiet — and the fake gateway (which never learned of a
-  // live run) confirms via abort that nothing is running, so it parks safely.
+  // live run) confirms via abort that nothing is running, so it recovers as an
+  // auto-retry (D75): attempt FAILED, task back to QUEUED behind backoff.
   clock.advance(31 * 60 * 1000);
   const reclaimed = await h.scheduler.reclaimStalledDispatches();
   assert.deepEqual(reclaimed, [execution.id]);
-  assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED);
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.FAILED);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED);
 });
 
 test("a run the GATEWAY says is live is not parked — our silence is not its death", async () => {
@@ -355,7 +365,7 @@ test("parking waits for abort confirmation — an unverifiable run keeps its slo
     "the model slot stays occupied while the run may still be live");
 });
 
-test("a confirmed stop parks with the evidence named", async () => {
+test("a confirmed stop recovers with the evidence named", async () => {
   const clock = new Clock(1_000_000);
   const h = await buildHarness({ clock });
   const { project, worker } = await seedBasics(h);
@@ -372,12 +382,13 @@ test("a confirmed stop parks with the evidence named", async () => {
   const reclaimed = await h.scheduler.reclaimStalledDispatches();
   assert.deepEqual(reclaimed, [execution.id]);
   assert.ok(h.fake.gateway.aborts.includes(execution.session_key), "abort ran before anything was freed");
-  const parked = await h.repos.executions.get(execution.id);
-  assert.equal(parked.status, ExecutionStatus.BLOCKED);
-  assert.match(parked.result, /aborted live run at gateway/);
+  const dead = await h.repos.executions.get(execution.id);
+  assert.equal(dead.status, ExecutionStatus.FAILED);
+  assert.match(dead.result, /aborted live run at gateway/);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED, "auto-retried (D75)");
 });
 
-test("a gateway-failed session parks with the verdict named, not just the silence", async () => {
+test("a gateway-failed session recovers with the verdict named, not just the silence", async () => {
   // TASK-4CA0D674: the gateway's own projection said `failed` while the park
   // reason said only "no runtime event for 1810s". The verdict is the thing
   // an operator needs first — it names the failure, the silence just times it.
@@ -392,10 +403,47 @@ test("a gateway-failed session parks with the verdict named, not just the silenc
   clock.advance(31 * 60 * 1000);
   const reclaimed = await h.scheduler.reclaimStalledDispatches();
   assert.deepEqual(reclaimed, [execution.id]);
-  const parked = await h.repos.executions.get(execution.id);
-  assert.equal(parked.status, ExecutionStatus.BLOCKED);
-  assert.match(parked.result, /gateway session: failed/);
-  assert.match(parked.result, /no active run at gateway/);
+  const dead = await h.repos.executions.get(execution.id);
+  assert.equal(dead.status, ExecutionStatus.FAILED);
+  assert.match(dead.result, /gateway session: failed/);
+  assert.match(dead.result, /no active run at gateway/);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED, "auto-retried (D75)");
+});
+
+test("the retry budget is real: a task that keeps dying ends up BLOCKED", async () => {
+  // Auto-recovery must not become a loop that drowns the signal. Default
+  // budget is 2 requeues inside the 1h failure window — the third death parks
+  // the task BLOCKED with the streak named, which is where a human genuinely
+  // belongs. The clock stays tight (backoff is 30s→60s, silence 31m per
+  // death): drifting minutes past the window would drop the older failures
+  // from recentFailures and the budget would never trigger.
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "keeps dying" });
+  await h.scheduler.notify();
+
+  const kill = async () => {
+    const execution = await h.repos.executions.latest(task.id);
+    h.fake.gateway.markTerminal(execution.session_key, "failed");
+    clock.advance(31 * 60 * 1000);
+    await h.scheduler.reclaimStalledDispatches();
+  };
+
+  await kill();
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED, "first death requeues");
+  clock.advance(5 * 60 * 1000); // backoff 30s elapses, still inside the window
+  await h.scheduler.notify();
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED, "retry dispatched");
+  await kill();
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED, "second death requeues");
+  clock.advance(5 * 60 * 1000);
+  await h.scheduler.notify();
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED, "second retry dispatched");
+  await kill();
+  const exhausted = await h.repos.tasks.get(task.id);
+  assert.equal(exhausted.status, Status.BLOCKED, "third death exhausts the budget");
+  assert.match(exhausted.wait_reason ?? "", /auto-retries exhausted/);
 });
 
 // ── The over-commit scenario, end to end ────────────────────────────────────

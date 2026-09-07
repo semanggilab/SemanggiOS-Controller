@@ -2445,3 +2445,43 @@ brain_id tak berubah, hanya kardinalitasnya).
 anggota dimatikan diskip dengan alasan + fail-back otomatis; seluruh daftar
 mati/kembar/tak dikenal ditolak; pool level jadi daftar penuh; PUT end-to-end
 terurut sampai ke preferred task; PUT kembar ditolak tanpa menyentuh sel).
+
+## D69 — Memarkir ulang task yang sudah menunggu bukan transisi
+
+**Ditemukan di cluster, bukan di review.** Controller crash loop, restart sekali per tick scheduler:
+
+```
+Error: illegal task transition WAIT_WORKSPACE -> WAIT_WORKSPACE
+  at assertTransition (state-machine.mjs:136)
+  at park (admission.mjs:307) → tick (admission.mjs:607) → pass → drain
+```
+
+TASK-05C65CF2 menunggu lease workspace `sdmk-kader` yang dipegang TASK-2C56D3A8#1. Admission mengevaluasi ulang task yang menunggu pada **setiap** pass dan memarkirnya ulang dengan detail baru — dan detail WAIT_WORKSPACE memuat `expires_at` lease pemblokir (`admission.mjs:145`), yang bergerak tiap kali pemegangnya memperpanjang. `setStatus` hanya short-circuit kalau status **dan** detailnya identik byte-per-byte, jadi ETA yang menyegar jatuh ke `assertTransition(WAIT_WORKSPACE, WAIT_WORKSPACE)` dan melempar. Pass mati, proses ikut mati, Swarm merestart, tick berikutnya mengulanginya. Terukur: satu crash tiap ~30 detik.
+
+**Keputusan: sempitkan KAPAN asersi berjalan, bukan APA yang ditolak.** Diam di tempat bukan perpindahan, jadi bukan urusan `assertTransition`. Hanya perpindahan antar-state yang diperiksa:
+
+```js
+if (task.status !== next) assertTransition(task.status, next, { reason });
+```
+
+**Alternatif yang ditolak:** menambah tepi `WAIT_x → WAIT_x` ke tabel TRANSITIONS. Itu akan menyatakan bahwa memarkir ulang adalah perpindahan yang sah, padahal ia bukan perpindahan sama sekali — dan melemahkan tabel untuk kasus yang tidak ada.
+
+Detail yang menyegar tetap **ditulis**: ETA baru adalah satu-satunya hal yang berubah bagi operator yang menunggu, dan membuangnya akan memperbaiki crash dengan cara membekukan informasi.
+
+**Test:** 476 → 481. Dibuktikan menangkap bug — dengan fix dikembalikan, 2 dari 5 gagal. Yang dipaku: re-park detail segar tidak melempar dan ETA barunya sampai; re-park identik tetap no-op (event log tidak berisik); keempat state WAIT_* diperlakukan sama; dan dua guard lama TIDAK ikut longgar (`CANCELLED → QUEUED` masih ditolak, `COMPLETE → QUEUED` masih menuntut revision).
+
+**Terverifikasi hidup:** nol crash sejak sync, sesudahnya antrean bersih dari WAIT_WORKSPACE.
+
+## D70 — AgentOS 0.7.7 di atas gateway 2026.7.1, dan migrasi auth yang satu arah
+
+**Fork disusulkan ke `agentos-v0.7.7`** (`741bbff9`). Titik cabang `ad841691` ternyata leluhur tag itu, jadi ini penyusulan 36 commit hulu, bukan pelurusan sejarah. Hulu menyentuh 210 berkas, Semanggi 35; **hanya 8 beririsan, 3 berkonflik** — arsitektur overlay `apply.sh` terbayar persis seperti alasannya ditulis. Nol dependensi baru (`pnpm-lock.yaml` tidak berubah). Delapan dari delapan jangkar `apply.sh` juga masih menempel pada 0.7.7 pristine, jadi jalur pemulihan alternatif tetap hidup.
+
+**Baseline versi hanya diagnostik.** `OPENCLAW_SUPPORTED_BASELINE_VERSION` naik ke `2026.8.1` (bukan 2026.8.2 seperti yang dikira), tetapi dipakai hanya untuk teks pesan, flag readiness, dan alur *update* OpenClaw — tidak ada di jalur chat/mission/agent. Gerbang sesungguhnya **tidak berubah**: protokol baseline tetap 4, dan 18 id operasi wajib identik dengan sebelumnya. Konsekuensi yang MUST diterima, bukan dilaporkan sebagai bug: diagnostik akan terus menyatakan gateway di bawah baseline selama gateway 2026.7.1.
+
+**Gerbang identitas baru lolos, dan alasannya bisa diukur.** 0.7.7 menambah `requireAgentOsOpenClawPreflight` di 11 route: `grantedScopesKnown = Array.isArray(hello.auth?.scopes)`; `false` → 503, scope kurang → 403. Diukur langsung ke gateway 2026.7.1 — token bersama saja memberi `{"role":"operator","scopes":[]}` (D13 lagi), tetapi identitas device AgentOS yang sudah dipasangkan memberi `["operator.admin","operator.read","operator.write"]` dengan `grantedScopesKnown=true`. Konfigurasi cluster memenuhi jalur kedua: URL loopback (`isLocalGatewayUrl` benar), tidak ada `gateway` block di `openclaw.json` AgentOS, dan tidak ada `OPENCLAW_GATEWAY_TOKEN` di env PID 1 — sehingga `activeDeviceAuth = deviceAuth && !token && !password` aktif.
+
+**Celah yang tersisa, sempit dan nyata:** gateway memberi scope **milik device**, bukan yang diminta — permintaan 8 scope tetap dijawab 3. Metode yang menuntut `operator.approvals` atau `operator.questions` akan 403 di preflight. Bersinggungan dengan §6.2 butir 1 CLAUDE.md; perbaikannya pairing ulang, yang butuh keputusan manusia.
+
+**Migrasi satu arah — dan rollback yang tidak cukup.** 0.7.7 memigrasi `instance-protection.json` v1 → v2 (menambah `actorId`) dan melahirkan `agentos-users.json` pada boot pertama. 0.7.6 menolak v2 dengan **500 `Instance protection request failed`** pada setiap login. Jadi rollback AgentOS BUKAN hanya `git reset` + sync: berkas v1 MUST dipulihkan dari backup. Salt, hash, dan `sessionSecret` identik di kedua versi, jadi pemulihan tidak menghilangkan apa pun. Ditemukan dengan cara mahal — rollback yang terpicu salah baca (lihat catatan berikut) mengunci login sampai berkas v1 dikembalikan.
+
+**Catatan metodologis yang layak diingat:** `authStatus.native.ok` di `/api/settings/gateway` **bukan** status link gateway — ia probe `connect` tersendiri yang bisa timeout sementara koneksi native yang sesungguhnya berjalan normal. Membacanya sebagai bukti kegagalan memicu rollback yang tidak perlu. Sinyal yang benar adalah log gateway sendiri: permintaan `id=agentos:…` yang dijawab `res ✓`.

@@ -422,7 +422,19 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
         const task = await tasks.get(taskId);
         if (!task) throw new Error(`unknown task ${taskId}`);
         if (task.status === next && task.wait_reason === waitDetail) return task;
-        assertTransition(task.status, next, { reason });
+        // Staying in the same state is not a transition, so it is not the
+        // assertion's business. Admission re-parks a waiting task on every pass
+        // and the detail it writes carries live values — WAIT_WORKSPACE embeds
+        // the blocking lease's `expires_at`, which moves each time the holder
+        // renews. The short-circuit above only catches a re-park whose detail is
+        // byte-identical, so a refreshed ETA fell through to
+        // assertTransition(WAIT_WORKSPACE, WAIT_WORKSPACE) and threw — killing
+        // the scheduler pass, and with it the process, once per tick for as long
+        // as one task waited on another's lease (TASK-05C65CF2 behind
+        // TASK-2C56D3A8#1, measured live). Refreshing the reason a task is
+        // waiting MUST be allowed to say the same thing twice; only actual
+        // movement between states is checked.
+        if (task.status !== next) assertTransition(task.status, next, { reason });
         await store.run(`UPDATE tasks SET status = ?, wait_reason = ?, updated_at = ? WHERE id = ?`, [
           next,
           waitDetail,

@@ -61,9 +61,11 @@ export function createReconciler({
   // last observed activity: the abort-before-park watchdog (D71) already
   // guarantees new BLOCKED rows are confirmed stopped, so this sweep exists
   // for stragglers — rows parked by the old code while their runs kept
-  // going. A window bounded in hours keeps the pass from describing every
-  // task ever parked.
-  const blockedScanWindowMs = config.blockedScanWindowMs ?? 6 * 60 * 60 * 1000;
+  // going. Measured on the cluster DB the base filter (latest execution
+  // unfinalized AND carrying a session key) already narrows this to a
+  // handful of rows, so a day-wide window is a handful of describes — while
+  // still bounding the sweep as old BLOCKED rows accumulate over months.
+  const blockedScanWindowMs = config.blockedScanWindowMs ?? 24 * 60 * 60 * 1000;
 
   async function describe(key) {
     if (!runtime || typeof runtime.describeSession !== "function") return null;

@@ -204,6 +204,29 @@ class SqliteStore {
       }
     }
 
+    // D71 koreksi jangkar: baris warisan yang di-backfill dari created_at
+    // padahal transkripnya mencatat aktivitas lebih belakangan (TASK-E2854DB9:
+    // created 20:17, pesan terakhir 21:21 — 64 menit yang membuat jam backfill
+    // berbohong 1 jam). Pesan terakhir ADALAH aktivitas terakhir yang teramati;
+    // konvergen dan idempoten — setelah diterapkan, kondisinya tidak pernah
+    // benar lagi untuk baris yang sama. BENTUK TABEL DIBACA ULANG: blok ALTER
+    // di atas menambah kolom pada boot ini, dan cols yang di-cache sebelumnya
+    // masih belum mengetahuinya.
+    if (
+      cols("executions").includes("last_event_at") &&
+      cols("executions").includes("finalized_at") &&
+      cols("execution_messages").includes("at")
+    ) {
+      this.#db.exec(`
+        UPDATE executions SET last_event_at = (
+          SELECT MAX(at) FROM execution_messages m WHERE m.execution_id = executions.id
+        )
+        WHERE finalized_at IS NULL
+          AND (SELECT MAX(at) FROM execution_messages m WHERE m.execution_id = executions.id)
+              > COALESCE(last_event_at, 0)
+      `);
+    }
+
     // D37: template and profile move from a per-request parameter (typed into
     // the Control page every time) to a per-project setting (typed once, in
     // Settings → Project). Existing rows get the same defaults the code

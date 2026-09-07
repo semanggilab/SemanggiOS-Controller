@@ -130,7 +130,7 @@ async function main() {
     events: controller.events,
     runtime,
     applyDescribe: (execution, session) => sessionEvents.applyDescribe(execution, session),
-    config: { blockedScanWindowMs: Number(process.env.SEMANGGI_BLOCKED_SCAN_MS ?? 6 * 60 * 60 * 1000) },
+    config: { blockedScanWindowMs: Number(process.env.SEMANGGI_BLOCKED_SCAN_MS ?? 24 * 60 * 60 * 1000) },
     log: log.child({ component: "reconciler" }),
   });
 

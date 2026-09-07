@@ -282,7 +282,9 @@ test("old BLOCKED rows fall out of the scan window", async () => {
   await h.repos.executions.setStatus(execution.id, ExecutionStatus.BLOCKED, { result: "old code parked this" });
   await h.repos.tasks.setStatus(task.id, Status.BLOCKED, { reason: "old code parked this" });
 
-  clock.advance(7 * 60 * 60 * 1000);
+  // Default window is a day — a straggler from the last day of old-code
+  // parking is still the reconciler's business; one from two days back is not.
+  clock.advance(25 * 60 * 60 * 1000);
   const out = await rec.reconcileOnce();
   assert.equal(out.stragglers.length, 0, "a straggler older than the window is not described");
 });

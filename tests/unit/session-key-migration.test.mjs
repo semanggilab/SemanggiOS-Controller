@@ -110,3 +110,57 @@ test("last_event_at arrives, backfills only unfinalized rows, and survives trigg
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// D71 jangkar pesan: backfill created_at berbohong untuk baris warisan yang
+// transkripnya mencatat aktivitas lebih belakangan (TASK-E2854DB9: created
+// 20:17, pesan terakhir 21:21). Pesan terakhir adalah aktivitas terakhir yang
+// teramati — dan tanpa koreksi ini, jendela scan reconciler salah mengira
+// baris itu lebih tua dari umurnya.
+test("last_event_at is re-anchored to the last recorded message when later", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "semanggi-mig3-"));
+  const file = join(dir, "controller.db");
+  try {
+    const db = new DatabaseSync(file);
+    db.exec(`
+      CREATE TABLE executions (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, revision_no INTEGER NOT NULL,
+        session_mode TEXT NOT NULL, session_key TEXT, status TEXT NOT NULL,
+        created_at INTEGER NOT NULL, finalized_at INTEGER
+      );
+      CREATE TABLE execution_messages (
+        execution_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '', blocks TEXT, at INTEGER NOT NULL,
+        PRIMARY KEY (execution_id, seq, role)
+      );
+    `);
+    db.prepare(
+      `INSERT INTO executions (id, task_id, revision_no, session_mode, status, created_at)
+       VALUES ('TASK-C#1', 'TASK-C', 1, 'FRESH', 'DISPATCHED', 1000)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO execution_messages (execution_id, seq, role, at) VALUES ('TASK-C#1', 1, 'user', 1000)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO execution_messages (execution_id, seq, role, at) VALUES ('TASK-C#1', 2, 'assistant', 95000)`,
+    ).run();
+    db.close();
+
+    const store = openStore({ location: file });
+    try {
+      // First boot: column + created_at backfill; the corrective then lifts it
+      // to the transcript's truth in the same pass.
+      const row = await store.get(`SELECT last_event_at FROM executions WHERE id = 'TASK-C#1'`);
+      assert.equal(row.last_event_at, 95000, "the last recorded message is the last observed activity");
+      // Idempotent: a second open changes nothing.
+      await store.close();
+      const store2 = openStore({ location: file });
+      const again = await store2.get(`SELECT last_event_at FROM executions WHERE id = 'TASK-C#1'`);
+      assert.equal(again.last_event_at, 95000);
+      await store2.close();
+    } finally {
+      await store.close().catch(() => {});
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -27,6 +27,8 @@ import { LEVEL_TO_QUALITY, ROLE_CATEGORY } from "./decompose.mjs";
 import { Status } from "./state-machine.mjs";
 import { WakeReason } from "../scheduler/scheduler.mjs";
 import { resolveWorkspaceFile } from "./workspace-files.mjs";
+import { shortId } from "./repositories.mjs";
+import { deliverablesDirFor } from "../runtime/instruction.mjs";
 
 /** Apa yang dituntut dari tiap role ketika objeknya sebuah dokumen. */
 const DOC_RESPONSIBILITY = Object.freeze({
@@ -42,11 +44,16 @@ const DOC_RESPONSIBILITY = Object.freeze({
     "dan kriteria selesai yang bisa diperiksa. Jangan merancang solusi teknis.",
 });
 
-/** Ke mana hasilnya ditulis bila operator tidak menyebutkan berkas keluaran. */
-const DOC_DELIVERABLE = Object.freeze({
-  reviewer: "docs/review.md",
-  architect: "docs/architecture.md",
-  analyst: "docs/brief.md",
+/** Nama berkas keluaran per role. Bukan path penuh: direktorinya adalah
+ *  `deliverables/<task-id>/` — keputusan yang sama dengan preamble dispatch
+ *  (instruction.mjs), yang menyuruh SEMUA task menulis ke sana. Path lama
+ *  `docs/review.md` bertentangan dengan preamble itu: agen mengikuti preamble
+ *  (hasil betul di deliverables/<task-id>/review.md) sementara balasan chat
+ *  menunjuk docs/ — operator dibawa ke berkas yang tidak pernah ditulis. */
+const DOC_DELIVERABLE_FILE = Object.freeze({
+  reviewer: "review.md",
+  architect: "architecture.md",
+  analyst: "brief.md",
 });
 
 /**
@@ -157,12 +164,19 @@ export async function createDocTask(controller, { projectId, text, refs = [], ro
     return { ok: false, reason: `Tidak ada Brain untuk ${role} (${effectiveLevel}) — tetapkan di halaman Brain Map lebih dulu.` };
   }
 
-  const deliverable = DOC_DELIVERABLE[role] ?? null;
+  // Id dibangkitkan DI SINI, bukan di dalam tasks.create: instruksi dan
+  // balasan chat harus menyebut path keluaran penuh
+  // (`deliverables/<task-id>/…`) sebelum baris task ada, dan satu-satunya cara
+  // memilikinya lebih dulu adalah membuatnya sendiri dengan generator yang
+  // sama (shortId) yang dipakai default create.
+  const taskId = shortId("TASK");
+  const deliverable = `${deliverablesDirFor(taskId)}/${DOC_DELIVERABLE_FILE[role] ?? "review.md"}`;
   // Judul menyebut berkas pertama yang dirujuk: sebuah kartu kanban bertuliskan
   // "Dokumen: review keamanannya" tidak memberi tahu dokumen yang mana, dan
   // itulah satu-satunya hal yang membedakan task ini dari task DOC berikutnya.
   const subject = clean[0] ? `${clean[0]} — ` : "";
   const task = await controller.repos.tasks.create({
+    id: taskId,
     projectId,
     workerId: worker.id,
     title: `Dokumen (${role}): ${subject}${String(text).slice(0, 80)}`.slice(0, 160),

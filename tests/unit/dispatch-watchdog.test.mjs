@@ -377,6 +377,27 @@ test("a confirmed stop parks with the evidence named", async () => {
   assert.match(parked.result, /aborted live run at gateway/);
 });
 
+test("a gateway-failed session parks with the verdict named, not just the silence", async () => {
+  // TASK-4CA0D674: the gateway's own projection said `failed` while the park
+  // reason said only "no runtime event for 1810s". The verdict is the thing
+  // an operator needs first — it names the failure, the silence just times it.
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "died at gateway" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  h.fake.gateway.markTerminal(execution.session_key, "failed");
+
+  clock.advance(31 * 60 * 1000);
+  const reclaimed = await h.scheduler.reclaimStalledDispatches();
+  assert.deepEqual(reclaimed, [execution.id]);
+  const parked = await h.repos.executions.get(execution.id);
+  assert.equal(parked.status, ExecutionStatus.BLOCKED);
+  assert.match(parked.result, /gateway session: failed/);
+  assert.match(parked.result, /no active run at gateway/);
+});
+
 // ── The over-commit scenario, end to end ────────────────────────────────────
 
 test("a live-but-silent run still holds the provider's last concurrency slot", async () => {

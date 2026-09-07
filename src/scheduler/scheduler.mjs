@@ -123,6 +123,7 @@ export function createScheduler({ admission, repos, config = {}, now = () => Dat
     for (const execution of stalled) {
       const task = await repos.tasks.get(execution.task_id);
       const sessionKey = execution.session_key ?? null;
+      let describeStatus = null;
       try {
         // D71, step 1 — ask the gateway before guessing. Silence in OUR
         // subscription is not silence at the run: the controller re-subscribes
@@ -130,7 +131,8 @@ export function createScheduler({ admission, repos, config = {}, now = () => Dat
         // runs came to be parked on the cluster while still streaming.
         if (sessionKey && typeof hooks.describeSession === "function") {
           const session = await hooks.describeSession({ key: sessionKey });
-          if (session?.status === "running") {
+          describeStatus = session?.status ?? null;
+          if (describeStatus === "running") {
             // The run is alive; our view of it is what died. Refresh the
             // activity clock and leave it alone — the reconciler keeps
             // watching, and its describe will deliver the outcome.
@@ -141,7 +143,7 @@ export function createScheduler({ admission, repos, config = {}, now = () => Dat
             });
             continue;
           }
-          if (session?.status === "done") {
+          if (describeStatus === "done") {
             // The run finished and we never saw the end frame. Do NOT park —
             // BLOCKED would free the workspace for a sibling while the
             // reconciler is about to prove COMPLETE. Touch so this pass does
@@ -183,9 +185,15 @@ export function createScheduler({ admission, repos, config = {}, now = () => Dat
         }
 
         const quietForMs = now() - (execution.last_event_at ?? execution.created_at);
+        // The gateway's own terminal classification (failed/killed/timeout),
+        // when describe offered one, names WHY the run is gone — the operator
+        // should read the verdict, not just "it went quiet" (TASK-4CA0D674:
+        // the session projection said `failed` while the queue said nothing).
+        const gatewayVerdict =
+          describeStatus && describeStatus !== "running" ? `gateway session: ${describeStatus}; ` : "";
         const detail =
           `no runtime event for ${Math.round(quietForMs / 1000)}s` +
-          (stopConfirmed === "unverified" ? " after last activity" : ` (${stopConfirmed})`);
+          ` (${gatewayVerdict}${stopConfirmed === "unverified" ? "not verified" : stopConfirmed})`;
         await repos.executions.setStatus(execution.id, ExecutionStatus.BLOCKED, { result: detail });
         if (task) {
           await repos.tasks.setStatus(task.id, Status.BLOCKED, { reason: detail, actor: "dispatch-watchdog" });

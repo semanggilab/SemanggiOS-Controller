@@ -912,6 +912,37 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
       }
     },
 
+    /**
+     * The gateway's own durable projection of a session's run state.
+     *
+     * MEASURED live on 2026.7.1 (protocol 4, rule 4 — by request, not by
+     * reading dist): `sessions.describe {key}` answers
+     * `{ session: { status, startedAt, endedAt, abortedLastRun,
+     *              inputTokens, outputTokens, totalTokens, sessionId, … } }`
+     * where `status` is the terminal classification the gateway itself keeps
+     * (source: session-lifecycle-state.ts — success:"done", timeout:"timeout",
+     * cancellation:"killed", failure:"failed", live:"running"). This is the
+     * only after-the-fact source of a run's outcome: `agent.wait` answers
+     * `{status:"timeout", timeoutPhase:"queue", providerStarted:false}` for a
+     * run that finished cleanly (D15), and /api/snapshot never carries
+     * gateway-direct runs at all.
+     *
+     * Returns `null` when the method is unavailable or the session is unknown
+     * — callers treat that as "no evidence", never as "not running".
+     */
+    async describeSession({ key }) {
+      if (!key) return null;
+      await connect();
+      if (!hello?.features?.methods?.includes("sessions.describe")) return null;
+      try {
+        const payload = await request("sessions.describe", { key }, { timeoutMs: 30_000 });
+        return payload?.session ?? null;
+      } catch (err) {
+        log.warn("session.describe-failed", { key, error: String(err.message).slice(0, 200) });
+        return null;
+      }
+    },
+
     async close() {
       try {
         socket?.close();

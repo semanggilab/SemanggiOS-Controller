@@ -131,6 +131,14 @@ CREATE TABLE IF NOT EXISTS executions (
   started_at     INTEGER,
   ended_at       INTEGER,
   created_at     INTEGER NOT NULL,
+  -- Aktivitas gateway terakhir yang teramati untuk eksekusi ini (pesan, tool
+  -- frame, lifecycle start, atau "masih running" menurut sessions.describe).
+  -- Watchdog memarkir berdasarkan kolom ini, bukan created_at: TASK-E2854DB9
+  -- (64 menit, 103 pesan SETELAH diparkir) dan TASK-2C56D3A8 (2j48m, 440
+  -- pesan setelahnya) sama-sama diparkir di menit ke-30 hanya karena usianya
+  -- melewati batas — usia sejak dispatch tidak mengatakan apa-apa tentang
+  -- hidup-matinya sebuah run (D71).
+  last_event_at  INTEGER,
   -- Set when the execution reaches a terminal state; from then on the row is
   -- frozen (POC-4 §4: "Execution lama tetap immutable").
   finalized_at   INTEGER,

@@ -630,3 +630,60 @@ test("tool start/update frames and command_output deltas are not recorded", asyn
 
   assert.equal((await h.repos.messages.listByExecution(execution.id)).length, 0);
 });
+
+// ── D72: the describe-driven rescue ─────────────────────────────────────────
+
+test("applyDescribe completes a run the gateway reports done, recording its tokens", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "lost end" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sink = await sinkFor(h);
+
+  const out = await sink.applyDescribe(execution, {
+    status: "done", startedAt: 1000, endedAt: 2000,
+    inputTokens: 106343, outputTokens: 77561, sessionId: "b061", abortedLastRun: false,
+  });
+  assert.equal(out.handled, true);
+  const exec = await h.repos.executions.get(execution.id);
+  assert.equal(exec.status, ExecutionStatus.COMPLETE);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
+  assert.equal(exec.tokens_input, 106343);
+  assert.equal(exec.tokens_output, 77561);
+  assert.equal(exec.session_ref, "b061");
+});
+
+test("applyDescribe never overwrites usage a live event already recorded", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "counted already" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  await h.repos.executions.recordUsage(execution.id, { input_tokens: 10, output_tokens: 5 });
+  const sink = await sinkFor(h);
+
+  await sink.applyDescribe(execution, {
+    status: "done", endedAt: 2, inputTokens: 999, outputTokens: 999, sessionId: null,
+  });
+  const exec = await h.repos.executions.get(execution.id);
+  assert.equal(exec.tokens_input, 10, "a session aggregate must not replace a per-message reading");
+  assert.equal(exec.tokens_output, 5);
+});
+
+test("applyDescribe ignores everything but positive 'done' evidence", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "killed at gateway" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sink = await sinkFor(h);
+
+  assert.equal((await sink.applyDescribe(execution, { status: "killed" })).handled, false);
+  assert.equal((await sink.applyDescribe(execution, { status: "running" })).handled, false);
+  assert.equal((await sink.applyDescribe(execution, null)).handled, false);
+  // And once final, even a done report is a no-op, not an error.
+  await h.fake.completeExecution(execution.id);
+  assert.equal((await sink.applyDescribe(execution, { status: "done" })).handled, false);
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE);
+});

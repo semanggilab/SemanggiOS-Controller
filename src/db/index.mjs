@@ -183,6 +183,27 @@ class SqliteStore {
       this.#db.exec(`ALTER TABLE tasks ADD COLUMN deleted_at INTEGER`);
     }
 
+    // D71: aktivitas terakhir yang teramati. Watchdog lama memakai created_at
+    // sebagai jam, jadi run sehat sepanjang 64 menit (TASK-E2854DB9) diparkir
+    // di menit ke-30 sambil terus streaming. Backfill created_at: baris warisan
+    // langsung dinilai dari usianya — konservatif, dan baris yang memang mati
+    // tidak lolos dari pemeriksaan hanya karena migrasi baru berjalan.
+    // Baris FINAL sengaja tidak disentuh: trigger imutabilitas meng-abort
+    // UPDATE apa pun padahal, dan NULL pada baris final tidak pernah dibaca
+    // (stalled() memfilter finalized_at IS NULL; COALESCE menutup sisanya).
+    // Fixture warisan yang bahkan belum punya finalized_at sama saja
+    // dilewati backfill-nya — semantik identik lewat COALESCE.
+    const executionCols2 = cols("executions");
+    if (executionCols2.length > 0 && !executionCols2.includes("last_event_at")) {
+      this.#db.exec(`ALTER TABLE executions ADD COLUMN last_event_at INTEGER`);
+      if (executionCols2.includes("finalized_at")) {
+        this.#db.exec(
+          `UPDATE executions SET last_event_at = created_at
+             WHERE last_event_at IS NULL AND finalized_at IS NULL`,
+        );
+      }
+    }
+
     // D37: template and profile move from a per-request parameter (typed into
     // the Control page every time) to a per-project setting (typed once, in
     // Settings → Project). Existing rows get the same defaults the code

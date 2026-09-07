@@ -81,11 +81,21 @@ export async function createController({
   // D42: admission resolves Brain names from the brains table (seeded above),
   // so it is wired after seeding, with the catalog as fallback.
   const admission = createAdmission({ repos, events, policy, brains, runtime, config, now, log: log.child({ component: "admission" }) });
-  const scheduler = createScheduler({ admission, repos, config: { log: log.child({ component: "scheduler" }), ...config }, now });
+  // D71: gateway hooks the watchdog needs (abortRun/describeSession). A holder
+  // rather than direct functions because the session-event sink that owns the
+  // describe→verdict mapping is built AFTER the controller (it needs
+  // controller.repos); main.mjs binds it here once both exist.
+  const gatewayHooks = {};
+  const scheduler = createScheduler({
+    admission,
+    repos,
+    config: { log: log.child({ component: "scheduler" }), gatewayHooks, ...config },
+    now,
+  });
 
   // `resources` (seed resources.json) ikut dikembalikan: DELETE model-map
   // (D67) harus tahu baris mana yang akan di-seed ulang pada boot berikutnya —
   // menghapus baris yang masih ada di seed adalah penghapusan yang tidak
   // pernah terjadi.
-  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, config, now, log, runtime, seedResources: resources };
+  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, config, now, log, runtime, seedResources: resources };
 }

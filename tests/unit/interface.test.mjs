@@ -147,7 +147,7 @@ test("the approval notification tells the operator exactly how to answer", async
   assert.match(note.text, new RegExp(`reject ${task.id}`));
 });
 
-// --- reconciliation ----------------------------------------------------------
+// --- reconciliation (D72: gateway session projection is the source) ----------
 
 async function dispatched() {
   const clock = new Clock();
@@ -159,71 +159,154 @@ async function dispatched() {
   return { h, clock, task, execution };
 }
 
-test("a terminal runtime status is believed immediately", async () => {
+/** The same wiring main.mjs does: a real sink owns the describe→verdict map. */
+async function makeReconciler(h, sessions) {
+  const { createSessionEventSink } = await import("../../src/runtime/session-events.mjs");
+  const sink = createSessionEventSink({
+    repos: h.repos, events: h.events, scheduler: h.scheduler,
+    runtime: { connect: async () => ({}), request: async () => ({}) },
+  });
+  const keys = Object.keys(sessions);
+  return createReconciler({
+    repos: h.repos,
+    events: h.events,
+    runtime: {
+      describeSession: async ({ key }) => (keys.includes(key) ? sessions[key] : null),
+      abortRun: async () => ({ ok: true, aborted: false, status: "no-active-run" }),
+    },
+    applyDescribe: (execution, session) => sink.applyDescribe(execution, session),
+    now: h.clock.now,
+  });
+}
+
+test("a gateway 'done' session settles COMPLETE — the lost-end rescue (D72)", async () => {
   const { h, task, execution } = await dispatched();
-  const rec = createReconciler({ repos: h.repos, events: h.events, now: h.clock.now });
-  const out = await rec.reconcileOnce({ readStatus: async () => ({ status: "completed", result: "ok" }) });
+  const rec = await makeReconciler(h, {
+    [execution.session_key]: {
+      status: "done", startedAt: 1, endedAt: 2, inputTokens: 100, outputTokens: 40,
+      sessionId: "sess-1", abortedLastRun: false,
+    },
+  });
+  const out = await rec.reconcileOnce();
 
   assert.equal(out.settled.length, 1);
-  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE);
+  const exec = await h.repos.executions.get(execution.id);
+  assert.equal(exec.status, ExecutionStatus.COMPLETE);
   assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
+  assert.equal(exec.tokens_input, 100, "describe token totals are recorded when none were");
+  assert.equal(exec.tokens_output, 40);
+  assert.equal(exec.session_ref, "sess-1", "our own agent: key is upgraded to the gateway sessionId");
   assert.equal((await h.repos.leases.list()).length, 0, "the workspace must be released");
 });
 
-test("a non-terminal status is not acted on until it goes stale", async () => {
-  const { h, clock, task } = await dispatched();
-  const rec = createReconciler({ repos: h.repos, events: h.events, config: { staleAfterMs: 60_000 }, now: clock.now });
-  const read = async () => ({ status: "running" });
+test("a gateway 'running' session is activity proof, not staleness (D71)", async () => {
+  const { h, clock, task, execution } = await dispatched();
+  const rec = await makeReconciler(h, {
+    [execution.session_key]: { status: "running", startedAt: 1 },
+  });
 
-  await rec.reconcileOnce({ readStatus: read });
-  assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED, "first sighting proves nothing");
-
-  clock.advance(30_000);
-  await rec.reconcileOnce({ readStatus: read });
-  assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED, "still inside the window");
-
-  clock.advance(40_000);
-  const out = await rec.reconcileOnce({ readStatus: read });
-  assert.equal(out.stale.length, 1);
-  // POC-2 E3/E7: the record lies in both directions, so a stuck status is
-  // BLOCKED (recoverable by a revision), never FAILED.
-  assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED);
+  const before = execution.last_event_at ?? execution.created_at;
+  clock.advance(45 * 60 * 1000);
+  const out = await rec.reconcileOnce();
+  assert.equal(out.alive.length, 1);
+  const after = await h.repos.executions.get(execution.id);
+  assert.ok(after.last_event_at > before, "the activity clock is refreshed");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED, "live is live, at any age");
+  // And the refreshed clock is exactly what keeps the watchdog from parking.
+  const stalled = await h.repos.executions.stalled(clock.now() - 30 * 60 * 1000);
+  assert.equal(stalled.length, 0, "a describe-refreshed run is not stalled");
 });
 
-test("an unreadable status leaves the task alone", async () => {
+test("an unreadable session leaves the task alone", async () => {
   const { h, task } = await dispatched();
-  const rec = createReconciler({ repos: h.repos, events: h.events, now: h.clock.now });
-  const out = await rec.reconcileOnce({ readStatus: async () => null });
+  const rec = await makeReconciler(h, {});
+  const out = await rec.reconcileOnce();
   assert.equal(out.unknown.length, 1);
   assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED, "silence is not evidence");
 });
 
-test("a status that changes resets the staleness clock", async () => {
-  const { h, clock, task } = await dispatched();
-  const rec = createReconciler({ repos: h.repos, events: h.events, config: { staleAfterMs: 60_000 }, now: clock.now });
-
-  await rec.reconcileOnce({ readStatus: async () => ({ status: "queued" }) });
-  clock.advance(50_000);
-  await rec.reconcileOnce({ readStatus: async () => ({ status: "running" }) });
-  clock.advance(50_000);
-  const out = await rec.reconcileOnce({ readStatus: async () => ({ status: "running" }) });
-  assert.equal(out.stale.length, 0, "progress restarts the window");
+test("killed/failed evidence rescues nothing and condemns nothing", async () => {
+  // TASK-2C56D3A8: the gateway's own projection says the last run of the
+  // session died (context overflow -> killed). That is evidence for an
+  // operator, not a verdict — the reconciler rescues (done) or records,
+  // and only a human condemns.
+  const { h, task, execution } = await dispatched();
+  const rec = await makeReconciler(h, {
+    [execution.session_key]: { status: "killed", endedAt: 2, abortedLastRun: true },
+  });
+  const out = await rec.reconcileOnce();
+  assert.equal(out.settled.length, 0);
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.DISPATCHED);
   assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED);
 });
 
-test("the snapshot revision is what triggers a look", async () => {
-  const h = await buildHarness();
-  let revision = 1;
+test("a BLOCKED task whose run is STILL live is aborted (concurrency invariant)", async () => {
+  // The user-visible hazard this whole change exists for: parked BLOCKED
+  // while the agent kept running frees the model slot, the worker slot and
+  // the workspace — admission then over-commits the provider. The reconciler
+  // enforces "BLOCKED ⇒ not running at the gateway".
+  const { h, task, execution } = await dispatched();
+  let abortedKey = null;
+  const { createSessionEventSink } = await import("../../src/runtime/session-events.mjs");
+  const sink = createSessionEventSink({
+    repos: h.repos, events: h.events, scheduler: h.scheduler,
+    runtime: { connect: async () => ({}), request: async () => ({}) },
+  });
   const rec = createReconciler({
     repos: h.repos,
     events: h.events,
-    runtime: { snapshot: async () => ({ revision }) },
+    runtime: {
+      describeSession: async () => ({ status: "running", startedAt: 1 }),
+      abortRun: async ({ sessionKey }) => {
+        abortedKey = sessionKey;
+        return { ok: true, aborted: true, status: "aborted" };
+      },
+    },
+    applyDescribe: (execution, session) => sink.applyDescribe(execution, session),
     now: h.clock.now,
   });
-  assert.equal(await rec.revisionChanged(), true, "first read establishes the baseline");
-  assert.equal(await rec.revisionChanged(), false, "unchanged revision means nothing moved");
-  revision = 2;
-  assert.equal(await rec.revisionChanged(), true);
+  await h.repos.executions.setStatus(execution.id, ExecutionStatus.BLOCKED, { result: "watchdog parked" });
+  await h.repos.tasks.setStatus(task.id, Status.BLOCKED, { reason: "watchdog parked" });
+
+  const out = await rec.reconcileOnce();
+  assert.ok(out.stragglers.includes(execution.id));
+  assert.equal(abortedKey, execution.session_key, "the live run under a BLOCKED task is aborted at the gateway");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED, "the task stays where a human decides");
+});
+
+test("old BLOCKED rows fall out of the scan window", async () => {
+  const { h, clock, task, execution } = await dispatched();
+  const rec = await makeReconciler(h, {
+    [execution.session_key]: { status: "running", startedAt: 1 },
+  });
+  await h.repos.executions.setStatus(execution.id, ExecutionStatus.BLOCKED, { result: "old code parked this" });
+  await h.repos.tasks.setStatus(task.id, Status.BLOCKED, { reason: "old code parked this" });
+
+  clock.advance(7 * 60 * 60 * 1000);
+  const out = await rec.reconcileOnce();
+  assert.equal(out.stragglers.length, 0, "a straggler older than the window is not described");
+});
+
+test("the pass is self-gating: finalized or keyless executions are not described", async () => {
+  const { h, task, execution } = await dispatched();
+  let describeCalls = 0;
+  const rec = createReconciler({
+    repos: h.repos,
+    events: h.events,
+    runtime: {
+      describeSession: async () => {
+        describeCalls += 1;
+        return { status: "done", endedAt: 1 };
+      },
+    },
+    applyDescribe: async () => ({ handled: false }),
+    now: h.clock.now,
+  });
+  await h.fake.completeExecution(execution.id);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
+  const out = await rec.reconcileOnce();
+  assert.equal(describeCalls, 0, "a finalized execution is not the reconciler's business");
+  assert.equal(out.settled.length, 0);
 });
 
 // --- the chat surface must be reachable --------------------------------------

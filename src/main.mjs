@@ -107,13 +107,6 @@ async function main() {
       why: "no SLACK_SIGNING_SECRET_FILE or SLACK_SIGNING_SECRET, so /api/work/slack/* will reject every request",
     });
   }
-  const reconciler = createReconciler({
-    repos: controller.repos,
-    events: controller.events,
-    runtime: agentos,
-    config: { staleAfterMs: Number(process.env.SEMANGGI_STALE_AFTER_MS ?? 10 * 60 * 1000) },
-  });
-
   // D15: the only source on this gateway version that reports a run finishing.
   sessionEvents = createSessionEventSink({
     repos: controller.repos,
@@ -124,6 +117,21 @@ async function main() {
     // from the brains table to decide wait-one-window vs block.
     brains: controller.brains,
     log: log.child({ component: "session-events" }),
+  });
+
+  // D71/D72: the watchdog's gateway verification (abort-before-park,
+  // describe-truth) and the reconciler's describe reader both bind here —
+  // after the sink exists, because the sink owns the describe→verdict mapping.
+  controller.gatewayHooks.abortRun = (p) => runtime.abortRun(p);
+  controller.gatewayHooks.describeSession = (p) => runtime.describeSession(p);
+
+  const reconciler = createReconciler({
+    repos: controller.repos,
+    events: controller.events,
+    runtime,
+    applyDescribe: (execution, session) => sessionEvents.applyDescribe(execution, session),
+    config: { blockedScanWindowMs: Number(process.env.SEMANGGI_BLOCKED_SCAN_MS ?? 6 * 60 * 60 * 1000) },
+    log: log.child({ component: "reconciler" }),
   });
 
   // The heartbeat that keeps a live run's lease alive rides on the scheduler
@@ -176,13 +184,19 @@ async function main() {
 
   controller.scheduler.start();
 
-  // Reconciliation is driven by the snapshot revision, not by a fixed poll of
-  // every task (POC-2 E3/E7: a single status read is not evidence).
+  // D72: reconciliation runs on a plain timer. The pass is self-gating — one
+  // describe per task whose latest execution is unfinalized and carries a
+  // session key — so there is nothing to save by gating it on the AgentOS
+  // snapshot revision: that revision never moves for gateway-direct runs,
+  // which is exactly the case the reconciler exists for. (The old
+  // revision-gated call sites passed no readStatus at all, so the pass had
+  // neither a trigger that fired nor a source to read — a no-op wearing the
+  // name of a safety net.)
   const reconcileTimer = setInterval(() => {
     void (async () => {
       try {
-        if (await reconciler.revisionChanged()) {
-          await reconciler.reconcileOnce();
+        const out = await reconciler.reconcileOnce();
+        if (out.settled.length > 0 || out.stragglers.length > 0) {
           await controller.scheduler.notify(WakeReason.TASK_FINISHED);
         }
       } catch (err) {

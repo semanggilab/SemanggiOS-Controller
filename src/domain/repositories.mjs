@@ -887,18 +887,6 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
 
     get: (id) => store.get(`SELECT * FROM executions WHERE id = ?`, [id]),
 
-    /**
-     * Executions that were handed to a runtime and then went quiet.
-     *
-     * D20: since D15 a terminal status arrives on the gateway's lifecycle
-     * `end` event. A run that never really started — rejected after accept, or
-     * lost when the gateway restarted — never emits one, so its execution sits
-     * DISPATCHED forever holding a workspace lease. With one workspace per
-     * project that freezes the whole project.
-     *
-     * `created_at` is the clock, not `started_at`: a run that never started has
-     * no start time, and that is exactly the case being caught.
-     */
     /** How many attempts for this task failed recently — the backoff input. */
     recentFailures: async (taskId, since) => {
       const row = await store.get(
@@ -909,14 +897,45 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       return row?.n ?? 0;
     },
 
+    /**
+     * Executions that were handed to a runtime and then went quiet.
+     *
+     * D20: since D15 a terminal status arrives on the gateway's lifecycle
+     * `end` event. A run that never really started — rejected after accept, or
+     * lost when the gateway restarted — never emits one, so its execution sits
+     * DISPATCHED forever holding a workspace lease. With one workspace per
+     * project that freezes the whole project.
+     *
+     * D71: the clock is the last OBSERVED activity (`last_event_at`, bumped by
+     * every recorded message/tool frame and by a "still running" describe),
+     * not `created_at`. The old age-since-dispatch test parked two live runs
+     * on the cluster (TASK-E2854DB9: 103 messages AFTER the park;
+     * TASK-2C56D3A8: 440) — a run streaming events is not stalled no matter
+     * how old it is. `last_event_at` falls back to `created_at` for rows from
+     * before the column existed, which is exactly the "never started, never
+     * emitted" case D20 was written for.
+     */
     stalled: (cutoff) =>
       store.all(
         `SELECT * FROM executions
           WHERE status IN ('DISPATCHED','RUNNING')
             AND finalized_at IS NULL
-            AND created_at <= ?
+            AND COALESCE(last_event_at, created_at) <= ?
           ORDER BY created_at ASC`,
         [cutoff],
+      ),
+
+    /**
+     * Records observed gateway activity on an execution (D71). Monotonic —
+     * an out-of-order event never drags the clock back — and silent on final
+     * rows: the immutability trigger would turn a late frame into an error,
+     * and the row's story is already closed anyway.
+     */
+    touch: (id, at) =>
+      store.run(
+        `UPDATE executions SET last_event_at = MAX(COALESCE(last_event_at, 0), ?)
+           WHERE id = ? AND finalized_at IS NULL`,
+        [at, id],
       ),
 
     listByTask: (taskId) =>

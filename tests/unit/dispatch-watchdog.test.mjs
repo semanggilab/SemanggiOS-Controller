@@ -237,3 +237,175 @@ test("an oversized instruction is refused rather than billed", async () => {
     /over the .* byte limit/,
   );
 });
+
+// ── D71: the watchdog keys on observed activity, not dispatch age ───────────
+//
+// The cluster incident this section regresses: TASK-E2854DB9 (64 min, 103
+// messages AFTER the park) and TASK-2C56D3A8 (2j48m, 440 after) were both
+// parked at exactly the 30-minute mark while still streaming — the old
+// `stalled()` keyed on created_at, which says nothing about a run's life.
+
+test("a streaming run is never stalled, however old (TASK-E2854DB9 shape)", async () => {
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "streams forever" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const key = execution.session_key;
+
+  const { createSessionEventSink } = await import("../../src/runtime/session-events.mjs");
+  const sink = createSessionEventSink({
+    repos: h.repos, events: h.events, scheduler: h.scheduler,
+    runtime: { connect: async () => ({}), request: async () => ({}) },
+  });
+
+  // 40 minutes of life, a message every ten: past the old 30-minute wall the
+  // whole time, alive the whole time.
+  for (let i = 0; i < 4; i++) {
+    clock.advance(10 * 60 * 1000);
+    await sink.handle("session.message", {
+      sessionKey: key, messageSeq: i + 1,
+      message: { role: "assistant", content: "work", timestamp: clock.now() },
+    });
+  }
+  assert.equal((await h.repos.executions.stalled(clock.now() - 30 * 60 * 1000)).length, 0,
+    "a run that streamed four times in forty minutes is not stalled");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED);
+
+  // Now it really goes quiet — and the fake gateway (which never learned of a
+  // live run) confirms via abort that nothing is running, so it parks safely.
+  clock.advance(31 * 60 * 1000);
+  const reclaimed = await h.scheduler.reclaimStalledDispatches();
+  assert.deepEqual(reclaimed, [execution.id]);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED);
+});
+
+test("a run the GATEWAY says is live is not parked — our silence is not its death", async () => {
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "subscription gap" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  h.fake.gateway.markRunning(execution.session_key);
+
+  // Hours of controller-side silence — the exact TASK-2C56D3A8 shape (2j48m).
+  clock.advance(3 * 60 * 60 * 1000);
+  const reclaimed = await h.scheduler.reclaimStalledDispatches();
+  assert.deepEqual(reclaimed, [], "a gateway-live run is never reclaimed");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.DISPATCHED);
+  const after = await h.repos.executions.get(execution.id);
+  assert.ok(after.last_event_at >= clock.now() - 1000, "the describe refreshed the activity clock");
+});
+
+test("a run the GATEWAY says finished is not parked — the reconciler rescues it", async () => {
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "lost end frame" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  h.fake.gateway.markTerminal(execution.session_key, "done");
+
+  clock.advance(31 * 60 * 1000);
+  assert.deepEqual(await h.scheduler.reclaimStalledDispatches(), [],
+    "parking BLOCKED under a finished run would free the workspace for a sibling for nothing");
+
+  // And the same evidence settles it COMPLETE within one reconcile pass.
+  const { createSessionEventSink } = await import("../../src/runtime/session-events.mjs");
+  const { createReconciler } = await import("../../src/runtime/reconciler.mjs");
+  const sink = createSessionEventSink({
+    repos: h.repos, events: h.events, scheduler: h.scheduler,
+    runtime: { connect: async () => ({}), request: async () => ({}) },
+  });
+  const reconciler = createReconciler({
+    repos: h.repos, events: h.events, runtime: h.runtime,
+    applyDescribe: (e, s) => sink.applyDescribe(e, s), now: clock.now,
+  });
+  const out = await reconciler.reconcileOnce();
+  assert.equal(out.settled.length, 1);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE);
+});
+
+test("parking waits for abort confirmation — an unverifiable run keeps its slot", async () => {
+  // The concurrency invariant (the over-commit hazard): BLOCKED frees the
+  // model slot, the worker slot and the lease. None of that may happen while
+  // the run's fate at the gateway is unknown.
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "gateway unreachable" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const path = (await h.repos.tasks.get(task.id)).workspace_path;
+
+  // A gateway that cannot answer (describe null — session unknown to it — and
+  // abort failing outright).
+  h.gatewayHooks.describeSession = async () => null;
+  h.gatewayHooks.abortRun = async () => ({ ok: false, aborted: false, reason: "gateway unreachable" });
+
+  clock.advance(31 * 60 * 1000);
+  const reclaimed = await h.scheduler.reclaimStalledDispatches();
+  assert.deepEqual(reclaimed, [], "an unverifiable run is not parked");
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.DISPATCHED);
+  assert.ok(await h.repos.leases.get(path), "the lease stays while the outcome is unknown");
+  assert.equal(await h.repos.resources.activeCount(execution.model_provider, execution.model_id), 1,
+    "the model slot stays occupied while the run may still be live");
+});
+
+test("a confirmed stop parks with the evidence named", async () => {
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "quiet and dead" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+
+  // The run IS live at the gateway, but describe cannot see it (an unknown
+  // session to that surface — the shape a pruned or restart-lost session has).
+  // The watchdog must not free anything until abort has actually stopped it.
+  h.fake.gateway.markRunning(execution.session_key);
+  h.gatewayHooks.describeSession = async () => null;
+  clock.advance(31 * 60 * 1000);
+  const reclaimed = await h.scheduler.reclaimStalledDispatches();
+  assert.deepEqual(reclaimed, [execution.id]);
+  assert.ok(h.fake.gateway.aborts.includes(execution.session_key), "abort ran before anything was freed");
+  const parked = await h.repos.executions.get(execution.id);
+  assert.equal(parked.status, ExecutionStatus.BLOCKED);
+  assert.match(parked.result, /aborted live run at gateway/);
+});
+
+// ── The over-commit scenario, end to end ────────────────────────────────────
+
+test("a live-but-silent run still holds the provider's last concurrency slot", async () => {
+  // The exact accounting failure reported: a task parked BLOCKED while its
+  // agent kept running freed a slot that no longer existed, so admission
+  // dispatched a second task onto a provider already at its limit. With
+  // describe-verification the slot is only freed on gateway-confirmed truth.
+  const clock = new Clock(1_000_000);
+  const h = await buildHarness({ clock });
+  const { project, worker } = await seedBasics(h, { concurrencyLimit: 1, maxConcurrent: 8 });
+  const first = await queuedTask(h, { project, worker, title: "silent but alive", isolate: true });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(first.id);
+  assert.equal(execution.model_provider, "google"); // documentation/normal -> gemini-flash
+  h.fake.gateway.markRunning(execution.session_key);
+
+  clock.advance(31 * 60 * 1000);
+  await h.scheduler.reclaimStalledDispatches();
+  assert.equal((await h.repos.tasks.get(first.id)).status, Status.DISPATCHED,
+    "the run is live at the gateway; parking it would invent a free slot");
+
+  // Pinned to the SAME model — otherwise D68 failover routes the second task
+  // elsewhere and the test stops being about concurrency accounting.
+  const second = await queuedTask(h, {
+    project, worker, title: "wants the same model", isolate: true,
+    modelPolicy: { preferred: ["gemini-flash"] },
+  });
+  await h.scheduler.notify();
+  assert.equal((await h.repos.tasks.get(second.id)).status, Status.WAIT_CONCURRENCY,
+    "the provider's only slot is still truthfully occupied");
+  assert.equal(await h.repos.resources.activeCount("google", "gemini-flash"), 1);
+});

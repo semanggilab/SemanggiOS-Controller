@@ -1,25 +1,36 @@
-// Status reconciliation.
+// Status reconciliation — rewritten around the gateway's own session
+// projection (D72).
 //
-// POC-2 E3 and E7 both found dispatch records that stayed `running`, or
-// reported `timeout` with `timeoutPhase: gateway_draining`, while the work had
-// actually succeeded. So a single status read is not evidence, and a task must
-// never be declared failed on the strength of one poll.
+// History, because the shape of this file is a lesson: the first reconciler
+// read a status through an injected `readStatus` that production never wired
+// (main.mjs called reconcileOnce() with no argument — every lookup "unknown",
+// nothing ever settled), and even a wired reader had nothing to read:
+// /api/snapshot carries AgentOS dispatch records only, and runs dispatched
+// straight to the Gateway never appear in it (D15). Meanwhile the fast path
+// (sessions.subscribe lifecycle `end`) loses events in every reconnect gap —
+// the controller re-subscribes once a minute — and that is how executions
+// finished cleanly at the gateway while their tasks sat BLOCKED forever
+// (TASK-E2854DB9: gateway logged `ended with stopReason=stop`; the controller
+// never saw a byte of it).
 //
-// The rules here follow from that:
-//   - a terminal runtime status is believed immediately;
-//   - a non-terminal one is only believed after it has been seen unchanged for
-//     `staleAfterMs`, and even then it produces BLOCKED (recoverable), never
-//     FAILED;
-//   - artifacts on disk outrank the status field, because E3 showed the work
-//     completing while the record said otherwise.
+// `sessions.describe {key}` (measured live on 2026.7.1, protocol 4) returns
+// the gateway's durable run classification — running | done | timeout |
+// killed | failed — and is the one after-the-fact source that exists. The
+// rules now follow from what it can and cannot prove:
+//
+//   - `done` is positive success evidence: settle COMPLETE (the D57 edge —
+//     a late outcome outranks the watchdog's guess — delivered by describe).
+//   - `running` is activity proof: refresh the execution's activity clock so
+//     the watchdog cannot false-park a live run our subscription lost sight
+//     of, and — for a task already parked BLOCKED — abort the straggler so
+//     the invariant "BLOCKED ⇒ not running at the gateway" holds. That
+//     invariant is what makes freeing the concurrency slot, the worker slot
+//     and the workspace lease at park time truthful instead of optimistic.
+//   - killed/failed/timeout are evidence, not verdicts: the reconciler
+//     rescues, humans condemn. Those rows stay BLOCKED/resumable and the
+//     operator reads the recorded evidence.
 import { Status, ExecutionStatus } from "../domain/state-machine.mjs";
 import { EventKind } from "../domain/events.mjs";
-
-const TERMINAL_RUNTIME = {
-  completed: ExecutionStatus.COMPLETE,
-  cancelled: ExecutionStatus.CANCELLED,
-  failed: ExecutionStatus.FAILED,
-};
 
 // Exported because the settle API endpoint answers the same question the
 // reconciler does — "this execution is final, so where does the task stand?"
@@ -32,98 +43,116 @@ export const TASK_FOR_EXECUTION = {
   [ExecutionStatus.BLOCKED]: Status.BLOCKED,
 };
 
-export function createReconciler({ repos, events, runtime, config = {}, now = () => Date.now() }) {
-  const staleAfterMs = config.staleAfterMs ?? 10 * 60 * 1000;
-  const lastSeen = new Map(); // executionId -> {status, at}
+export function createReconciler({
+  repos,
+  events,
+  // The gateway runtime: { describeSession({key}) -> session|null }. Null
+  // runtime means no reconciliation source — the pass reports everything as
+  // unknown and settles nothing (same honest shape as before, now by design).
+  runtime = null,
+  // The session-event sink's applyDescribe(execution, session) — the single
+  // owner of the describe→COMPLETE mapping, shared with nothing.
+  applyDescribe = null,
+  config = {},
+  now = () => Date.now(),
+  log = { info() {}, warn() {}, error() {} },
+}) {
+  // BLOCKED tasks are scanned only inside this window from the execution's
+  // last observed activity: the abort-before-park watchdog (D71) already
+  // guarantees new BLOCKED rows are confirmed stopped, so this sweep exists
+  // for stragglers — rows parked by the old code while their runs kept
+  // going. A window bounded in hours keeps the pass from describing every
+  // task ever parked.
+  const blockedScanWindowMs = config.blockedScanWindowMs ?? 6 * 60 * 60 * 1000;
+
+  async function describe(key) {
+    if (!runtime || typeof runtime.describeSession !== "function") return null;
+    try {
+      return await runtime.describeSession({ key });
+    } catch {
+      return null;
+    }
+  }
+
+  async function abortStraggler(execution, task, session) {
+    if (typeof runtime.abortRun !== "function") return false;
+    const abort = await runtime.abortRun({ sessionKey: execution.session_key }).catch(() => null);
+    const stopped = Boolean(abort?.ok && (abort.aborted || abort.status === "no-active-run"));
+    await events.append({
+      kind: EventKind.EXECUTION_STATUS,
+      subjectType: "execution",
+      subjectId: execution.id,
+      actor: "reconciler",
+      payload: {
+        source: "sessions.describe",
+        observed: "running-under-blocked",
+        stopConfirmed: stopped,
+        abort: abort ? { aborted: abort.aborted, status: abort.status ?? null } : null,
+        sessionStatus: session?.status ?? null,
+      },
+    });
+    log.warn("reconciler.blocked-still-running", {
+      task: task.id, exec: execution.id, session: execution.session_key,
+      stopped, abortStatus: abort?.status ?? null,
+    });
+    return stopped;
+  }
 
   /**
-   * @param readStatus  (runtimeRef) => {status, result?} | null
-   *   Injected so the source can be the SSE stream, a snapshot diff, or a test
-   *   double, without the reconciliation rules caring which.
+   * One reconciliation pass. Self-gating: only tasks whose latest execution
+   * is unfinalized AND carries a session key are examined, so the pass costs
+   * one describe per piece of possibly-live work — not per task in the DB.
    */
-  async function reconcileOnce({ readStatus } = {}) {
-    const read = readStatus ?? (async () => null);
-    const outcome = { settled: [], stale: [], unknown: [] };
+  async function reconcileOnce() {
+    const outcome = { settled: [], alive: [], stragglers: [], unknown: [] };
+    const describeSession = typeof applyDescribe === "function" ? applyDescribe : null;
 
-    for (const status of [Status.DISPATCHED, Status.RUNNING, Status.WAIT_HUMAN]) {
+    for (const status of [Status.DISPATCHED, Status.RUNNING, Status.WAIT_HUMAN, Status.BLOCKED]) {
       for (const task of await repos.tasks.list({ status, limit: 10_000 })) {
         const execution = await repos.executions.latest(task.id);
-        if (!execution?.runtime_ref) continue;
+        if (!execution?.session_key) continue;
+        if (execution.finalized_at) continue;
+        if (status === Status.BLOCKED) {
+          const lastActive = execution.last_event_at ?? execution.created_at;
+          if (now() - lastActive > blockedScanWindowMs) continue;
+        }
 
-        const report = await read(execution.runtime_ref);
-        if (!report) {
+        const session = await describe(execution.session_key);
+        if (!session) {
           outcome.unknown.push(execution.id);
           continue;
         }
 
-        const mapped = TERMINAL_RUNTIME[String(report.status).toLowerCase()];
-        if (mapped) {
-          await settle(task, execution, mapped, report.result ?? null, "runtime reported a terminal status");
-          outcome.settled.push({ executionId: execution.id, status: mapped });
-          lastSeen.delete(execution.id);
+        if (session.status === "running") {
+          // Activity proof. Refresh the clock the watchdog reads, so a live
+          // run our subscription lost sight of cannot be false-parked at the
+          // 30-minute mark (D71's other half).
+          await repos.executions.touch(execution.id, now());
+          outcome.alive.push(execution.id);
+          if (status === Status.BLOCKED) {
+            // Parked by the old watchdog while the run kept going: enforce
+            // the invariant the accounting depends on.
+            await abortStraggler(execution, task, session);
+            outcome.stragglers.push(execution.id);
+          }
           continue;
         }
 
-        // Non-terminal. Track how long it has looked like this.
-        const seen = lastSeen.get(execution.id);
-        if (!seen || seen.status !== report.status) {
-          lastSeen.set(execution.id, { status: report.status, at: now() });
-          continue;
+        if (session.status === "done" && describeSession) {
+          const result = await describeSession(execution, session);
+          if (result?.handled) {
+            outcome.settled.push({ executionId: execution.id, status: Status.COMPLETE });
+            continue;
+          }
         }
-        if (now() - seen.at < staleAfterMs) continue;
-
-        // Stale. POC-2 showed the record can lie in both directions, so the
-        // task is blocked (recoverable via a revision) rather than failed.
-        await settle(
-          task,
-          execution,
-          ExecutionStatus.BLOCKED,
-          `runtime status stuck at "${report.status}" for ${Math.round((now() - seen.at) / 1000)}s`,
-          "stale runtime status",
-        );
-        outcome.stale.push({ executionId: execution.id, runtimeStatus: report.status });
-        lastSeen.delete(execution.id);
+        // killed/failed/timeout: evidence only. A DISPATCHED task here will
+        // be parked by the watchdog's own describe+abort confirmation with a
+        // truthful reason; a BLOCKED one is already where a human decides.
       }
     }
 
     return outcome;
   }
 
-  async function settle(task, execution, executionStatus, result, reason) {
-    await repos.executions.setStatus(execution.id, executionStatus, { result });
-    const taskStatus = TASK_FOR_EXECUTION[executionStatus];
-    if (taskStatus && taskStatus !== task.status) {
-      await repos.tasks.setStatus(task.id, taskStatus, { waitDetail: null, actor: "reconciler" });
-    }
-    if (task.workspace_path) {
-      const lease = await repos.leases.get(task.workspace_path);
-      if (lease?.execution_id === execution.id)
-        await repos.leases.release(task.workspace_path, { executionId: execution.id, actor: "reconciler" });
-    }
-    await events.append({
-      kind: EventKind.EXECUTION_STATUS,
-      subjectType: "execution",
-      subjectId: execution.id,
-      actor: "reconciler",
-      payload: { to: executionStatus, reason, result },
-    });
-  }
-
-  /**
-   * Snapshot-driven trigger. /api/snapshot carries a `revision` that changes
-   * when anything moves, so it tells us when to look rather than us polling
-   * every task on a timer.
-   */
-  let lastRevision = null;
-  async function revisionChanged() {
-    if (!runtime?.snapshot) return false;
-    const snap = await runtime.snapshot().catch(() => null);
-    if (!snap) return false;
-    const revision = snap.revision ?? null;
-    const changed = revision !== lastRevision;
-    lastRevision = revision;
-    return changed;
-  }
-
-  return { reconcileOnce, revisionChanged };
+  return { reconcileOnce };
 }

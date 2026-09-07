@@ -24,12 +24,22 @@ export const WakeReason = Object.freeze({
 
 export function createScheduler({ admission, repos, config = {}, now = () => Date.now() }) {
   const watchdogMs = config.watchdogMs ?? 30_000;
-  // How long a dispatched execution may stay silent before it is reclaimed
+  // How long a dispatched execution may stay quiet before it is reclaimed
   // (D20). Deliberately generous: a long reasoning turn is normal, and
-  // reclaiming live work would be worse than reclaiming late.
+  // reclaiming live work would be worse than reclaiming late. Since D71
+  // "quiet" is measured from the last OBSERVED activity (message, tool frame,
+  // lifecycle start, or a describe that says "running"), not from dispatch —
+  // the age-since-dispatch test parked two live runs on the cluster at
+  // exactly the 30-minute mark.
   const dispatchTimeoutMs = config.dispatchTimeoutMs ?? 30 * 60 * 1000;
   const leaseTtlMs = config.leaseTtlMs ?? 15 * 60 * 1000;
   const log = config.log ?? nullLogger;
+  // Late-bound gateway hooks (D71): { abortRun, describeSession }. The
+  // scheduler is built before the session-event sink exists, so main.mjs
+  // fills this holder in afterwards; an empty holder means "no gateway
+  // verification available" and the watchdog falls back to parking on
+  // silence alone (the resumable BLOCKED of D20).
+  const hooks = config.gatewayHooks ?? {};
   let running = false;
   let pendingReasons = new Set();
   let timer = null;
@@ -112,8 +122,70 @@ export function createScheduler({ admission, repos, config = {}, now = () => Dat
     const reclaimed = [];
     for (const execution of stalled) {
       const task = await repos.tasks.get(execution.task_id);
-      const detail = `no runtime event for ${Math.round((now() - execution.created_at) / 1000)}s after dispatch`;
+      const sessionKey = execution.session_key ?? null;
       try {
+        // D71, step 1 — ask the gateway before guessing. Silence in OUR
+        // subscription is not silence at the run: the controller re-subscribes
+        // every 60s and every reconnect gap eats events, which is how two live
+        // runs came to be parked on the cluster while still streaming.
+        if (sessionKey && typeof hooks.describeSession === "function") {
+          const session = await hooks.describeSession({ key: sessionKey });
+          if (session?.status === "running") {
+            // The run is alive; our view of it is what died. Refresh the
+            // activity clock and leave it alone — the reconciler keeps
+            // watching, and its describe will deliver the outcome.
+            await repos.executions.touch(execution.id, now());
+            log.info("dispatch.still-running", {
+              task: task?.id ?? null, exec: execution.id, session: sessionKey,
+              silentForMs: now() - (execution.last_event_at ?? execution.created_at),
+            });
+            continue;
+          }
+          if (session?.status === "done") {
+            // The run finished and we never saw the end frame. Do NOT park —
+            // BLOCKED would free the workspace for a sibling while the
+            // reconciler is about to prove COMPLETE. Touch so this pass does
+            // not re-litigate, and let the reconciler's describe settle it.
+            await repos.executions.touch(execution.id, session.endedAt ?? now());
+            log.info("dispatch.finished-unseen", {
+              task: task?.id ?? null, exec: execution.id, session: sessionKey,
+              endedAt: session.endedAt ?? null,
+            });
+            continue;
+          }
+        }
+
+        // D71, step 2 — confirm the run is stopped BEFORE freeing anything.
+        // Parking marks the execution BLOCKED, which releases a concurrency
+        // slot, a worker slot and the workspace lease. If the run is actually
+        // still alive at the gateway, all three go free while the provider
+        // keeps serving the zombie — the accounting then under-counts real
+        // usage and admission over-commits past the provider's limit.
+        // `sessions.abort` is the confirmation because its contract
+        // distinguishes "I stopped it" (abortedRunId) from "nothing was
+        // running" (status:"no-active-run").
+        let stopConfirmed = "unverified";
+        if (sessionKey && typeof hooks.abortRun === "function") {
+          const abort = await hooks.abortRun({ sessionKey });
+          if (abort.ok && (abort.aborted || abort.status === "no-active-run")) {
+            stopConfirmed = abort.aborted ? "aborted live run at gateway" : "no active run at gateway";
+          } else {
+            // Inconclusive (gateway unreachable, session unknown): hold the
+            // row exactly as it is. It stays DISPATCHED, keeps its lease
+            // heartbeat, keeps occupying its concurrency slot — conservative
+            // is the only safe direction — and the next tick retries.
+            log.warn("dispatch.park-deferred", {
+              task: task?.id ?? null, exec: execution.id, session: sessionKey,
+              reason: abort.reason ?? `abort status ${abort.status ?? "?"}`,
+            });
+            continue;
+          }
+        }
+
+        const quietForMs = now() - (execution.last_event_at ?? execution.created_at);
+        const detail =
+          `no runtime event for ${Math.round(quietForMs / 1000)}s` +
+          (stopConfirmed === "unverified" ? " after last activity" : ` (${stopConfirmed})`);
         await repos.executions.setStatus(execution.id, ExecutionStatus.BLOCKED, { result: detail });
         if (task) {
           await repos.tasks.setStatus(task.id, Status.BLOCKED, { reason: detail, actor: "dispatch-watchdog" });
@@ -127,8 +199,9 @@ export function createScheduler({ admission, repos, config = {}, now = () => Dat
         log.warn("dispatch.timeout", {
           task: task?.id ?? null, exec: execution.id,
           provider: execution.model_provider, model: execution.model_id,
-          silentForMs: now() - execution.created_at,
+          silentForMs: quietForMs,
           workspace: task?.workspace_path ?? null,
+          stopConfirmed,
         });
         reclaimed.push(execution.id);
       } catch (err) {

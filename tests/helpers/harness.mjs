@@ -49,6 +49,11 @@ export async function buildHarness({ routing = SAMPLE_ROUTING, config = {}, cloc
   const holder = {};
   const runtime = {
     dispatch: (req) => holder.fake.dispatch(req),
+    // D71/D72: the same gateway surfaces production wires through
+    // gatewayHooks, exposed here so watchdog/reconciler tests exercise the
+    // real verification paths instead of skipping them.
+    abortRun: (p) => holder.fake.abortRun(p),
+    describeSession: (p) => holder.fake.describeSession(p),
   };
   const controller = await createController({
     routing,
@@ -58,7 +63,9 @@ export async function buildHarness({ routing = SAMPLE_ROUTING, config = {}, cloc
     ...(log ? { log } : {}),
   });
   holder.fake = createFakeAgentOS({ repos: controller.repos });
-  return { ...controller, clock, fake: holder.fake };
+  controller.gatewayHooks.abortRun = runtime.abortRun;
+  controller.gatewayHooks.describeSession = runtime.describeSession;
+  return { ...controller, clock, fake: holder.fake, runtime };
 }
 
 /** Convenience seeding: one project, one worker, one available model. */

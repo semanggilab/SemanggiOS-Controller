@@ -145,6 +145,82 @@ export function createSessionEventSink({
   // session, and the lifecycle `end` event (which has both) closes the loop.
   const pendingUsage = new Map();
 
+  /**
+   * The shared tail of every "this run is over, here is the outcome" path:
+   * execution status, task follows where the state machine allows, retry
+   * reset, lease release, audit event, scheduler wake. Used by the live
+   * `end` event (applyEnd) and by the describe-driven rescue (applyDescribe)
+   * so the two cannot drift — D57's settle lesson applies to code too.
+   */
+  async function finalizeRun(execution, verdict, { source, reason, usage = null, sessionId = null, extra = {} }) {
+    const runId = execution.id;
+    await repos.executions.setStatus(runId, verdict.execution, { result: reason });
+    // The run's outcome is recorded on the execution no matter where the task
+    // went, but the task only follows where the state machine allows. Two
+    // measured shapes of "the task moved on": the watchdog parked it BLOCKED
+    // and the real end arrived late (that one is now a legal BLOCKED →
+    // COMPLETE — the parking was a guess, this is the truth), and an operator
+    // CANCELLED the task while its run was still alive — CANCELLED is a dead
+    // end by design, so the task stays abandoned while the execution above
+    // says what really happened. Before this check, the forced transition
+    // threw inside handle()'s catch-all and the lease release, the audit
+    // event and the scheduler wake below were all skipped along with it —
+    // which is how TASK-7A3CC32A sat BLOCKED against a COMPLETE execution.
+    const taskBefore = await repos.tasks.get(execution.task_id);
+    const taskFollows =
+      taskBefore && (taskBefore.status === verdict.task || canTransition(taskBefore.status, verdict.task));
+    if (taskFollows) {
+      await repos.tasks.setStatus(execution.task_id, verdict.task, {
+        reason: verdict.task === Status.COMPLETE ? null : `run ended: ${reason}`,
+        actor: "session-events",
+      });
+    } else {
+      log.warn("run.ended-task-unmoved", {
+        task: execution.task_id, exec: runId,
+        taskStatus: taskBefore?.status ?? null, verdict: verdict.task,
+      });
+    }
+    if (taskFollows && verdict.task === Status.COMPLETE) {
+      // D51/D52: success starts the retry counts over. A task that got
+      // through once does not carry the attempts of the run that finally
+      // worked — the counts measure one losing streak, not a task's life.
+      await repos.tasks.resetRetries(execution.task_id);
+    }
+
+    const task = await repos.tasks.get(execution.task_id);
+    if (task?.workspace_path) {
+      const lease = await repos.leases.get(task.workspace_path);
+      if (lease?.execution_id === runId)
+        await repos.leases.release(task.workspace_path, { executionId: runId, actor: "session-events" });
+    }
+
+    await events.append({
+      kind: EventKind.EXECUTION_STATUS,
+      subjectType: "execution",
+      subjectId: runId,
+      payload: { source, ...extra },
+    });
+
+    // A finished run frees a lease, a worker slot and provider concurrency, so
+    // the queue should move immediately rather than waiting for the watchdog.
+    log.info("run.ended", {
+      task: execution.task_id, exec: runId,
+      provider: execution.model_provider, model: execution.model_id,
+      stopReason: reason,
+      taskStatus: task?.status ?? verdict.task,
+      tokens: usage
+        ? {
+            input: usage.input_tokens, output: usage.output_tokens,
+            cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens,
+            costUsd: usage.providerCostUsd,
+          }
+        : null,
+      sessionId,
+    });
+    await scheduler?.notify?.("RUN_ENDED");
+    return { handled: true, status: task?.status ?? verdict.task };
+  }
+
   async function applyEnd(runId, data, payload) {
     const execution = await repos.executions.get(runId);
     if (!execution) {
@@ -186,80 +262,82 @@ export function createSessionEventSink({
       await repos.executions.update(runId, { session_ref: payload.sessionId });
     }
 
-    await repos.executions.setStatus(runId, verdict.execution, { result: verdict.reason });
-    // The run's outcome is recorded on the execution no matter where the task
-    // went, but the task only follows where the state machine allows. Two
-    // measured shapes of "the task moved on": the watchdog parked it BLOCKED
-    // and the real end arrived late (that one is now a legal BLOCKED →
-    // COMPLETE — the parking was a guess, this is the truth), and an operator
-    // CANCELLED the task while its run was still alive — CANCELLED is a dead
-    // end by design, so the task stays abandoned while the execution above
-    // says what really happened. Before this check, the forced transition
-    // threw inside handle()'s catch-all and the lease release, the audit
-    // event and the scheduler wake below were all skipped along with it —
-    // which is how TASK-7A3CC32A sat BLOCKED against a COMPLETE execution.
-    const taskBefore = await repos.tasks.get(execution.task_id);
-    const taskFollows =
-      taskBefore && (taskBefore.status === verdict.task || canTransition(taskBefore.status, verdict.task));
-    if (taskFollows) {
-      await repos.tasks.setStatus(execution.task_id, verdict.task, {
-        reason: verdict.task === Status.COMPLETE ? null : `run ended: ${verdict.reason}`,
-        actor: "session-events",
-      });
-    } else {
-      log.warn("run.ended-task-unmoved", {
-        task: execution.task_id, exec: runId,
-        taskStatus: taskBefore?.status ?? null, verdict: verdict.task,
-      });
-    }
-    if (taskFollows && verdict.task === Status.COMPLETE) {
-      // D51/D52: success starts the retry counts over. A task that got
-      // through once does not carry the attempts of the run that finally
-      // worked — the counts measure one losing streak, not a task's life.
-      await repos.tasks.resetRetries(execution.task_id);
-    }
-
-    const task = await repos.tasks.get(execution.task_id);
-    if (task?.workspace_path) {
-      const lease = await repos.leases.get(task.workspace_path);
-      if (lease?.execution_id === runId)
-        await repos.leases.release(task.workspace_path, { executionId: runId, actor: "session-events" });
-    }
-
-    await events.append({
-      kind: EventKind.EXECUTION_STATUS,
-      subjectType: "execution",
-      subjectId: runId,
-      payload: {
-        source: "sessions.subscribe",
+    return finalizeRun(execution, verdict, {
+      source: "sessions.subscribe",
+      reason: verdict.reason,
+      usage,
+      sessionId: payload?.sessionId ?? null,
+      extra: {
         stopReason: verdict.reason,
         aborted: Boolean(data?.aborted),
         startedAt: data?.startedAt ?? null,
         endedAt: data?.endedAt ?? null,
       },
     });
+  }
 
-    // A finished run frees a lease, a worker slot and provider concurrency, so
-    // the queue should move immediately rather than waiting for the watchdog.
-    log.info("run.ended", {
-      task: execution.task_id, exec: runId,
-      provider: execution.model_provider, model: execution.model_id,
-      stopReason: verdict.reason, aborted: Boolean(data?.aborted),
-      // The status the task ACTUALLY has now — normally the verdict's, but a
-      // task that went terminal first (e.g. cancelled mid-run) keeps its own.
-      taskStatus: task?.status ?? verdict.task,
-      durationMs: data?.startedAt && data?.endedAt ? data.endedAt - data.startedAt : null,
-      tokens: usage
-        ? {
-            input: usage.input_tokens, output: usage.output_tokens,
-            cacheRead: usage.cache_read_input_tokens, cacheWrite: usage.cache_creation_input_tokens,
-            costUsd: usage.providerCostUsd,
-          }
-        : null,
-      sessionId: payload?.sessionId ?? null,
-    });
-    await scheduler?.notify?.("RUN_ENDED");
-    return { handled: true, status: task?.status ?? verdict.task };
+  /**
+   * The describe-driven rescue (D72): the gateway's own session projection
+   * says the run finished ("done") while the execution here is still
+   * DISPATCHED/RUNNING or parked BLOCKED. That is the shape left behind when
+   * the lifecycle `end` frame was lost in a subscription gap — TASK-E2854DB9
+   * (gateway logged `ended with stopReason=stop`; the controller never saw
+   * it) and TASK-2C56D3A8 sat BLOCKED exactly like this.
+   *
+   * "done" is the ONLY verdict applied automatically. killed/failed/timeout
+   * are evidence an operator should read, not a verdict to condemn with: the
+   * reconciler rescues, humans condemn.
+   */
+  async function applyDescribe(execution, session) {
+    if (!execution || !session) return { handled: false, reason: "no execution or session" };
+    // Re-read: the caller's copy can be stale (the reconciler reads, then a
+    // late end event finalizes the row, then this runs). Writing through a
+    // stale copy would fire the immutability trigger — the same race D57
+    // taught applyEnd to respect, caught here BEFORE any write.
+    const fresh = await repos.executions.get(execution.id);
+    if (!fresh) return { handled: false, reason: "unknown execution" };
+    if (fresh.finalized_at) return { handled: false, reason: "already final" };
+    execution = fresh;
+    if (session.status !== "done") return { handled: false, reason: `session status ${session.status}` };
+
+    // describe carries the session's token totals. Write them only when we
+    // never recorded per-message usage — overwriting a live reading with a
+    // session aggregate would be the same lie D17 caught, in reverse.
+    if (
+      Number.isFinite(session.inputTokens) || Number.isFinite(session.outputTokens)
+    ) {
+      const current = await repos.executions.get(execution.id);
+      if ((current?.tokens_input ?? 0) === 0 && (current?.tokens_output ?? 0) === 0) {
+        await repos.executions.recordUsage(execution.id, {
+          input_tokens: Number.isFinite(session.inputTokens) ? session.inputTokens : 0,
+          output_tokens: Number.isFinite(session.outputTokens) ? session.outputTokens : 0,
+        });
+      }
+    }
+    const storedIsOurOwnKey =
+      typeof execution.session_ref === "string" && execution.session_ref.startsWith("agent:");
+    if (session.sessionId && (!execution.session_ref || storedIsOurOwnKey)) {
+      await repos.executions.update(execution.id, { session_ref: session.sessionId });
+    }
+    if (Number.isFinite(session.endedAt)) {
+      await repos.executions.touch(execution.id, session.endedAt);
+    }
+
+    return finalizeRun(
+      execution,
+      { execution: ExecutionStatus.COMPLETE, task: Status.COMPLETE },
+      {
+        source: "sessions.describe",
+        reason: "done",
+        sessionId: session.sessionId ?? null,
+        extra: {
+          stopReason: "done (gateway session projection)",
+          startedAt: session.startedAt ?? null,
+          endedAt: session.endedAt ?? null,
+          abortedLastRun: Boolean(session.abortedLastRun),
+        },
+      },
+    );
   }
 
   /**
@@ -563,6 +641,9 @@ export function createSessionEventSink({
       content: msg.content,
       at: msg.timestamp ?? now(),
     });
+    // D71: a message IS runtime evidence. The watchdog used to key on
+    // dispatch age and parked runs that were streaming the whole time.
+    await repos.executions.touch(execId, msg.timestamp ?? now());
     return true;
   }
 
@@ -597,6 +678,7 @@ export function createSessionEventSink({
       content: [block],
       at: p?.timestamp ?? now(),
     });
+    await repos.executions.touch(execId, p?.timestamp ?? now());
     return true;
   }
 
@@ -642,6 +724,7 @@ export function createSessionEventSink({
       }],
       at: payload?.ts ?? now(),
     });
+    await repos.executions.touch(execId, payload?.ts ?? now());
     return true;
   }
 
@@ -685,6 +768,12 @@ export function createSessionEventSink({
         return;
       }
       if (payload?.stream !== "lifecycle") return;
+      // A `start` frame is the first sign of life a dispatched run can give;
+      // it counts as activity exactly like a message (D71).
+      if (payload?.data?.phase === "start") {
+        if (payload?.runId) await repos.executions.touch(payload.runId, payload.data?.startedAt ?? now());
+        return;
+      }
       if (payload?.data?.phase !== "end") return;
       const result = await applyEnd(payload.runId, payload.data, payload);
       // The structured line is emitted by applyEnd; nothing to add here.
@@ -709,5 +798,12 @@ export function createSessionEventSink({
     return res;
   }
 
-  return { handle, start, applyEnd, applyLateError, get pendingUsageSize() { return pendingUsage.size; } };
+  return {
+    handle,
+    start,
+    applyEnd,
+    applyLateError,
+    applyDescribe,
+    get pendingUsageSize() { return pendingUsage.size; },
+  };
 }

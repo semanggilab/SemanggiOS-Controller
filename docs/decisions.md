@@ -2565,3 +2565,39 @@ Seluruh keputusan itu tinggal di SATU fungsi (`resolveWorkspaceFile`) yang punya
 **UI Command Center yang menyertai** (di semanggi-agentos-ui, bukan keputusan arsitektur controller): bubble operator `bg-primary/15` (tint, bukan fill — bubble penuh `bg-primary` terbaca sebagai tombol); balasan /doc yang membuat task kini membawa seksi live — status + tiga aktivitas transkrip terakhir, refresh 10 detik, berhenti total (spinner dan polling) saat status tidak lagi in-flight.
 
 **Test:** 494 → 508 (deliverable path di balasan+files+instruksi, larangan `docs/review.md`, vonis gateway dalam alasan parkir).
+
+## D75 — Dua kegagalan `pnpm test` adalah baseline, dan koreksi terhadap D70
+
+Dua butir terbuka POC-7 ditutup dengan pengukuran; salah satunya membatalkan klaim D70 sendiri.
+
+### Suite tes hulu: 1061/1063, dan angka 2 itu sinyal
+
+`pnpm test` di pohon fork (container sekali-pakai, heap 3072 MB) menghasilkan `tests 1063, pass 1061, fail 2`. Kedua kegagalan ada di `tests/openclaw-boundary-safety.test.ts` dan berupa asersi teks pada berkas sumber — persis dua berkas yang `apply.sh` memang ubah:
+
+- `sidebar exposes config-driven mission and admin navigation routes` → `/type SidebarSection = "overview" \| "operations" \| "system";/`, digagalkan oleh sisipan `"semanggi"` dari `patch_sidebar`.
+- `settings control center exposes hash navigation for subpages` → `/const settingsSectionGroups = \["Core", "OpenClaw", "Workspace", "System"\] as const;/`, digagalkan oleh sisipan `"Semanggi"` dari `patch_settings`.
+
+Keduanya adalah pernyataan hulu bahwa navigasinya **persis** milik hulu; fork mana pun yang menambah satu section menggagalkannya. **Keputusan: biarkan gagal, dan jadikan angkanya baseline.** `pnpm test` pada fork MUST menghasilkan tepat dua kegagalan dengan tepat dua nama itu — tiga berarti ada yang lain rusak.
+
+**Alternatif yang ditolak:** menambal kedua regex lewat `apply.sh`. Itu menambah dua jangkar pada berkas **tes** hulu — permukaan rebase baru yang harus dijaga selamanya — demi menyembunyikan sinyal yang justru berguna. Menyembunyikan kegagalan yang bisa dijelaskan lebih mahal daripada menjelaskannya sekali di sini.
+
+### Koreksi D70: celah scope tidak menyentuh gerbang izin ACP
+
+D70 menulis bahwa hilangnya `operator.approvals`/`operator.questions` "bersinggungan dengan §6.2 butir 1" (gerbang izin ACP). **Itu salah.** Diperiksa ke sumber:
+
+- Tidak ada satu pun route AgentOS yang memakai `exec.approval.resolve` atau `question.resolve` di preflight.
+- Controller tidak pernah memanggil keduanya (`grep` di `src/` kosong); approval Semanggi hidup di tabel controller sendiri (`WAIT_HUMAN` + API approval).
+- `docs/permission-bridge-design.md` **sudah menolak** jalur exec-approval gateway sejak awal: pencarian `exec.approval` di dist `@openclaw/acpx` mengembalikan nol kecocokan, dan opsi yang dipilih adalah interposer ACP (opsi C) — yang tidak pernah menyentuh mekanisme itu.
+
+Jadi gerbang izin ACP **tidak** bergantung pada scope tersebut, dan menambahkannya tidak akan memajukan §6.2 butir 1 satu langkah pun.
+
+**Yang benar-benar terpengaruh hanya `operator.pairing`**, yang menggerbangi `device.pair.list` dan `device.pair.approve` (`app/api/runtime/issues`, `app/api/settings/gateway`). Scope yang benar-benar dipegang, dibaca dari gateway: `gateway-client` → `operator.write, operator.admin`; `cli` → `operator.admin`.
+
+Dampaknya sempit dan terpisah antara yang terukur dan yang diturunkan:
+
+- **Terukur:** membaca daftar device tetap jalan — `POST /api/runtime/issues {action:"reviewDevices"}` menjawab **200**, karena ia `securityClass: "read"`, identitasnya jatuh ke `unknown` (bukan `denied`), dan isinya datang dari fallback CLI.
+- **Diturunkan, belum diukur:** `device.pair.approve` adalah mutasi ber-scope yang tidak dipegang, jadi ia SHOULD ditolak. Tidak diuji: menyetujui pairing adalah aksi kepercayaan, dan `pending: 0` — tidak ada yang bisa disetujui tanpa lebih dulu membuat device baru.
+
+**Keputusan: jangan tambahkan scope tanpa jalur yang memakainya.** Satu-satunya kemampuan yang hilang adalah menyetujui pairing device baru **dari dalam UI AgentOS**; `openclaw devices approve` di host tetap ada dan tidak lewat preflight. Bila operator memang menginginkannya, tambahkan `operator.pairing` **saja** — prosedurnya di `semanggi-poc7-agentos-077-upgrade-development-spec.md` §11.3. Scope yang diberikan "untuk jaga-jaga" adalah kepercayaan yang diberikan tanpa alasan.
+
+**Pelajaran yang sama untuk ketiga kalinya (D34, D38, D41, dan sekarang ini):** kontrak hulu MUST diverifikasi dengan menelusuri pemakainya, bukan dari tabel deklarasinya. Tabel `OPENCLAW_STATIC_METHOD_SCOPES` menyebut scope untuk metode yang, ternyata, tidak dipanggil siapa pun di pohon ini.

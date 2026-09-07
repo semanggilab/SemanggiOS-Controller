@@ -24,7 +24,7 @@ import {
 } from "../domain/brains.mjs";
 import { DEFAULT_BRAIN_MAP } from "../domain/brain-map.mjs";
 import { quotaDriverCatalog, quotaDriverIdFor } from "../domain/quota-drivers/index.mjs";
-import { buildPlan, ROLE_CATEGORY } from "../domain/decompose.mjs";
+import { buildPlan, LEVEL_TO_QUALITY, ROLE_CATEGORY } from "../domain/decompose.mjs";
 import { EventKind } from "../domain/events.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
 import { markRegistered, parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
@@ -33,8 +33,17 @@ import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
 import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
 import { mergeModelMap, modelDeleteBlockers } from "../domain/model-map.mjs";
+import {
+  FILE_ROOTS,
+  isEditablePath,
+  listWorkspaceFiles,
+  readWorkspaceFile,
+  resolveWorkspaceFile,
+} from "../domain/workspace-files.mjs";
+import { createDocTask } from "../domain/doc-task.mjs";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 /** Urutan kekuatan level — dipakai untuk menandai pemaku Brain yang basi. */
 const LEVEL_RANK = Object.freeze({ [Level.LOW]: 0, [Level.NORMAL]: 1, [Level.CRITICAL]: 2 });
@@ -43,8 +52,11 @@ const CONTROL_HELP =
   "Tulis pekerjaan yang ingin dikerjakan dan saya pecah menjadi task, " +
   "awali dengan `/prepare` untuk satu task penyusun docs/plans.md + docs/tasks.md, " +
   "awali dengan `/task` untuk satu task langsung, " +
+  "awali dengan `/doc` untuk me-review atau merevisi dokumen yang sudah ada " +
+  "(sebut berkasnya dengan `@docs/plans.md`; role dipilih dari kata kerjanya), " +
   "atau beri perintah pada task yang ada (status/stop/run/cancel/model TASK-XXXX, " +
-  "run dan cancel menerima beberapa id sekaligus).";
+  "run dan cancel menerima beberapa id sekaligus). " +
+  "`/task` dan `/doc` menerima `:level low|normal|critical` untuk menetapkan levelnya.";
 
 /**
  * Satu langkah rencana, siap ditampilkan.
@@ -495,6 +507,79 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     });
     log.info("project.doc-updated", { project: id, doc: `${dir}/${doc}.md`, size: body.content.length, by });
     return { name: doc, dir, exists: true, size: body.content.length };
+  });
+
+  // --- berkas workspace (pencarian "@" dan panel viewer) ---------------------
+  //
+  // Endpoint /docs/{name} di atas melayani daftar readiness: tujuh nama tetap,
+  // di-whitelist per nama. Tiga endpoint di bawah melayani hal yang berbeda —
+  // MENELUSURI apa yang benar-benar ada di workspace, karena pencarian "@" di
+  // composer tidak bisa dibatasi pada nama yang sudah didaftarkan lebih dulu:
+  // sebuah project punya deliverables dan catatan yang lahir saat dikerjakan.
+  //
+  // Gantinya whitelist DIREKTORI (workspace-files.mjs): tiga akar tetap, path
+  // ditolak bila keluar darinya setelah dinormalisasi, tulis hanya untuk .md.
+  // Seluruh keputusan itu tinggal di satu fungsi yang punya tes sendiri —
+  // route ini hanya menerjemahkan hasilnya ke HTTP.
+
+  route("GET", "/api/work/projects/{id}/files", async ({ id }, _b, query) => {
+    const project = await repos.projects.get(id);
+    if (!project) throw notFound(`unknown project ${id}`);
+    const q = String(query.get("q") ?? "").trim().toLowerCase();
+    // Default .md: yang dicari operator lewat "@" adalah dokumen. `ext=*`
+    // membuka seluruh isi ketiga direktori untuk pemanggil yang memang
+    // menginginkannya (panel viewer membuka berkas apa pun yang diklik).
+    const extParam = String(query.get("ext") ?? ".md");
+    const extensions = extParam === "*" ? null : extParam.split(",").map((e) => e.trim()).filter(Boolean);
+    let files = await listWorkspaceFiles(project.workspace_path, { extensions });
+    if (q) files = files.filter((f) => f.path.toLowerCase().includes(q));
+    return { projectId: id, workspacePath: project.workspace_path, roots: FILE_ROOTS, files };
+  });
+
+  route("GET", "/api/work/projects/{id}/file", async ({ id }, _b, query) => {
+    const project = await repos.projects.get(id);
+    if (!project) throw notFound(`unknown project ${id}`);
+    // Query param, bukan segmen path: sebuah path berisi "/" tidak selamat
+    // melewati proxy catch-all Next.js — pelajaran yang sama yang membuat
+    // Model Map memakai query param untuk model id groq.
+    const target = resolveWorkspaceFile(project.workspace_path, query.get("path"));
+    if (!target.ok) throw badRequest(target.reason);
+    try {
+      const file = await readWorkspaceFile(target.absolute);
+      return {
+        path: target.relative,
+        exists: true,
+        editable: isEditablePath(target.relative),
+        binary: file.binary,
+        content: file.content,
+        size: file.size,
+      };
+    } catch {
+      // Tidak ada bukan galat: panel viewer membuka nama berkas yang disebut
+      // sebuah balasan chat, dan agen bisa menyebut berkas yang gagal ia tulis.
+      return { path: target.relative, exists: false, editable: isEditablePath(target.relative), binary: false, content: null, size: 0 };
+    }
+  });
+
+  route("PUT", "/api/work/projects/{id}/file", async ({ id }, body, query, actor) => {
+    const project = await repos.projects.get(id);
+    if (!project) throw notFound(`unknown project ${id}`);
+    const target = resolveWorkspaceFile(project.workspace_path, query.get("path") ?? body?.path);
+    if (!target.ok) throw badRequest(target.reason);
+    if (!isEditablePath(target.relative)) throw badRequest("hanya berkas .md yang bisa disunting dari sini");
+    if (typeof body?.content !== "string") throw badRequest("content is required");
+    const by = actor?.kind === "operator" ? actor.name : String(body.user ?? "agentos-ui");
+    await mkdir(dirname(target.absolute), { recursive: true });
+    await writeFile(target.absolute, body.content, "utf8");
+    await controller.events.append({
+      kind: "project.doc-updated",
+      subjectType: "project",
+      subjectId: id,
+      actor: by,
+      payload: { document: target.relative, size: body.content.length },
+    });
+    log.info("project.doc-updated", { project: id, doc: target.relative, size: body.content.length, by });
+    return { path: target.relative, exists: true, editable: true, size: body.content.length };
   });
 
   // Project-level Role Level overrides (Settings → Project → Edit modal).
@@ -1846,6 +1931,42 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       };
     }
 
+    if (parsed.intent === Intent.DOC) {
+      // Review/revisi dokumen — satu task, role dari verba (D73). Project
+      // diambil dengan aturan yang sama dengan PREPARE dan TASK.
+      const taskProjectId = body.projectId ?? process.env.SEMANGGI_DEFAULT_PROJECT ?? null;
+      if (!taskProjectId) throw badRequest("projectId is required (tidak ada project default yang dikonfigurasi)");
+      const by = actor?.kind === "operator" ? actor.name : String(body.user ?? "agentos-ui");
+      const outcome = await createDocTask(controller, {
+        projectId: taskProjectId,
+        text: parsed.text,
+        refs: parsed.docRefs ?? [],
+        role: parsed.role ?? "analyst",
+        level: parsed.level ?? null,
+        actor: by,
+      });
+      if (!outcome.ok) {
+        return { intent: "DOC", action: "task", taskId: null, needsConfirmation: false, target: null, reply: outcome.reason, tasks: [] };
+      }
+      const refNote = outcome.refs.length > 0 ? ` atas ${outcome.refs.map((r) => `\`${r}\``).join(", ")}` : "";
+      return {
+        intent: "DOC",
+        action: "task",
+        taskId: outcome.task.id,
+        needsConfirmation: false,
+        target: { id: outcome.task.id, title: outcome.task.title, status: outcome.task.status },
+        // Balasan MENYEBUT role dan level yang dipilih: keduanya ditebak dari
+        // kalimat operator, dan tebakan yang tidak pernah diucapkan adalah
+        // tebakan yang tidak pernah bisa dikoreksi.
+        reply:
+          `Task \`${outcome.task.id}\` dibuat — satu ${outcome.role} (${outcome.level}, ${outcome.brain.name})${refNote}` +
+          (outcome.deliverable ? `, hasilnya ke \`${outcome.deliverable}\`` : "") +
+          `  _(${by})_`,
+        files: outcome.refs.concat(outcome.deliverable ? [outcome.deliverable] : []),
+        tasks: [],
+      };
+    }
+
     if (parsed.intent === Intent.PREPARE) {
       // Persiapan dokumen rencana sebagai SATU task analyst — bukan rantai
       // dekomposisi (D47). Project dari body/env, sama dengan jalur TASK.
@@ -1949,15 +2070,24 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         }
 
         const by = actor?.kind === "operator" ? actor.name : String(body.user ?? "agentos-ui");
+        // ":level critical" pada "/task" menetapkan kelas kualitas dan kelas
+        // Brain-nya (D73). Task langsung tidak punya role, jadi tidak ada
+        // resolveLevel yang bisa ditimpa — yang ditetapkan di sini adalah
+        // level itu sendiri, dan tanpa token ini task tetap memakai default
+        // repositori seperti sebelumnya.
+        const levelPolicy = parsed.level
+          ? { qualityClass: LEVEL_TO_QUALITY[parsed.level], modelPolicy: { class: parsed.level } }
+          : {};
         const task = await repos.tasks.create({
           projectId: taskProjectId,
           workerId: worker.id,
           title: parsed.text.slice(0, 120),
           description: parsed.text,
+          ...levelPolicy,
         });
         await repos.tasks.setStatus(task.id, Status.QUEUED, { actor: by });
         await scheduler.notify(WakeReason.TASK_CREATED);
-        log.info("control.task-created", { task: task.id, project: taskProjectId, by });
+        log.info("control.task-created", { task: task.id, project: taskProjectId, level: parsed.level ?? null, by });
         return {
           intent: "TASK",
           action: "task",

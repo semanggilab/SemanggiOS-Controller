@@ -19,6 +19,11 @@ export const Intent = Object.freeze({
   // penuh (analyst → architect → builder → …) membayar lima fase untuk
   // pekerjaan yang secara alami selesai dalam satu run (D47).
   PREPARE: "PREPARE",
+  // Review/revisi sebuah dokumen yang SUDAH ada — satu task, role dipilih
+  // dari verba permintaannya. Bukan PREPARE (yang menulis rencana dari nol)
+  // dan bukan WORK (yang membayar lima fase); memperbaiki satu dokumen
+  // selesai dalam satu run, alasan yang sama dengan D47.
+  DOC: "DOC",
   CONFIRM: "CONFIRM",
 });
 
@@ -125,7 +130,70 @@ const CHATTY = /^(hi|halo|hello|thanks|terima kasih|makasih|good morning|pagi|si
 // `/prepare`); bentuk lama dua-titik TETAP diterima karena router ini dibagi
 // dengan Slack dan kebiasaan lama tidak boleh mati diam-diam — yang berubah
 // adalah bentuk yang dipasang tombol-tombol template.
-const INTENT_PREFIX = /^(?:\/(work|task|prepare)\b|(work|task|prepare)\s*:)\s*:?\s*/i;
+const INTENT_PREFIX = /^(?:\/(work|task|prepare|doc)\b|(work|task|prepare|doc)\s*:)\s*:?\s*/i;
+
+// --- level eksplisit ---------------------------------------------------------
+//
+// ":level critical" di mana pun dalam kalimat menetapkan level task, menimpa
+// resolveLevel(template, role, profile). Kosakatanya SAMA dengan Level di
+// brains.mjs — bukan sinonim bebas: level yang tidak dikenal akan diam-diam
+// memilih Brain yang salah, dan operator tidak akan tahu sampai hasilnya
+// mengecewakan. Karena itu polanya menuntut salah satu dari tiga kata itu
+// persis; ":level tinggi" tidak cocok dan token itu tinggal sebagai prosa,
+// terlihat di judul task — kegagalan yang kelihatan, bukan yang senyap.
+const LEVEL_TOKEN = /(^|\s):level\s+(low|normal|critical)\b/i;
+
+/**
+ * Mengambil level eksplisit dan MENGHAPUS tokennya dari teks.
+ *
+ * Token harus hilang: yang tersisa menjadi judul dan deskripsi task, dan
+ * ":level critical" di dalam judul kartu kanban adalah sisa sintaks, bukan
+ * informasi. @returns {{level: string|null, text: string}}
+ */
+export function parseLevel(raw) {
+  const s = String(raw ?? "");
+  const m = LEVEL_TOKEN.exec(s);
+  if (!m) return { level: null, text: s };
+  return {
+    level: m[2].toLowerCase(),
+    text: s.replace(LEVEL_TOKEN, "$1").replace(/\s{2,}/g, " ").trim(),
+  };
+}
+
+// --- rujukan dokumen ---------------------------------------------------------
+//
+// "@docs/plans.md" menunjuk berkas di workspace project. Polanya menuntut
+// sebuah ekstensi (titik + huruf) atau garis miring supaya ia tidak menelan
+// mention orang ("@satria") — dua sintaks yang mustahil dibedakan tanpa itu,
+// dan router ini dibagi dengan Slack, tempat mention orang adalah hal biasa.
+const DOC_REF = /@([A-Za-z0-9._\-/]*[/.][A-Za-z0-9._\-/]+)/g;
+
+/** Semua berkas yang dirujuk "@…", terurut kemunculan, tanpa duplikat. */
+export function parseDocRefs(raw) {
+  const out = [];
+  for (const m of String(raw ?? "").matchAll(DOC_REF)) {
+    const ref = m[1].replace(/[.,;:]+$/, "");
+    if (ref && !out.includes(ref)) out.push(ref);
+  }
+  return out;
+}
+
+// Role yang mengerjakan sebuah permintaan /doc, dipilih dari VERBA-nya.
+//
+// Tiga role, karena tiga jenis pekerjaan berbeda terhadap sebuah dokumen:
+// menilai yang sudah ada (reviewer), merancang ulang bentuknya (architect),
+// menguraikan isinya (analyst). Urutan penting — "periksa desainnya" adalah
+// review, bukan desain, jadi pola reviewer diuji lebih dulu.
+const DOC_ROLE_RULES = [
+  { role: "reviewer", re: /\b(review|periksa|cek|audit|nilai|koreksi|kritik|telaah)\b/i },
+  { role: "architect", re: /\b(rancang|desain|design|arsitektur|architecture|struktur(kan)?|refactor)\b/i },
+];
+const DOC_ROLE_DEFAULT = "analyst";
+
+/** @returns {"analyst"|"architect"|"reviewer"} */
+export function pickDocRole(text) {
+  return DOC_ROLE_RULES.find((r) => r.re.test(String(text ?? "")))?.role ?? DOC_ROLE_DEFAULT;
+}
 
 const DURATION = /(\d+)\s*(m|min|mins|minute|minutes|menit|h|hr|hrs|hour|hours|jam)\b/i;
 
@@ -148,7 +216,30 @@ export function classify(raw) {
   // #4F59F63A") and a bare command ("status 4F59F63A") both reach the same
   // canonical id — and so the `text` every handler receives already carries
   // the full TASK- form.
-  let text = normalizeTaskIds(String(raw ?? "").trim().replace(/^@\S+\s*/, ""));
+  //
+  // Dua hal dilucuti dari teks mentah lebih dulu, dan keduanya ikut dalam
+  // hasil sebagai field tersendiri — bukan dibiarkan hanyut ke dalam judul
+  // task, tempat sisa sintaks akan dibaca agen sebagai instruksi.
+  //
+  // Rujukan dokumen dibaca dari teks MENTAH karena pembuangan mention di
+  // bawah memakan token "@…" pertama, dan "@docs/plans.md" di awal kalimat
+  // adalah rujukan berkas, bukan sapaan — mengambilnya lebih dulu membuat
+  // urutan kedua aturan itu tidak lagi menentukan.
+  const docRefs = parseDocRefs(raw);
+  // Mention orang dibuang hanya bila ia memang mention orang: token tanpa
+  // "/" dan tanpa titik. Tanpa syarat ini, "@docs/plans.md review" kehilangan
+  // berkas yang justru menjadi objek permintaannya. Pola lama dibuat untuk
+  // Slack, tempat "@" selalu orang; di Command Center ia juga berkas.
+  const withoutMention = String(raw ?? "")
+    .trim()
+    .replace(/^@([A-Za-z0-9._\-]+)(\s+|$)/, (m, token) => (/[./]/.test(token) ? m : ""));
+  const { level, text: cleaned } = parseLevel(withoutMention);
+  return { ...classifyText(cleaned), level, docRefs };
+}
+
+/** Klasifikasi teks yang sudah dibersihkan dari mention dan token `:level`. */
+function classifyText(raw) {
+  let text = normalizeTaskIds(String(raw ?? "").trim());
   if (!text) return { intent: Intent.CONFIRM, action: null, taskId: null, confidence: 0, text, reason: "empty message" };
 
   // Declared intent: strip the prefix and remember it. Everything after the
@@ -182,7 +273,14 @@ export function classify(raw) {
 
   // Inside a declared prefix, a CREATE verb ("Buat rencana…") is the payload
   // describing the work — only task-scoped commands outrank the declaration.
-  const verbIsCommand = verb && !(forced && verb.action === Action.CREATE);
+  //
+  // "/doc" tidak punya perintah task-scoped sama sekali: verbanya JUSTRU yang
+  // memilih role ("review …" → reviewer). Membiarkan aturan lama berlaku akan
+  // membuat "/doc @plans.md review keamanannya" jatuh ke Action.REVIEW,
+  // menuntut task id yang memang tidak ada, dan berakhir CONFIRM — sebuah
+  // perintah yang tidak bisa berhasil pada input apa pun (kegagalan yang sama
+  // bentuknya dengan D36).
+  const verbIsCommand = verb && forced !== "DOC" && !(forced && verb.action === Action.CREATE);
 
   if (verbIsCommand) {
     // A task-scoped verb without a task id is ambiguous: "approve" which one?
@@ -219,10 +317,20 @@ export function classify(raw) {
     // prepare request ("Buat rencana…") back to WORK and defeat the
     // declaration. Only task-scoped commands (status/stop/…) outrank it.
     return {
-      intent: forced === "WORK" ? Intent.WORK : forced === "PREPARE" ? Intent.PREPARE : Intent.TASK,
+      intent:
+        forced === "WORK"
+          ? Intent.WORK
+          : forced === "PREPARE"
+            ? Intent.PREPARE
+            : forced === "DOC"
+              ? Intent.DOC
+              : Intent.TASK,
       action: Action.CREATE,
       taskId,
       taskIds,
+      // Role hanya bermakna untuk DOC — di sana verbanya memang yang memilih
+      // siapa yang mengerjakan; di jalur lain role datang dari pipeline.
+      role: forced === "DOC" ? pickDocRole(text) : undefined,
       confidence: 1,
       text,
       hasVerbPrefix: false,

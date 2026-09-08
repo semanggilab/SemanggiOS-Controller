@@ -1090,6 +1090,50 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   // is an endpoint: same mapping the reconciler uses, same state-machine
   // gate as everyone else, and a refusal that names the transition rather
   // than a silent nothing.
+  // D85: mengembalikan sinyal kuota sebuah resource yang tercatat SALAH.
+  //
+  // Kenapa ini perlu ada: sebelum D85, dispatch harness bisa mengklaim model
+  // `claude-code/claude-code` sambil benar-benar berjalan di agen GLM. Ketika
+  // GLM menolak karena kuota, penolakan itu dicatat terhadap resource
+  // claude-code — sehingga langganan Claude yang SEHAT terparkir sampai
+  // 2026-09-15 dengan pesan milik ZAI ("Your limit will reset at ...").
+  //
+  // PATCH resource sengaja tidak menyentuh sinyal live (D66): kebijakan
+  // operator dan pengukuran runtime tidak boleh saling menimpa. Tetapi tanpa
+  // JALUR APA PUN, satu-satunya perbaikan adalah UPDATE tangan ke database —
+  // dan aturan 6 §4.1 melarangnya karena jejak audit lalu menceritakan
+  // sejarah yang tidak pernah terjadi. Endpoint ini adalah jalur sahnya, dan
+  // ia MENCATAT dirinya sendiri seperti setiap tulis lain.
+  //
+  // Admin-only, dan sengaja tidak memaksa: kalau resource memang sedang
+  // kehabisan kuota betulan, sinyal berikutnya dari provider akan
+  // memarkirnya lagi dalam hitungan detik. Yang dibersihkan di sini adalah
+  // catatan yang salah alamat, bukan kenyataan yang tidak disukai.
+  route("POST", "/api/work/resources/clear-quota", async (_p, body, query, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may clear a quota signal");
+    const provider = String(query.get("provider") ?? body?.provider ?? "").trim();
+    const model = String(query.get("model") ?? body?.model ?? "").trim();
+    if (!provider || !model) throw badRequest("provider and model are required");
+    const existing = await repos.resources.get(provider, model);
+    if (!existing) throw notFound(`unknown resource ${provider}/${model}`);
+    if (existing.availability === "AVAILABLE") {
+      return { cleared: false, reason: "resource is already AVAILABLE", resource: presentResource(existing) };
+    }
+    const before = {
+      availability: existing.availability,
+      nextAvailableAt: existing.next_available_at ?? null,
+      signal: existing.last_quota_signal ?? null,
+    };
+    const resource = await repos.resources.setAvailability(provider, model, "AVAILABLE", {
+      nextAvailableAt: null,
+      windowKind: existing.window_kind ?? null,
+      signal: null,
+      source: actor?.name ? `operator:${actor.name}` : "operator",
+    });
+    log.info("resource.quota-cleared", { provider, model, before, by: actor?.name ?? "operator" });
+    return { cleared: true, before, resource: presentResource(resource) };
+  });
+
   route("POST", "/api/work/tasks/{id}/settle", async ({ id }, body, _q, actor) => {
     if (actor?.role !== "admin") throw forbidden("only an admin may settle tasks");
     const task = await repos.tasks.get(id);

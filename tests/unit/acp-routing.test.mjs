@@ -113,3 +113,86 @@ test("D85: Brain non-harness tidak berubah perilaku", async () => {
   });
   assert.equal(agent?.id, "sdmk-kader-architect", "pencocokan model biasa tetap seperti sebelumnya");
 });
+
+// --- D85: jalur pemulihan sinyal kuota yang salah alamat ----------------------
+//
+// Kerusakan susulan dari salah-rute harness: penolakan kuota GLM tercatat
+// terhadap resource `claude-code/claude-code`, sehingga langganan Claude yang
+// SEHAT terparkir sampai 2026-09-15 membawa pesan milik ZAI. PATCH resource
+// sengaja tidak menyentuh sinyal live (D66), jadi tanpa endpoint ini satu-
+// satunya perbaikan adalah UPDATE tangan — yang aturan 6 §4.1 larang.
+import { once } from "node:events";
+import { createApi } from "../../src/api/server.mjs";
+import { buildHarness } from "../helpers/harness.mjs";
+
+const TOKEN = "controller-token-for-tests";
+
+async function apiFor(h) {
+  const api = createApi(h, { token: TOKEN });
+  const server = api.createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = server.address();
+  const call = async (method, path, body) => {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${TOKEN}`, ...(body ? { "content-type": "application/json" } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    return { status: res.status, body: await res.json().catch(() => ({})) };
+  };
+  return { call, close: () => new Promise((r) => server.close(r)) };
+}
+
+test("D85: clear-quota mengembalikan resource yang salah diparkir, dan mencatatnya", async () => {
+  const h = await buildHarness();
+  await h.repos.resources.upsert({ provider: "claude-code", model: "claude-code", concurrencyLimit: 2 });
+  // Persis keadaan cluster: pesan ZAI tercatat pada resource claude-code.
+  await h.repos.resources.setAvailability("claude-code", "claude-code", "QUOTA_EXHAUSTED", {
+    nextAvailableAt: Date.now() + 7 * 86_400_000,
+    signal: "⚠️ Usage limit reached for 5 hour. Your limit will reset at 2026-09-09 03:34:02",
+  });
+  const api = await apiFor(h);
+  try {
+    const res = await api.call("POST", "/api/work/resources/clear-quota?provider=claude-code&model=claude-code");
+    assert.equal(res.status, 200);
+    assert.equal(res.body.cleared, true);
+    // Keadaan SEBELUM ikut dilaporkan: sebuah pembersihan yang tidak menyebut
+    // apa yang dibersihkan tidak bisa ditinjau ulang.
+    assert.match(res.body.before.signal, /Usage limit reached/);
+    assert.equal(res.body.resource.availability, "AVAILABLE");
+
+    const row = await h.repos.resources.get("claude-code", "claude-code");
+    assert.equal(row.availability, "AVAILABLE");
+    assert.equal(row.next_available_at, null);
+
+    const events = await h.events.list({ subjectType: "resource", subjectId: "claude-code/claude-code" });
+    assert.ok(events.some((e) => e.payload?.availability === "AVAILABLE"), "pembersihan MUST tercatat di event_log");
+  } finally {
+    await api.close();
+  }
+});
+
+test("D85: clear-quota pada resource yang sudah AVAILABLE tidak berpura-pura bekerja", async () => {
+  const h = await buildHarness();
+  await h.repos.resources.upsert({ provider: "zai", model: "glm-5.3", concurrencyLimit: 2 });
+  const api = await apiFor(h);
+  try {
+    const res = await api.call("POST", "/api/work/resources/clear-quota?provider=zai&model=glm-5.3");
+    assert.equal(res.body.cleared, false);
+    assert.match(res.body.reason, /already AVAILABLE/);
+  } finally {
+    await api.close();
+  }
+});
+
+test("D85: resource yang tidak dikenal ditolak 404, bukan dibuat diam-diam", async () => {
+  const h = await buildHarness();
+  const api = await apiFor(h);
+  try {
+    const res = await api.call("POST", "/api/work/resources/clear-quota?provider=nope&model=nope");
+    assert.equal(res.status, 404);
+  } finally {
+    await api.close();
+  }
+});

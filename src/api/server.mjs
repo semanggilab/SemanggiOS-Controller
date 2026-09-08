@@ -1602,7 +1602,23 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   const reconcileFloorNow = async (brain, actor, reason) => {
     if (!controller.sandboxProvision) return null;
     try {
-      return await controller.sandboxProvision.reconcileModel(brain.provider, brain.model, { actor, reason });
+      const out = await controller.sandboxProvision.reconcileModel(brain.provider, brain.model, { actor, reason });
+      // Selalu di-log, bukan hanya kegagalan: pagar D80/D81 (cap penuh, tanpa
+      // baris resource, busy-above-floor) membuat "tidak terjadi apa-apa"
+      // menjadi jawaban yang SAH — dan jawaban sah yang tidak tercatat
+      // tidak bisa dibedakan dari pemicu yang tidak pernah menyala.
+      log.info("sandbox-floor.reconciled", {
+        brain: brain.name,
+        provider: brain.provider,
+        model: brain.model,
+        floor: out.floor ?? null,
+        live: out.live ?? null,
+        created: out.created ?? [],
+        killed: out.killed ?? [],
+        skippedBusy: out.skippedBusy ?? [],
+        why: out.why ?? [],
+      });
+      return out;
     } catch (err) {
       log.warn("sandbox-floor.reconcile-failed", {
         brain: brain.name, provider: brain.provider, model: brain.model,

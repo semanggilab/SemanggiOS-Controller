@@ -251,20 +251,25 @@ async function main() {
   uploadTimer.unref?.();
   void uploadSweep();
 
-  // D80: keeper lantai sandbox — setiap Brain aktif dengan min_sandboxes > 0
-  // dijaga armadanya dari bawah, dibatasi concurrency_limit resource dan
-  // pagar claude-code (domain/sandbox-provision.mjs). Timer polos, bukan
-  // event-driven: lantai adalah keadaan yang diinginkan, dan keadaan yang
-  // diinginkan dicek ulang secara berkala — sama seperti reconciler D72,
-  // yang juga tidak menunggu diundang. Matikan dengan SEMANGGI_SANDBOX_KEEPER=0.
+  // D80/D81: keeper lantai sandbox — tiap brain aktif dengan min_sandboxes
+  // dijaga armadanya DUA ARAH: ditumbuhkan sampai lantai (dibatasi
+  // concurrency_limit resource), dipangkas ke lantai bila berlebih (hanya
+  // agen sem-auto-* yang idle — aturan busy sama dengan kill operator D78).
+  // Timer polos, bukan event-driven: lantai adalah keadaan yang diinginkan,
+  // dan keadaan yang diinginkan dicek ulang secara berkala — sama seperti
+  // reconciler D72, yang juga tidak menunggu diundang. Perubahan lantai via
+  // API juga memicu rekonsiliasi LANGSUNG (server.mjs); keeper menutup celah
+  // di antara itu. Matikan dengan SEMANGGI_SANDBOX_KEEPER=0.
   const sandboxKeeperMs = Number(process.env.SEMANGGI_SANDBOX_KEEPER_MS ?? 60_000);
   let sandboxKeeperTimer = null;
   if (controller.sandboxProvision && sandboxKeeperMs > 0 && process.env.SEMANGGI_SANDBOX_KEEPER !== "0") {
     sandboxKeeperTimer = setInterval(() => {
       void controller.sandboxProvision
-        .enforceMinimums({ actor: "keeper" })
+        .reconcileAll({ actor: "keeper" })
         .then((out) => {
-          if (out.created > 0) log.info("sandbox-keeper.created", { created: out.created, perBrain: out.perBrain });
+          if (out.created > 0 || out.killed > 0) {
+            log.info("sandbox-keeper.reconciled", { created: out.created, killed: out.killed, results: out.results });
+          }
         })
         .catch((err) => log.warn("sandbox-keeper.failed", { error: String(err.message ?? err) }));
     }, sandboxKeeperMs);

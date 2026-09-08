@@ -23,6 +23,7 @@
 //      tidak pernah throw ke pemanggil — provisioning adalah upaya tambahan
 //      di atas parkir yang sudah benar, bukan penggantinya.
 import { shortId } from "./repositories.mjs";
+import { Status } from "./state-machine.mjs";
 
 const slug = (s) => String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
@@ -55,6 +56,26 @@ export function agentsForModel({ provider, model }, liveAgents) {
   const target = `${provider}/${model}`.toLowerCase();
   return liveAgents.filter((a) => String(a?.model?.primary ?? "").toLowerCase() === target);
 }
+
+// Agen yang sedang dipakai task hidup, per agent_ref — aturan yang sama dengan
+// kill operator D78: sandbox yang sedang bekerja tidak dipotong. Pindah ke
+// modul ini karena pemangkasan lantai (D81) butuh jawaban yang sama, dan dua
+// salinan aturan "sibuk" akan berbeda pendapat tepat saat task sedang berjalan.
+export async function busyAgentsByRef(repos) {
+  const busy = new Map(); // agent_ref -> { taskId, projectId }
+  for (const status of [Status.DISPATCHED, Status.RUNNING]) {
+    for (const task of await repos.tasks.list({ status, limit: 10_000 })) {
+      if (!task.worker_id) continue;
+      const worker = await repos.workers.get(task.worker_id);
+      if (worker && !busy.has(worker.agent_ref)) {
+        busy.set(worker.agent_ref, { taskId: task.id, projectId: task.project_id });
+      }
+    }
+  }
+  return busy;
+}
+
+const AUTO_PREFIX = "sem-auto-";
 
 export function createSandboxProvision({ brains, runtime, repos, events, log, now = () => Date.now() }) {
   const liveAgents = async () => (await runtime?.listAgents?.().catch(() => [])) ?? [];
@@ -118,50 +139,136 @@ export function createSandboxProvision({ brains, runtime, repos, events, log, no
   }
 
   /**
-   * Jalur keeper (D80): menjaga lantai min_sandboxes untuk setiap Brain yang
-   * aktif. Slot deterministik (`sem-auto-<brain>-<n>`) membuat pass berikutnya
-   * menghitung ulang dari nama yang sama — kegagalan setengah jalan konvergen,
-   * tidak menumpuk. Agen operator/probe yang sudah hidup untuk model itu
-   * DIHITUNG ke arah lantai: lantai adalah jumlah agen, bukan jumlah agen
-   * buatan keeper.
+   * Rekonsiliasi SATU model (D80 grow + D81 trim). Lantai efektif sebuah
+   * model = MAX min_sandboxes brain AKTIF yang memakai model itu — dua brain
+   * berbagi pool agen yang sama (D79), jadi memangkas demi lantai brain B
+   * akan membocorkan lantai brain A. Di atas lantai: pangkas hanya agen
+   * `sem-auto-*` yang IDLE (aturan busy = aturan kill operator D78); agen
+   * operator dan probe tidak pernah disentuh — bentuk armada non-otomatis
+   * tetap keputusan manusia. Ephemeral mati duluan (sbx- lahir on-demand,
+   * lalu slot bernomor besar) supaya inti stabil slot 1..N bertahan dan pass
+   * keeper berikutnya tidak menumbuhkan apa pun.
    */
-  async function enforceMinimums({ actor = "keeper" } = {}) {
-    if (typeof runtime?.createProbeAgent !== "function") {
-      return { created: 0, perBrain: [] };
-    }
-    const out = { created: 0, perBrain: [] };
+  async function reconcileModel(provider, model, { actor = "keeper", reason = "keeper pass" } = {}) {
+    if (typeof runtime?.listAgents !== "function") return { provider, model, skipped: "no-runtime" };
+    const enabled = (await brains.list({ enabledOnly: true })).filter(
+      (b) => b.provider === provider && b.model === model && b.provider !== "claude-code",
+    );
+    const floor = enabled.reduce((m, b) => Math.max(m, b.minSandboxes ?? 0), 0);
+    const governor = enabled.find((b) => (b.minSandboxes ?? 0) === floor) ?? null;
+    const out = { provider, model, floor, live: 0, created: [], killed: [], skippedBusy: [], why: [] };
+
+    const cap = await capFor({ provider, model });
     const live = await liveAgents();
-    for (const brain of await brains.list({ enabledOnly: true })) {
-      if (!(brain.minSandboxes > 0) || brain.provider === "claude-code") continue;
-      const cap = await capFor(brain);
-      if (cap == null) {
-        out.perBrain.push({ brain: brain.name, why: "no-resource-entry" });
-        continue;
-      }
-      let current = agentsForModel(brain, live).length;
-      if (current >= brain.minSandboxes) continue;
+    const fleet = agentsForModel({ provider, model }, live);
+    let count = fleet.length;
+    out.live = count;
+
+    if (count < floor && typeof runtime.createProbeAgent !== "function") {
+      out.why.push("no-provisioning");
+      return out;
+    }
+    if (count < floor && cap == null) {
+      out.why.push("no-resource-entry");
+      return out;
+    }
+
+    if (count < floor) {
       const taken = new Set(live.map((a) => String(a?.name ?? "")));
-      for (let slot = 1; slot <= brain.minSandboxes && current < brain.minSandboxes; slot++) {
-        if (current >= cap) {
-          out.perBrain.push({ brain: brain.name, why: "cap-full", live: current, cap });
+      const base = slug(governor.name);
+      for (let slot = 1; slot <= floor && count < floor; slot++) {
+        if (count >= cap) {
+          out.why.push("cap-full");
           break;
         }
-        const name = `sem-auto-${slug(brain.name)}-${slot}`.slice(0, 63);
+        const name = `${AUTO_PREFIX}${base}-${slot}`.slice(0, 63);
         if (taken.has(name)) continue;
         try {
-          const agent = await createOne(brain, { name, reason: "keeper minimum", actor });
-          live.push({ id: agent.id, name, model: { primary: `${brain.provider}/${brain.model}` } });
+          const agent = await createOne(governor, { name, reason, actor });
+          live.push({ id: agent.id, name, model: { primary: `${provider}/${model}` } });
           taken.add(name);
-          current++;
-          out.created++;
+          count++;
+          out.created.push(name);
         } catch (err) {
-          out.perBrain.push({ brain: brain.name, why: "create-failed", error: String(err.message ?? err) });
+          out.why.push(`create-failed:${String(err.message ?? err)}`);
           break;
         }
       }
+    }
+
+    if (count > floor && typeof runtime.deleteAgent === "function") {
+      const ours = fleet.filter((a) => String(a?.name ?? "").startsWith(AUTO_PREFIX));
+      const busy = await busyAgentsByRef(repos);
+      // sbx- (on-demand) sebelum slot keeper, nomor slot besar sebelum kecil.
+      const rank = (a) => {
+        const name = String(a.name);
+        const slot = name.match(/-(\d+)$/);
+        return (name.includes("-sbx-") ? 1_000_000 : 0) + (slot ? Number(slot[1]) : 0);
+      };
+      ours.sort((a, b) => rank(b) - rank(a));
+      for (const agent of ours) {
+        if (count <= floor) break;
+        const id = String(agent.id ?? "");
+        if (busy.has(id)) {
+          out.skippedBusy.push(id);
+          continue;
+        }
+        try {
+          await runtime.deleteAgent({ agentId: id });
+          count--;
+          out.killed.push(id);
+          await events.append({
+            kind: "brain.sandbox-auto-killed",
+            subjectType: "brain",
+            // Model tanpa brain aktif (lantai turun lewat disable/hapus)
+            // menyebut model sebagai subjek — armada memang milik model (D79).
+            subjectId: governor ? governor.id : `${provider}/${model}`,
+            actor,
+            payload: { agentId: id, name: String(agent.name ?? ""), model: `${provider}/${model}`, reason },
+          });
+          log.info("brain.sandbox-auto-killed", { agentId: id, name: String(agent.name ?? ""), model: `${provider}/${model}`, floor, by: actor });
+        } catch (err) {
+          out.why.push(`kill-failed:${String(err.message ?? err)}`);
+          break;
+        }
+      }
+      // Agen sibuk di atas lantai tidak error — mereka dipangkas pass
+      // berikutnya begitu idle; konvergensi, bukan kegagalan.
+      if (out.killed.length === 0 && out.skippedBusy.length > 0) out.why.push("busy-above-floor");
+    }
+
+    out.live = count;
+    return out;
+  }
+
+  /**
+   * Pass penuh (keeper D80/D81): setiap model yang punya brain, plus model
+   * yang masih menyimpan agen sem-auto — lantai bisa turun ke 0 lewat
+   * disable/hapus brain, dan sisa armada otomatisnya harus ikut turun.
+   */
+  async function reconcileAll({ actor = "keeper" } = {}) {
+    const out = { results: [], created: 0, killed: 0 };
+    const models = new Map();
+    for (const b of await brains.list()) {
+      if (b.provider === "claude-code") continue;
+      models.set(`${b.provider}/${b.model}`.toLowerCase(), { provider: b.provider, model: b.model });
+    }
+    const live = await liveAgents();
+    for (const a of live) {
+      const name = String(a?.name ?? "");
+      const primary = String(a?.model?.primary ?? "");
+      if (!name.startsWith(AUTO_PREFIX) || !primary.includes("/")) continue;
+      const idx = primary.indexOf("/");
+      models.set(primary.toLowerCase(), { provider: primary.slice(0, idx), model: primary.slice(idx + 1) });
+    }
+    for (const { provider, model } of models.values()) {
+      const r = await reconcileModel(provider, model, { actor, reason: "keeper pass" });
+      if (r.created?.length || r.killed?.length || r.why?.length) out.results.push(r);
+      out.created += r.created?.length ?? 0;
+      out.killed += r.killed?.length ?? 0;
     }
     return out;
   }
 
-  return { maybeProvisionForBrain, enforceMinimums, probeWorkspaceFor, agentsForModel };
+  return { maybeProvisionForBrain, reconcileModel, reconcileAll, probeWorkspaceFor, agentsForModel, busyAgentsByRef: () => busyAgentsByRef(repos) };
 }

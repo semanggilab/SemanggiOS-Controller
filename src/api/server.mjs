@@ -28,7 +28,7 @@ import { buildPlan, LEVEL_TO_QUALITY, ROLE_CATEGORY } from "../domain/decompose.
 import { EventKind } from "../domain/events.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
 import { markRegistered, parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
-import { probeWorkspaceFor } from "../domain/sandbox-provision.mjs";
+import { probeWorkspaceFor, busyAgentsByRef as sharedBusyAgentsByRef } from "../domain/sandbox-provision.mjs";
 import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
@@ -1595,11 +1595,31 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   // (label "mistral-custom" tanpa alias adalah brain berjendela-null).
   route("GET", "/api/work/quota-drivers", async () => ({ drivers: quotaDriverCatalog() }));
 
+  // D81: rekonsiliasi LANGSUNG saat lantai berubah — operator yang menurunkan
+  // angka berhak melihat armada mengecil di reload berikutnya, bukan 60 detik
+  // kemudian. Dibuat best-effort: gateway yang sedang tidak bisa dihubungi
+  // tidak boleh menolak perubahan konfigurasi; keeper menutup sisanya.
+  const reconcileFloorNow = async (brain, actor, reason) => {
+    if (!controller.sandboxProvision) return null;
+    try {
+      return await controller.sandboxProvision.reconcileModel(brain.provider, brain.model, { actor, reason });
+    } catch (err) {
+      log.warn("sandbox-floor.reconcile-failed", {
+        brain: brain.name, provider: brain.provider, model: brain.model,
+        error: String(err.message ?? err),
+      });
+      return null;
+    }
+  };
+
   route("POST", "/api/work/brains", async (_p, body, _q, actor) => {
     if (actor?.role !== "admin") throw forbidden("only an admin may define brains");
     try {
       const brain = await controller.brains.create(body);
       log.info("brain.created", { brain: brain.name, level: brain.level, by: actor.name });
+      if (brain.provider !== "claude-code" && (brain.minSandboxes ?? 0) > 0) {
+        await reconcileFloorNow(brain, actor.name, "brain created with a floor");
+      }
       return { brain };
     } catch (err) {
       throw badRequest(err.message);
@@ -1611,6 +1631,12 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     try {
       const brain = await controller.brains.update(id, body);
       log.info("brain.updated", { brain: brain.name, by: actor.name });
+      // Lantai efektif model ini bisa bergeser lewat dua pintu: angkanya
+      // sendiri, atau brain dinonaktifkan (lantai → 0, sisa armada otomatis
+      // menyusut). Keduanya direkonsiliasi saat itu juga.
+      if (body.minSandboxes !== undefined || body.enabled !== undefined) {
+        await reconcileFloorNow(brain, actor.name, "floor changed");
+      }
       return { brain };
     } catch (err) {
       throw badRequest(err.message);
@@ -1634,6 +1660,11 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         clearedMappings: clearedMappings.map((m) => `${m.template}/${m.role}/${m.level}`),
         by: actor.name,
       });
+      // D81: lantai model ini bisa ikut turun (atau hilang) — sisa armada
+      // sem-auto-nya menyusut sekarang, bukan menunggu keeper.
+      if (brain.provider !== "claude-code") {
+        await reconcileFloorNow(brain, actor.name, "brain deleted");
+      }
       return { brain, clearedMappings };
     } catch (err) {
       if (String(err.message).startsWith("unknown brain")) throw notFound(err.message);
@@ -2716,20 +2747,11 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
 
   /** RUNNING = ada task DISPATCHED/RUNNING yang parkir di worker ber-agent
    *  ini. Parkir WAIT_* tidak memegang sandbox (runnya tidak sedang
-   *  mengeksekusi) — itulah alasan kill legal untuk semuanya yang lain. */
-  async function busyAgentsByRef() {
-    const busy = new Map(); // agent_ref -> { taskId, projectId }
-    for (const status of [Status.DISPATCHED, Status.RUNNING]) {
-      for (const task of await repos.tasks.list({ status, limit: 10_000 })) {
-        if (!task.worker_id) continue;
-        const worker = await repos.workers.get(task.worker_id);
-        if (worker && !busy.has(worker.agent_ref)) {
-          busy.set(worker.agent_ref, { taskId: task.id, projectId: task.project_id });
-        }
-      }
-    }
-    return busy;
-  }
+   *  mengeksekusi) — itulah alasan kill legal untuk semuanya yang lain.
+   *  Implementasinya pindah ke domain/sandbox-provision.mjs (D81): pemangkasan
+   *  lantai butuh aturan "sibuk" yang sama, dan dua salinan aturan ini akan
+   *  berbeda pendapat tepat saat task sedang berjalan. */
+  const busyAgentsByRef = () => sharedBusyAgentsByRef(repos);
 
   /** Baris sandbox D78/D79 dari satu agent live + dua peta atribusi.
    *  Dipakai rute per-brain maupun overview armada — bentuk barisnya HARUS

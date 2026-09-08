@@ -100,9 +100,7 @@ test("the handshake sends the token and waits for hello-ok", async () => {
 // The nonce belongs to `device`, which a token-auth client does not send.
 test("the connect frame carries no root-level nonce", async () => {
   const { FakeWS, sent } = fakeSocketFactory({ sendChallenge: true });
-  // This is deliberately the token-only branch. Other tests exercise the
-  // device-auth branch, where the challenge nonce belongs inside `device`.
-  const rt = createGatewayRuntime({ token: "t", identityPath: null }, { WebSocketImpl: FakeWS });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
   await rt.connect();
   const params = sent.find((f) => f.method === "connect").params;
   assert.equal(params.nonce, undefined, "a root nonce makes the gateway reject the connection");
@@ -1011,5 +1009,106 @@ test("a probe's usage waiter never leaks into an unrelated run's usage", async (
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: WrongKeyEvent });
   const result = await rt.probeLevel({ agentId: "a1", thinking: "low", usageGraceMs: 30 });
   assert.equal(result.usage, null, "an event for a different sessionKey must not be attributed here");
+  await rt.close();
+});
+
+// ── models.list scoping (2026.8.2) ──────────────────────────────────────────
+//
+// Measured live on 2026.8.2: models.list with empty params returns zero
+// models, while the AgentOS client's own call passes {view:"configured"} and
+// gets the onboarded set. The adapter must ask the new way first and keep the
+// old empty-params call as a fallback for older gateways.
+
+test("listModels asks for view:configured and returns the models array", async () => {
+  const seen = [];
+  const { FakeWS } = fakeSocketFactory({
+    methods: ["connect", "agent.run", "agents.list", "models.list"],
+    onRequest: (f) => {
+      if (f.method === "models.list") {
+        seen.push(f.params);
+        return { ok: true, payload: { models: [{ id: "glm-5.2", provider: "zai", key: "zai/glm-5.2", maxTokens: 8192 }] } };
+      }
+      return { ok: true, payload: { runId: "r" } };
+    },
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const models = await rt.listModels();
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, "glm-5.2");
+  assert.deepEqual(seen, [{ view: "configured" }], "must not need the legacy fallback when the scoped call answers");
+  await rt.close();
+});
+
+test("listModels falls back to empty params when the scoped view answers empty", async () => {
+  const seen = [];
+  const { FakeWS } = fakeSocketFactory({
+    methods: ["connect", "agent.run", "agents.list", "models.list"],
+    onRequest: (f) => {
+      if (f.method === "models.list") {
+        seen.push(f.params ?? {});
+        return f.params?.view === "configured"
+          ? { ok: true, payload: { models: [] } }
+          : { ok: true, payload: { models: [{ id: "glm-4.7", provider: "zai" }] } };
+      }
+      return { ok: true, payload: { runId: "r" } };
+    },
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const models = await rt.listModels();
+  assert.equal(models.length, 1, "the legacy empty-params call is the fallback for older gateways");
+  assert.deepEqual(seen, [{ view: "configured" }, {}]);
+  await rt.close();
+});
+
+// ── config-declared agents (2026.8.2 ACP harness) ───────────────────────────
+//
+// agents.list only reports LIVE agents; ACP harness agents like "claude-opus"
+// are config entries — dispatchable by id, invisible to the live list. The
+// brain connection test needs this second source to stop reporting healthy
+// harness agents as missing.
+
+test("listConfiguredAgents reads agent ids from config.get's agents.entries map", async () => {
+  const { FakeWS } = fakeSocketFactory({
+    methods: ["connect", "agent.run", "agents.list", "config.get"],
+    onRequest: (f) => {
+      if (f.method === "config.get") {
+        return {
+          ok: true,
+          payload: {
+            config: { agents: { entries: { "claude-opus": { runtime: { acp: {} } }, "sdmk-kader-architect": {} } } },
+            resolved: {},
+          },
+        };
+      }
+      return { ok: true, payload: { runId: "r" } };
+    },
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const ids = await rt.listConfiguredAgents();
+  assert.deepEqual(ids.sort(), ["claude-opus", "sdmk-kader-architect"]);
+  await rt.close();
+});
+
+test("listConfiguredAgents tolerates the legacy agents.list array shape", async () => {
+  const { FakeWS } = fakeSocketFactory({
+    methods: ["connect", "agent.run", "agents.list", "config.get"],
+    onRequest: (f) => {
+      if (f.method === "config.get") {
+        return { ok: true, payload: { config: { agents: { list: [{ id: "old-agent" }, { name: "nameless" }] } } } };
+      }
+      return { ok: true, payload: { runId: "r" } };
+    },
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const ids = await rt.listConfiguredAgents();
+  assert.deepEqual(ids, ["old-agent", "nameless"]);
+  await rt.close();
+});
+
+test("listConfiguredAgents returns [] when config.get is not advertised", async () => {
+  const { FakeWS } = fakeSocketFactory({ methods: ["connect", "agent.run", "agents.list"] });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const ids = await rt.listConfiguredAgents();
+  assert.deepEqual(ids, []);
   await rt.close();
 });

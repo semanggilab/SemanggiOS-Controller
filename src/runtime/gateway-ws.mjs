@@ -485,11 +485,54 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
     async listModels() {
       await connect();
       if (!hello?.features?.methods?.includes("models.list")) return [];
-      try {
-        const payload = await request("models.list", {});
+      // 2026.8.2 scopes the answer: `view:"configured"` is the onboarded set
+      // this cache exists to show, while an empty-params call that older
+      // gateways answered fine measurably returns 0 models there. Ask the
+      // new way first, keep the old way as fallback, and log a failure
+      // instead of swallowing it — a silent empty cache reads as "no models
+      // onboarded" and sends the operator hunting a phantom.
+      const modelsFrom = (payload) => {
         const models = payload?.models ?? payload ?? [];
         return Array.isArray(models) ? models : [];
-      } catch {
+      };
+      try {
+        const configured = modelsFrom(await request("models.list", { view: "configured" }));
+        if (configured.length > 0) return configured;
+        return modelsFrom(await request("models.list", {}));
+      } catch (err) {
+        log.warn("gateway.models-list-failed", { error: String(err?.message ?? err).slice(0, 200) });
+        return [];
+      }
+    },
+
+    /// Config-declared agents, as distinct from live ones. 2026.8.2 keeps
+    /// ACP harness agents (e.g. "claude-opus") as CONFIG entries — present
+    /// in `config.get`'s snapshot under agents.entries, dispatchable by id,
+    /// but absent from `agents.list`, which only reports provisioned agents.
+    /// Callers that need "does this agent exist at all" must look here when
+    /// the live list misses; callers that need "will it answer a dispatch
+    /// right now" should still trust the live list plus a dispatch probe.
+    async listConfiguredAgents() {
+      await connect();
+      if (!hello?.features?.methods?.includes("config.get")) return [];
+      try {
+        const payload = await request("config.get", {});
+        const config = payload?.config ?? {};
+        const resolved = payload?.resolved ?? {};
+        const entriesFrom = (snapshot) => {
+          if (!snapshot || typeof snapshot !== "object") return null;
+          const agents = snapshot.agents ?? null;
+          if (agents?.entries && typeof agents.entries === "object" && !Array.isArray(agents.entries)) {
+            return Object.keys(agents.entries);
+          }
+          if (Array.isArray(agents?.list)) {
+            return agents.list.map((a) => a?.id ?? a?.name).filter((id) => typeof id === "string");
+          }
+          return null;
+        };
+        return entriesFrom(config) ?? entriesFrom(resolved) ?? [];
+      } catch (err) {
+        log.warn("gateway.config-get-failed", { error: String(err?.message ?? err).slice(0, 200) });
         return [];
       }
     },

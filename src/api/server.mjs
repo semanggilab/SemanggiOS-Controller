@@ -2716,6 +2716,30 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       }
     }
 
+    // 2026.8.2 keeps ACP harness agents (e.g. "claude-opus") in the gateway
+    // CONFIG, not in the live list: dispatchable by id, invisible to
+    // agents.list (measured on the cluster — 9 live agents, none of them
+    // the harness 90D214DF successfully ran on). Dispatch reaches config-
+    // only agents, so the honest test for them is the dispatch itself.
+    // `listConfiguredAgents` is optional: a runtime without it falls
+    // through to the live-only message unchanged.
+    if (!match && provider === "claude-code" && acpAgent) {
+      const configured = (await controller.runtime?.listConfiguredAgents?.().catch(() => [])) ?? [];
+      const needle = String(acpAgent).toLowerCase();
+      if (configured.some((id) => String(id ?? "").toLowerCase() === needle)) {
+        match = { id: acpAgent };
+      } else if (configured.length > 0) {
+        return {
+          ok: false,
+          reason: "no-agent",
+          message:
+            `No agent named "${acpAgent}" exists on the gateway — not live, and not among its ` +
+            `${configured.length} configured agent ids. On OpenClaw 2026.8.2 ACP harness agents are ` +
+            `config entries: add it to the gateway's agents config, then test again.`,
+        };
+      }
+    }
+
     if (!match) return { ok: false, reason: "no-agent", message };
     
     const agentId = match.id ?? match.agentId;

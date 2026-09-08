@@ -18,6 +18,8 @@ import { resolveLevel } from "./brains.mjs";
 import { LEVEL_TO_QUALITY, ROLE_CATEGORY } from "./decompose.mjs";
 import { Status } from "./state-machine.mjs";
 import { WakeReason } from "../scheduler/scheduler.mjs";
+import { adoptUploadsForTask } from "./workspace-files.mjs";
+import { shortId } from "./repositories.mjs";
 
 export async function createPrepareTask(controller, { projectId, text, actor = "operator" }) {
   const project = await controller.repos.projects.get(projectId);
@@ -62,11 +64,18 @@ export async function createPrepareTask(controller, { projectId, text, actor = "
     };
   }
 
+  // Id dibangkitkan di sini untuk hal yang sama dengan createDocTask: adopsi
+  // lampiran (D77) butuh id task SEBELUM baris task ada, agar rujukan
+  // tmp/uploads/ di deskripsi diganti salinan per-task yang pathnya sudah
+  // final saat task lahir.
+  const taskId = shortId("TASK");
+  const adoption = await adoptUploadsForTask(project.workspace_path, taskId, String(text));
   const task = await controller.repos.tasks.create({
+    id: taskId,
     projectId,
     workerId: worker.id,
     title: `Siapkan rencana & task: ${String(text).slice(0, 100)}`,
-    description: String(text),
+    description: adoption.text,
     qualityClass: LEVEL_TO_QUALITY[level] ?? "L3",
     workspaceMode: "write",
     workspacePath: project.workspace_path,

@@ -417,6 +417,27 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       );
     },
 
+    // D78 (Process Manager): per worker, the task most recently updated on it —
+    // "what was this sandbox last used for" for an idle agent. One query, not
+    // N. ORDER BY matters for the caller's first-wins dedupe per agent_ref:
+    // nothing stops one agent backing several workers rows, and without the
+    // ordering SQLite returns them in arbitrary order — the "last task" would
+    // be whichever worker row came first, not the agent's most recent. A tie
+    // on updated_at within one worker can still return two rows; caller keeps
+    // the first, which is fine for attribution.
+    latestByWorker: () =>
+      store.all(
+        `SELECT t.* FROM tasks t
+         JOIN (
+           SELECT worker_id, MAX(updated_at) AS max_updated
+             FROM tasks
+            WHERE worker_id IS NOT NULL AND deleted_at IS NULL
+            GROUP BY worker_id
+         ) latest ON latest.worker_id = t.worker_id AND latest.max_updated = t.updated_at
+         WHERE t.deleted_at IS NULL
+         ORDER BY t.updated_at DESC`,
+      ),
+
     async setStatus(taskId, next, { reason = null, waitDetail = null, actor = "controller" } = {}) {
       return store.tx(async () => {
         const task = await tasks.get(taskId);

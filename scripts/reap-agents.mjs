@@ -34,8 +34,15 @@ const token = arg("token", tokenFile ? readFileSync(tokenFile, "utf8").trim() : 
 const identityPath = arg("identity", null);
 // Hanya agen dengan prefiks ini yang boleh dipungut. Tanpa pagar itu satu salah
 // ketik bisa menghapus agen milik orang lain — termasuk yang dibuat lewat
-// AgentOS, yang tidak ada urusannya dengan kita.
-const prefix = arg("prefix", "sem");
+// AgentOS, yang tidak ada urusannya dengan kita. Default meng-cover KEDUA
+// prefiks yang diterima rute create sandbox (D78: /^(semanggi|sem)-/) — kalau
+// hanya "sem-" yang dicocokkan, setengah namespace yang kita sendiri izinkan
+// justru lolos dari pembersungan.
+const explicitPrefix = arg("prefix", null);
+const prefixMatch = explicitPrefix
+  ? (id) => id.startsWith(`${explicitPrefix}-`)
+  : (id) => /^(sem|semanggi)-/.test(id);
+const prefixLabel = explicitPrefix ? `${explicitPrefix}-` : "sem-|semanggi-";
 const dryRun = flag("dry-run");
 const keep = new Set((arg("keep", "") || "").split(",").filter(Boolean));
 
@@ -61,9 +68,9 @@ if (!granted.includes("operator.admin")) {
 }
 
 const agents = (await runtime.request("agents.list", {}))?.agents ?? [];
-const mine = agents.filter((a) => String(a.id ?? "").startsWith(`${prefix}-`));
+const mine = agents.filter((a) => prefixMatch(String(a.id ?? "")));
 
-console.log(`${agents.length} agen total, ${mine.length} berprefiks "${prefix}-"\n`);
+console.log(`${agents.length} agen total, ${mine.length} berprefiks "${prefixLabel}"\n`);
 
 let reaped = 0;
 for (const a of mine) {

@@ -15,7 +15,8 @@ import {
   DEFAULT_ROLE_LEVELS,
 } from "../../src/domain/brains.mjs";
 import { createApi } from "../../src/api/server.mjs";
-import { buildHarness } from "../helpers/harness.mjs";
+import { buildHarness, seedBasics, queuedTask } from "../helpers/harness.mjs";
+import { Status } from "../../src/domain/state-machine.mjs";
 
 const TOKEN = "controller-token-for-tests";
 
@@ -465,6 +466,126 @@ test("a runtime without probe-agent provisioning reports that gap, not a missing
     assert.equal(res.body.ok, false);
     assert.equal(res.body.reason, "provision-failed");
     assert.match(res.body.message, /no probe-agent provisioning/);
+  } finally {
+    await api.close();
+  }
+});
+
+// ── Process Manager (D78) ────────────────────────────────────────────────────
+//
+// Sandbox = agent gateway + workspace-nya. Daftarnya agent-centric karena
+// itulah yang dimutasi Test (probe D65) dan Create; atribusi project/task
+// datang dari worker; RUNNING berarti ada task DISPATCHED/RUNNING parkir di
+// sana — dan kill hanya legal untuk yang lain, ATURANNYA DI SERVER (pola D67).
+
+test("sandbox list: hanya agent milik brain, IDLE vs RUNNING, dengan atribusi task", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h); // worker.agent_ref = "doc-worker"
+  const brain = await h.brains.create({ name: "glm-brain", provider: "zai", model: "glm-5.2", thinking: "max", level: Level.NORMAL });
+  h.runtime.listAgents = async () => [
+    { id: "doc-worker", name: "doc-worker", workspace: "/nfs/workspaces/alpha", model: { primary: "zai/glm-5.2" } },
+    { id: "sem-workspaces-probe-zai-glm-5-2", name: "sem-workspaces-probe-zai-glm-5-2", model: { primary: "zai/glm-5.2" } },
+    { id: "lain", model: { primary: "google/gemini-flash" } }, // brain lain — tidak ikut
+  ];
+  const api = await startApi(h);
+  try {
+    // Bekas task terminal di worker itu → atribusi IDLE lewat fallback
+    // latestByWorker (task HIDUP yang menentukan RUNNING, tapi task terakhir
+    // yang menjawab "sandbox ini dipakai untuk apa").
+    const prior = await queuedTask(h, { project, worker, title: "dokumentasi lama" });
+    // QUEUED→COMPLETE ilegal (task yang belum pernah dikerjakan tidak bisa
+    // "selesai"); bekas task yang jujur lewat dispatch.
+    await h.repos.tasks.setStatus(prior.id, Status.DISPATCHED);
+    await h.repos.tasks.setStatus(prior.id, Status.COMPLETE);
+
+    let res = await api.call("GET", `/api/work/brains/${brain.id}/sandboxes`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.sandboxes.length, 2, JSON.stringify(res.body.sandboxes));
+    const idle = res.body.sandboxes.find((s) => s.agentId === "doc-worker");
+    assert.equal(idle.status, "IDLE");
+    assert.equal(idle.probe, false);
+    assert.equal(idle.taskId, prior.id, "atribusi IDLE = task terakhir di worker itu");
+    assert.equal(idle.projectId, project.id);
+    assert.equal(res.body.sandboxes.find((s) => s.agentId === "sem-workspaces-probe-zai-glm-5-2").probe, true);
+
+    // Task DISPATCHED di worker ber-agent itu → RUNNING + atribusi.
+    const task = await queuedTask(h, { project, worker, title: "menulis docs" });
+    await h.repos.tasks.setStatus(task.id, Status.DISPATCHED);
+    res = await api.call("GET", `/api/work/brains/${brain.id}/sandboxes`);
+    const busy = res.body.sandboxes.find((s) => s.agentId === "doc-worker");
+    assert.equal(busy.status, "RUNNING");
+    assert.equal(busy.taskId, task.id);
+    assert.equal(busy.projectId, project.id);
+  } finally {
+    await api.close();
+  }
+});
+
+test("kill sandbox: IDLE dihapus lewat agents.delete; RUNNING ditolak 409 dengan task-nya", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const brain = await h.brains.create({ name: "glm-brain", provider: "zai", model: "glm-5.2", level: Level.NORMAL });
+  const live = [{ id: "doc-worker", model: { primary: "zai/glm-5.2" } }];
+  h.runtime.listAgents = async () => live;
+  const deleted = [];
+  h.runtime.deleteAgent = async ({ agentId }) => {
+    deleted.push(agentId);
+    return { removedBindings: 2 };
+  };
+  const api = await startApi(h);
+  try {
+    const bad = await api.call("POST", `/api/work/brains/${brain.id}/sandboxes/kill`, { agentId: "bukan-agent-ini" });
+    assert.equal(bad.status, 404, "bukan sandbox brain ini");
+
+    const task = await queuedTask(h, { project, worker });
+    // Jalur sah state machine: QUEUED → DISPATCHED → RUNNING (D75 menambah
+    // tepi mundur, bukan lompatan maju).
+    await h.repos.tasks.setStatus(task.id, Status.DISPATCHED);
+    await h.repos.tasks.setStatus(task.id, Status.RUNNING);
+    const conflict = await api.call("POST", `/api/work/brains/${brain.id}/sandboxes/kill`, { agentId: "doc-worker" });
+    assert.equal(conflict.status, 409);
+    assert.match(conflict.body.error, new RegExp(task.id));
+    assert.deepEqual(deleted, [], "RUNNING tidak pernah sampai ke agents.delete");
+
+    await h.repos.tasks.setStatus(task.id, Status.COMPLETE);
+    const ok = await api.call("POST", `/api/work/brains/${brain.id}/sandboxes/kill`, { agentId: "doc-worker" });
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.equal(ok.body.killed, true);
+    assert.equal(ok.body.removedBindings, 2);
+    assert.deepEqual(deleted, ["doc-worker"]);
+  } finally {
+    await api.close();
+  }
+});
+
+test("create sandbox: nama berprefiks sem-, workspace absolut, model milik brain; claude-code ditolak", async () => {
+  const h = await buildHarness();
+  const brain = await h.brains.create({ name: "glm-brain", provider: "zai", model: "glm-5.2", level: Level.NORMAL });
+  const acp = await h.brains.create({ name: "claude-brain", provider: "claude-code", model: "claude-code", mode: "acp", acpAgent: "claude-opus", level: Level.NORMAL });
+  const created = [];
+  h.runtime.listAgents = async () => [];
+  h.runtime.createProbeAgent = async ({ name, workspace, model }) => {
+    created.push({ name, workspace, model });
+    return { id: name, name };
+  };
+  const api = await startApi(h);
+  try {
+    const reject = await api.call("POST", `/api/work/brains/${brain.id}/sandboxes`, { name: "box-1" });
+    assert.equal(reject.status, 400, "tanpa prefiks sem- ditolak (diskriminator asal D32)");
+
+    const relative = await api.call("POST", `/api/work/brains/${brain.id}/sandboxes`, { name: "semanggi-box-1", workspace: "workspaces/relatif" });
+    assert.equal(relative.status, 400, "workspace relatif adalah agent yang bekerja di mana-mana (pelajaran D65)");
+
+    const acpReject = await api.call("POST", `/api/work/brains/${acp.id}/sandboxes`, { name: "semanggi-claude" });
+    assert.equal(acpReject.status, 400);
+    assert.match(acpReject.body.error, /ACP harness/);
+
+    const ok = await api.call("POST", `/api/work/brains/${brain.id}/sandboxes`, { name: "Semanggi Box Alpha!" });
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.equal(ok.body.sandbox.name, "semanggi-box-alpha", "nama dislugkan");
+    assert.equal(ok.body.sandbox.model, "zai/glm-5.2", "model dikunci ke brain");
+    assert.ok(ok.body.sandbox.workspace.startsWith("/"), "workspace default absolut");
+    assert.deepEqual(created.map((c) => c.name), ["semanggi-box-alpha"]);
   } finally {
     await api.close();
   }

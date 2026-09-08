@@ -228,7 +228,8 @@ async function main() {
   }, Number(process.env.SEMANGGI_RECONCILE_MS ?? 20_000));
   reconcileTimer.unref?.();
 
-  // D76: penyapu lampiran. Agen diinstruksikan menghapus tmp/uploads/ segera
+  // D76/D77: penyapu lampiran — staging tmp/uploads/ DAN salinan per-task
+  // deliverables/<task>/tmp/uploads/. Agen diinstruksikan menghapus segera
   // setelah memuatnya, tapi instruksi bukan jaminan — TTL inilah yang
   // deterministik. Satu jam sekali cukup: TTL-nya 24 jam, beberapa menit
   // kelebihan umur tidak mengubah apa pun.

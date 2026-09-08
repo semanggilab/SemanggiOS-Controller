@@ -21,8 +21,8 @@
 // tulis hanya untuk `.md`. Yang dijaga tetap sama — tidak ada permintaan yang
 // bisa menunjuk ke luar workspace project.
 
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { copyFile, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, resolve, sep } from "node:path";
 
 /** Akar yang boleh dijelajah. Konstanta; tidak pernah datang dari request. */
 export const FILE_ROOTS = Object.freeze(["docs", "memory", "deliverables"]);
@@ -153,37 +153,120 @@ export async function readWorkspaceFile(absolute) {
   return { binary: false, content: buffer.toString("utf8"), size: buffer.length };
 }
 
-// --- unggahan operator (D76) --------------------------------------------------
+// --- unggahan operator (D76, D77) ---------------------------------------------
 //
 // Lampiran chat HIDUP di workspace hanya sampai task yang membacanya selesai
 // memuatnya. Direktori khusus tmp/uploads — bukan docs/ atau deliverables/ —
 // supaya dua kontrak yang sudah ada tidak berubah: listing "@" hanya menunjuk
 // dokumen proyek yang permanen, dan agen tidak mengira lampiran itu bagian
 // dari workspace yang boleh dirujuk lusa.
+//
+// D77 — DUA TAHAP: STAGING, LALU ADOPSI PER-TASK
+//
+// tmp/uploads/ di root workspace hanyalah STAGING: pada saat menempel
+// lampiran, task-nya belum ada, jaya path per-task mustahil diketahui lebih
+// awal. Begitu sebuah pesan menciptakan task, setiap lampiran yang dirujuk
+// deskripsinya DIADOPSI: disalin ke deliverables/<task-id>/tmp/uploads/ dan
+// rujukannya ditulis ulang. Alasannya bukan kosmetik — dengan satu berkas
+// global, dekomposisi WORK membuat N task yang merujuk berkas yang sama,
+// dan agen fase pertama yang patuh menghapus setelah memuat merampas
+// lampiran dari fase-fase di belakangnya. Salinan per-task membuat setiap
+// agen menghapus miliknya sendiri.
 
-/** Batas ukuran per berkas. Cukup untuk PDF/laporan; jauh di bawah apa yang
- *  bisa dipakai untuk mengisi NFS dengan sebuah kotak chat. */
+/** Batas ukuran per berkas. Cukup untuk laporan panjang; jauh di bawah apa
+ *  yang bisa dipakai untuk mengisi NFS dengan sebuah kotak chat. */
 export const UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
 
 export const UPLOAD_DIR = "tmp/uploads";
 
+/** Direktori staging dalam workspace. */
+export const uploadStagingDir = () => UPLOAD_DIR;
+
+/** Direktori lampiran milik satu task (D77). */
+export const uploadDirForTask = (taskId) => `deliverables/${taskId}/${UPLOAD_DIR}`;
+
 /**
- * Menulis satu unggahan. Nama disucikan menjadi BASENAME polos: operator
- * tidak pernah punya alasan meletakkan path di nama berkas, dan mengizinkan
- * "/" atau ".." di sana adalah menulis ke mana saja di workspace.
- *
- * @returns {{ok: true, path: string, size: number} | {ok: false, reason: string}}
+ * Ekstensi unggahan yang diterima — TEKS SAJA (D77). Lampiran adalah bahan
+ * yang dibaca agen dan ditampilkan operator di viewer; berkas biner tidak
+ * bisa menjadi keduanya, dan menolaknya di sini lebih murah daripada
+ * menyimpannya lalu mengecewkan dua kali (agen membaca sampah, viewer
+ * menolak render).
  */
-export async function saveUpload(workspacePath, requestedName, bytes) {
+export const UPLOAD_TEXT_EXTS = Object.freeze([
+  ".md", ".markdown", ".mdx", ".txt", ".text", ".log",
+  ".json", ".jsonl", ".ndjson", ".csv", ".tsv",
+  ".yml", ".yaml", ".toml", ".ini", ".conf", ".cfg",
+  ".xml", ".html", ".htm", ".css", ".scss", ".less",
+  ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+  ".py", ".rb", ".go", ".rs", ".java", ".kt", ".kts",
+  ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".php",
+  ".sh", ".bash", ".zsh", ".sql", ".graphql", ".svg",
+]);
+
+export function isTextUploadName(name) {
+  const lower = String(name ?? "").toLowerCase();
+  return UPLOAD_TEXT_EXTS.some((ext) => lower.endsWith(ext));
+}
+
+/**
+ * Rujukan lampiran yang disebut sebuah teks — bentuk staging
+ * (`tmp/uploads/<nama>`) maupun bentuk per-task
+ * (`deliverables/<task-id>/tmp/uploads/<nama>`). Pola lama hanya mencocokkan
+ * yang pertama dan memotong yang kedua menjadi `tmp/uploads/<nama>`: preamble
+ * lalu menyuruh agen menghapus path yang tidak pernah ada (D77).
+ */
+const UPLOAD_REF_RE = /(?:deliverables\/[A-Za-z0-9._\-]+\/)?tmp\/uploads\/[A-Za-z0-9._\-/]+/g;
+
+export function extractUploadRefs(text) {
+  const out = [];
+  for (const m of String(text ?? "").matchAll(UPLOAD_REF_RE)) {
+    const ref = m[0].replace(/[.,;:)]+$/, "");
+    if (!out.includes(ref)) out.push(ref);
+  }
+  return out;
+}
+
+/**
+ * Nama berkas dari input operator → basename polos yang AMAN DIJADIKAN TOKEN,
+ * atau null bila kosong. Spasi diganti "-" bukan dibuang: rujukan lampiran
+ * adalah token `@tmp/uploads/<nama>` di composer, dan pola token (completion,
+ * parseDocRefs, extractUploadRefs) semuanya berhenti di spasi — nama berspasi
+ * menghasilkan rujukan yang tidak pernah bisa dibaca kembali.
+ */
+function sanitizeUploadName(requestedName) {
   const name = String(requestedName ?? "")
     .split(/[\\/]/)
     .pop()
     .replace(/[\u0000-\u001f]/g, "")
-    .trim();
-  if (!name || name === "." || name === "..") return { ok: false, reason: "nama berkas kosong atau tidak sah" };
+    .trim()
+    .replace(/\s+/g, "-");
+  if (!name || name === "." || name === "..") return null;
+  return name;
+}
+
+/**
+ * Menulis satu unggahan ke staging. Nama disucikan menjadi BASENAME polos:
+ * operator tidak pernah punya alasan meletakkan path di nama berkas, dan
+ * mengizinkan "/" atau ".." di sana adalah menulis ke mana saja di workspace.
+ *
+ * Hanya teks (D77): ekstensi dicek daftar, dan isi diendus biner — NUL di
+ * 8 KB pertama, heuristik yang sama dengan readWorkspaceFile. Ekstensi bisa
+ * berbohong (PNG bernama .txt); isi tidak.
+ *
+ * @returns {{ok: true, path: string, size: number} | {ok: false, reason: string}}
+ */
+export async function saveUpload(workspacePath, requestedName, bytes) {
+  const name = sanitizeUploadName(requestedName);
+  if (!name) return { ok: false, reason: "nama berkas kosong atau tidak sah" };
   if (!Buffer.isBuffer(bytes) || bytes.length === 0) return { ok: false, reason: "berkas kosong" };
+  if (!isTextUploadName(name)) {
+    return { ok: false, reason: `hanya berkas teks yang bisa dilampirkan (${UPLOAD_TEXT_EXTS.join(" ")}) — ${name} ditolak` };
+  }
   if (bytes.length > UPLOAD_MAX_BYTES) {
     return { ok: false, reason: `berkas ${Math.round(bytes.length / 1024)}KB melebihi batas ${UPLOAD_MAX_BYTES / 1024 / 1024}MB` };
+  }
+  if (bytes.subarray(0, 8192).includes(0)) {
+    return { ok: false, reason: `${name} terdeteksi biner — lampiran hanya berkas teks` };
   }
   const dir = resolve(workspacePath, UPLOAD_DIR);
   await mkdir(dir, { recursive: true });
@@ -193,31 +276,128 @@ export async function saveUpload(workspacePath, requestedName, bytes) {
 }
 
 /**
+ * Menghapus satu lampiran STAGING — tombol "×" pada chip lampiran di composer
+ * (D77). Hanya staging: salinan per-task adalah milik task yang mengadopsinya,
+ * dihapus agen setelah dimuat atau penyapu TTL, bukan oleh operator dari sini.
+ *
+ * @returns {{ok: true, path: string} | {ok: false, reason: string}}
+ */
+export async function deleteUpload(workspacePath, requested) {
+  const raw = String(requested ?? "").trim();
+  const name = sanitizeUploadName(raw === UPLOAD_DIR || raw.startsWith(`${UPLOAD_DIR}/`) ? raw.slice(UPLOAD_DIR.length + 1) : raw);
+  if (!name) return { ok: false, reason: "nama berkas kosong atau tidak sah" };
+  const target = resolve(workspacePath, UPLOAD_DIR, name);
+  const base = resolve(workspacePath);
+  if (!target.startsWith(`${base}${sep}`)) return { ok: false, reason: "path keluar dari staging lampiran" };
+  try {
+    await rm(target, { force: false });
+  } catch {
+    return { ok: false, reason: `lampiran ${UPLOAD_DIR}/${name} tidak ada` };
+  }
+  return { ok: true, path: `${UPLOAD_DIR}/${name}` };
+}
+
+/**
+ * Adopsi lampiran oleh satu task (D77): setiap rujukan staging di teks
+ * disalin ke deliverables/<task-id>/tmp/uploads/ dan rujukannya ditulis
+ * ulang. Rujukan yang sumbernya sudah tidak ada DIBIARKAN apa adanya —
+ * task DOC menginstruksikan agen melaporkan berkas yang hilang, bukan
+ * menebak isinya, dan menghapus rujukan diam-diam akan menyembunyikan
+ * kegagalan itu dari operator.
+ *
+ * @returns {{text: string, adopted: string[], missing: string[], map: Record<string, string>}}
+ */
+export async function adoptUploadsForTask(workspacePath, taskId, text) {
+  const source = String(text ?? "");
+  const out = { text: source, adopted: [], missing: [], map: {} };
+  if (!workspacePath || !taskId) return out;
+  const base = resolve(workspacePath);
+  const stagingRoot = resolve(base, UPLOAD_DIR);
+  for (const ref of extractUploadRefs(source)) {
+    // Hanya bentuk staging yang diadopsi; rujukan deliverables/…/tmp/uploads
+    // sudah milik task lain — menyalinnya lagi berarti task ini ikut
+    // menghapus milik tetangganya.
+    if (!ref.startsWith(`${UPLOAD_DIR}/`)) continue;
+    // Sumber divalidasi SEPERTI destinasi: ref datang dari teks operator
+    // (termasuk /prepare dari Slack — identitas non-admin), dan pola ekstraksi
+    // mengizinkan ".." — tanpa ini `@tmp/uploads/../../etc/passwd` menyalin
+    // berkas host sembarang ke deliverables/ (temuan review D77; GET /file dan
+    // DELETE sudah lama menolak jalan keluar, jalur salin ini yang tertinggal).
+    // Ref yang mencoba kabur diperlakukan seperti sumber hilang.
+    const src = resolve(base, ref);
+    if (!src.startsWith(`${stagingRoot}${sep}`)) {
+      out.missing.push(ref);
+      continue;
+    }
+    const destRelative = `${uploadDirForTask(taskId)}/${basename(ref.slice(UPLOAD_DIR.length + 1))}`;
+    const dest = resolve(base, destRelative);
+    if (!dest.startsWith(`${base}${sep}`)) continue; // paranoia: ref datang dari teks operator
+    try {
+      await mkdir(dirname(dest), { recursive: true });
+      // realpath, bukan sekadar cek leksikal: symlink di dalam staging bisa
+      // menunjuk keluar, dan copyFile berjalan di host — mengikuti symlink
+      // di SINI berarti membaca di luar sandbox tempat agen itu sendiri
+      // dikurung.
+      const realSrc = await realpath(src);
+      const realStaging = await realpath(stagingRoot);
+      if (!realSrc.startsWith(`${realStaging}${sep}`)) {
+        out.missing.push(ref);
+        continue;
+      }
+      await copyFile(realSrc, dest);
+    } catch {
+      out.missing.push(ref);
+      continue;
+    }
+    out.adopted.push(destRelative);
+    out.map[ref] = destRelative;
+    out.text = out.text.split(ref).join(destRelative);
+  }
+  return out;
+}
+
+/**
  * Penyapu kedaluwarsa — pengaman kalau agen lupa menghapus setelah memuat
  * (instruksinya eksplisit, tapi "instruksi" bukan jaminan; deterministik yang
- * sejati adalah jam). Mengembalikan daftar path yang dihapus untuk diaudit.
+ * sejati adalah jam). Menyapu staging DAN setiap deliverables/<task>/tmp/uploads
+ * (D77). Mengembalikan daftar path yang dihapus untuk diaudit.
  */
 export async function cleanUploads(workspacePath, ttlMs, now = () => Date.now()) {
-  const dir = resolve(workspacePath, UPLOAD_DIR);
-  let entries;
-  try {
-    entries = await readdir(dir);
-  } catch {
-    return [];
-  }
+  const base = resolve(workspacePath);
   const removed = [];
-  for (const entry of entries) {
-    const target = resolve(dir, entry);
+  const sweepDir = async (dirAbsolute, labelFor) => {
+    let entries;
     try {
-      const info = await stat(target);
-      if (!info.isFile()) continue;
-      if (now() - info.mtimeMs > ttlMs) {
-        await rm(target);
-        removed.push(`${UPLOAD_DIR}/${entry}`);
-      }
+      entries = await readdir(dirAbsolute);
     } catch {
-      // Hilang di antara readdir dan stat — sudah tidak ada, selesai.
+      return; // direktori belum ada — keadaan normal, bukan kegagalan
     }
+    for (const entry of entries) {
+      const target = resolve(dirAbsolute, entry);
+      try {
+        const info = await stat(target);
+        if (!info.isFile()) continue;
+        if (now() - info.mtimeMs > ttlMs) {
+          await rm(target);
+          removed.push(labelFor(entry));
+        }
+      } catch {
+        // Hilang di antara readdir dan stat — sudah tidak ada, selesai.
+      }
+    }
+  };
+  await sweepDir(resolve(base, UPLOAD_DIR), (entry) => `${UPLOAD_DIR}/${entry}`);
+  // Pola tetap deliverables/<task-id>/tmp/uploads — bukan walk bebas: tidak
+  // ada yang boleh menghapus deliverable sungguhan, dan pola satu tingkat ini
+  // cukup karena adopsi selalu menulis ke bentuk itu.
+  let taskDirs;
+  try {
+    taskDirs = await readdir(resolve(base, "deliverables"));
+  } catch {
+    taskDirs = [];
+  }
+  for (const taskDir of taskDirs) {
+    await sweepDir(resolve(base, "deliverables", taskDir, UPLOAD_DIR), (entry) => `deliverables/${taskDir}/${UPLOAD_DIR}/${entry}`);
   }
   return removed;
 }

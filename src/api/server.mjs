@@ -8,7 +8,7 @@ import { nullLogger } from "../domain/logger.mjs";
 import { verifySlackRequest, parseSlackBody } from "../interface/slack-verify.mjs";
 import { timingSafeEqual } from "node:crypto";
 import { Status, canTransition } from "../domain/state-machine.mjs";
-import { DELETABLE_STATUSES } from "../domain/repositories.mjs";
+import { DELETABLE_STATUSES, shortId } from "../domain/repositories.mjs";
 import { TASK_FOR_EXECUTION } from "../runtime/reconciler.mjs";
 import { isExpedited, effectivePriority } from "../scheduler/selection.mjs";
 import { WakeReason } from "../scheduler/scheduler.mjs";
@@ -35,6 +35,8 @@ import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
 import { mergeModelMap, modelDeleteBlockers } from "../domain/model-map.mjs";
 import {
   FILE_ROOTS,
+  adoptUploadsForTask,
+  deleteUpload,
   isEditablePath,
   listWorkspaceFiles,
   readWorkspaceFile,
@@ -116,6 +118,9 @@ class HttpError extends Error {
 const badRequest = (msg, detail) => new HttpError(400, msg, detail);
 const notFound = (msg) => new HttpError(404, msg);
 const forbidden = (msg) => new HttpError(403, msg);
+// D78: kill targets a sandbox that may have started running between paint and
+// click — the honest answer is 409 with the task id, not a silent second try.
+const conflict = (msg) => new HttpError(409, msg);
 
 /** A thinking-level probe's in-memory progress entry, shaped for the wire. */
 function presentProbeStatus(status) {
@@ -585,11 +590,12 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     return { path: target.relative, exists: true, editable: true, size: body.content.length };
   });
 
-  // Lampiran operator → tmp/uploads/ (D76). Body adalah BYTES MENTAH, bukan
-  // JSON — dispatcher menyimpannya di body.__raw karena utf8-decode akan
-  // merusak berkas biner sebelum route ini sempat melihatnya. Satu berkas per
-  // permintaan; UI mengunggah berurutan sehingga kegagalan satu berkas bisa
-  // dilaporkan per berkas, bukan sebagai satu kegagalan massal.
+  // Lampiran operator → staging tmp/uploads/ (D76; adopsi per-task di D77).
+  // Body adalah BYTES MENTAH, bukan JSON — dispatcher menyimpannya di
+  // body.__raw karena utf8-decode akan merusak berkas biner sebelum route ini
+  // sempat melihatnya. Satu berkas per permintaan; UI mengunggah berurutan
+  // sehingga kegagalan satu berkas bisa dilaporkan per berkas, bukan sebagai
+  // satu kegagalan massal.
   route("POST", "/api/work/projects/{id}/uploads", async ({ id }, body, query, actor) => {
     const project = await repos.projects.get(id);
     if (!project) throw notFound(`unknown project ${id}`);
@@ -611,6 +617,32 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     });
     log.info("project.upload-created", { project: id, path: saved.path, size: saved.size, by });
     return saved;
+  });
+
+  // Tombol "×" pada chip lampiran di composer (D77). Hanya staging yang bisa
+  // dihapus dari sini — salinan per-task sudah milik task yang mengadopsinya
+  // (dihapus agen setelah dimuat / penyapu TTL), dan membukanya ke path bebas
+  // berarti composer bisa menghapus deliverable sungguhan.
+  route("DELETE", "/api/work/projects/{id}/uploads", async ({ id }, _b, query, actor) => {
+    const project = await repos.projects.get(id);
+    if (!project) throw notFound(`unknown project ${id}`);
+    const raw = String(query.get("path") ?? "").trim();
+    const inStaging = raw === UPLOAD_DIR || raw.startsWith(`${UPLOAD_DIR}/`);
+    if (!inStaging) throw badRequest(`hanya lampiran staging ${UPLOAD_DIR}/ yang bisa dihapus dari sini`);
+    const target = resolveWorkspaceFile(project.workspace_path, raw);
+    if (!target.ok) throw badRequest(target.reason);
+    const removed = await deleteUpload(project.workspace_path, target.relative);
+    if (!removed.ok) throw badRequest(removed.reason);
+    const by = actor?.kind === "operator" ? actor.name : String(query.get("user") ?? "agentos-ui");
+    await controller.events.append({
+      kind: "project.upload-deleted",
+      subjectType: "project",
+      subjectId: id,
+      actor: by,
+      payload: { path: removed.path },
+    });
+    log.info("project.upload-deleted", { project: id, path: removed.path, by });
+    return removed;
   });
 
   // Project-level Role Level overrides (Settings → Project → Edit modal).
@@ -1885,11 +1917,17 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       // dibuat menggantung ke id yang tidak ada.
       const dependsOn = item.deps.map((d) => idByLocal.get(d)).filter(Boolean);
       const resolvedRole = item.role ? namesByRole.get(item.role) : undefined;
+      // Adopsi lampiran (D77) — id lebih dulu supaya rujukan tmp/uploads/
+      // diganti salinan per-task sebelum task lahir (alasan yang sama dengan
+      // jalur TASK/WORK/DOC).
+      const taskId = shortId("TASK");
+      const adoption = await adoptUploadsForTask(root, taskId, String(item.description ?? item.title));
       const task = await repos.tasks.create({
+        id: taskId,
         projectId,
         workerId: worker.id,
         title: item.title.slice(0, 120),
-        description: item.description ?? item.title,
+        description: adoption.text,
         workspacePath: root,
         modelPolicy: {
           ...(item.role && ROLE_CATEGORY[item.role] ? { category: ROLE_CATEGORY[item.role] } : {}),
@@ -2082,7 +2120,8 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       if (parsed.action === Action.CREATE) {
         const taskProjectId = body.projectId ?? process.env.SEMANGGI_DEFAULT_PROJECT ?? null;
         if (!taskProjectId) throw badRequest("projectId is required (tidak ada project default yang dikonfigurasi)");
-        if (!(await repos.projects.get(taskProjectId))) throw badRequest(`unknown project ${taskProjectId}`);
+        const taskProject = await repos.projects.get(taskProjectId);
+        if (!taskProject) throw badRequest(`unknown project ${taskProjectId}`);
 
         // D43: every task-creating surface matches the same way — least-loaded
         // ACTIVE worker with access; assign or refuse, never park silently.
@@ -2109,16 +2148,22 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         const levelPolicy = parsed.level
           ? { qualityClass: LEVEL_TO_QUALITY[parsed.level], modelPolicy: { class: parsed.level } }
           : {};
+        // Adopsi lampiran (D77): id dibangkitkan lebih dulu (generator yang
+        // sama dengan default create) supaya rujukan tmp/uploads/ di deskripsi
+        // diganti salinan per-task sebelum task lahir.
+        const taskId = shortId("TASK");
+        const adoption = await adoptUploadsForTask(taskProject.workspace_path, taskId, parsed.text);
         const task = await repos.tasks.create({
+          id: taskId,
           projectId: taskProjectId,
           workerId: worker.id,
           title: parsed.text.slice(0, 120),
-          description: parsed.text,
+          description: adoption.text,
           ...levelPolicy,
         });
         await repos.tasks.setStatus(task.id, Status.QUEUED, { actor: by });
         await scheduler.notify(WakeReason.TASK_CREATED);
-        log.info("control.task-created", { task: task.id, project: taskProjectId, level: parsed.level ?? null, by });
+        log.info("control.task-created", { task: task.id, project: taskProjectId, level: parsed.level ?? null, uploadsAdopted: adoption.adopted.length, by });
         return {
           intent: "TASK",
           action: "task",
@@ -2261,11 +2306,18 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     const created = [];
     for (const step of resolved) {
       const dependsOn = step.after.map((r) => idByRole.get(r)).filter(Boolean);
+      // Adopsi lampiran PER TASK (D77): setiap fase dari satu pesan WORK
+      // mendapat SALINAN sendiri — fase pertama yang selesai memuat lalu
+      // menghapus tidak lagi merampas lampiran dari fase-fase di belakangnya,
+      // yang sebelumnya berbagi satu berkas staging.
+      const taskId = shortId("TASK");
+      const adoption = await adoptUploadsForTask(project.workspace_path, taskId, step.description);
       const task = await repos.tasks.create({
+        id: taskId,
         projectId,
         workerId: step.workerId,
         title: step.title,
-        description: step.description,
+        description: adoption.text,
         qualityClass: step.qualityClass,
         workspaceMode: step.workspaceMode,
         workspacePath: project.workspace_path,
@@ -2513,6 +2565,19 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   // missed, and every claude Brain read as "no agent provisioned" even with a
   // running, healthy harness. Fixed by resolving on `acpAgent`'s own agent id
   // for that one provider, the same distinction dispatch already makes.
+  // D78 (Process Manager): every live agent bound to this Brain — the sandbox
+  // list is agent-centric because one agent owns one sandbox workspace, and
+  // this is the same discriminator the connection test already trusts.
+  function agentsForBrain({ provider, model, acpAgent }, liveAgents) {
+    if (provider === "claude-code") {
+      if (!acpAgent) return [];
+      const needle = String(acpAgent).toLowerCase();
+      return liveAgents.filter((a) => String(a?.id ?? "").toLowerCase() === needle);
+    }
+    const target = `${provider}/${model}`.toLowerCase();
+    return liveAgents.filter((a) => String(a?.model?.primary ?? "").toLowerCase() === target);
+  }
+
   function resolveTestAgent(liveAgents, { provider, model, acpAgent }) {
     if (provider === "claude-code") {
       if (!acpAgent) {
@@ -2523,7 +2588,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
             '(routing.json "acpAgent"), never matched by model — set one before testing.',
         };
       }
-      const match = liveAgents.find((a) => String(a?.id ?? "").toLowerCase() === acpAgent.toLowerCase());
+      const match = agentsForBrain({ provider, model, acpAgent }, liveAgents)[0];
       return {
         match,
         message: match
@@ -2532,7 +2597,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       };
     }
     const target = `${provider}/${model}`.toLowerCase();
-    const match = liveAgents.find((a) => String(a?.model?.primary ?? "").toLowerCase() === target);
+    const match = agentsForBrain({ provider, model, acpAgent }, liveAgents)[0];
     return {
       match,
       message: match
@@ -2654,6 +2719,143 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     const result = await runBrainTest({ provider, model, acpAgent, thinking, effortMode });
     log.info("brain.tested-draft", { provider, model, agentId: result.agentId ?? null, ok: result.ok, status: result.status });
     return result;
+  });
+
+  // --- brain sandboxes: the Process Manager (D78) ----------------------------
+  //
+  // "Sandbox" di sini adalah AGENT gateway + workspace-nya, bukan sesi: satu
+  // agent memiliki tepat satu workspace sandbox, agents.list adalah sumber
+  // kebenaran terukur untuk "akan benar-benar berjalan" (D32), dan daftar
+  // agent-centric inilah yang dimutasi Test Connection (probe auto-provision
+  // D65 langsung muncul di sini) maupun Create. Sesi tetap urusan transkrip
+  // task.
+
+  /** RUNNING = ada task DISPATCHED/RUNNING yang parkir di worker ber-agent
+   *  ini. Parkir WAIT_* tidak memegang sandbox (runnya tidak sedang
+   *  mengeksekusi) — itulah alasan kill legal untuk semuanya yang lain. */
+  async function busyAgentsByRef() {
+    const busy = new Map(); // agent_ref -> { taskId, projectId }
+    for (const status of [Status.DISPATCHED, Status.RUNNING]) {
+      for (const task of await repos.tasks.list({ status, limit: 10_000 })) {
+        if (!task.worker_id) continue;
+        const worker = await repos.workers.get(task.worker_id);
+        if (worker && !busy.has(worker.agent_ref)) {
+          busy.set(worker.agent_ref, { taskId: task.id, projectId: task.project_id });
+        }
+      }
+    }
+    return busy;
+  }
+
+  route("GET", "/api/work/brains/{id}/sandboxes", async ({ id }) => {
+    const brain = await controller.brains.get(id);
+    if (!brain) throw notFound(`unknown brain ${id}`);
+    const live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+    const agents = agentsForBrain(brain, live);
+    const busy = await busyAgentsByRef();
+    // Agent idle tetap layak atribusi: task terakhir yang pernah jalan di sana.
+    const lastByAgent = new Map();
+    for (const task of await repos.tasks.latestByWorker()) {
+      const worker = task.worker_id ? await repos.workers.get(task.worker_id) : null;
+      if (worker && !lastByAgent.has(worker.agent_ref)) {
+        lastByAgent.set(worker.agent_ref, { taskId: task.id, projectId: task.project_id });
+      }
+    }
+    const sandboxes = agents.map((a) => {
+      const agentId = String(a.id ?? "");
+      const active = busy.get(agentId) ?? null;
+      const last = active ?? lastByAgent.get(agentId) ?? null;
+      return {
+        agentId,
+        name: a.name ?? agentId,
+        workspace: a.workspace ?? null,
+        status: active ? "RUNNING" : "IDLE",
+        projectId: last?.projectId ?? null,
+        taskId: last?.taskId ?? null,
+        probe: /^sem-workspaces-probe-/.test(agentId) || /^sem-workspaces-probe-/.test(String(a.name ?? "")),
+      };
+    });
+    return { brain: { id: brain.id, name: brain.name, provider: brain.provider, model: brain.model }, sandboxes };
+  });
+
+  // Membuat satu sandbox KOSONG untuk brain ini: agents.create dengan model
+  // brain, nama operator, workspace absolut. Bukan provisioning otonom yang
+  // registri sengaja tolak (D32) — ini klik operator eksplisit, bentuk yang
+  // sama dengan D65.
+  route("POST", "/api/work/brains/{id}/sandboxes", async ({ id }, body, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may create a sandbox");
+    const brain = await controller.brains.get(id);
+    if (!brain) throw notFound(`unknown brain ${id}`);
+    if (brain.provider === "claude-code") {
+      throw badRequest(
+        "claude-code agents are ACP harness agents pinned by routing (acpAgent) — they are not provisioned by model",
+      );
+    }
+    const name = slug(String(body?.name ?? ""));
+    // Prefiks sem-/semanggi- bukan kosmetik: itu diskriminator asal terukur
+    // (D32) — agent di luar konvensi terbaca "unknown origin" di inventaris
+    // dan lolos dari hygiene armada (skrip reap mencocokkan prefiks ini).
+    if (!name || !/^(semanggi|sem)-/.test(name) || name.length > 63) {
+      throw badRequest('name is required, must start with "semanggi-" or "sem-", and be at most 63 characters');
+    }
+    const live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+    const workspace = String(body?.workspace ?? "").trim() || `${probeWorkspaceFor(live, brain.provider)}-${name}`;
+    // Pelajaran D65, kini ditegakkan: workspace relatif adalah agent yang
+    // diam-diam bekerja di mana-mana — kontrak mount menyamakan path host dan
+    // container, jadi absolute adalah satu-satunya bentuk yang jujur.
+    if (!workspace.startsWith("/") || workspace.split("/").includes("..")) {
+      throw badRequest("workspace must be an absolute path and may not contain ..");
+    }
+    if (typeof controller.runtime?.createProbeAgent !== "function") {
+      throw badRequest("this runtime has no agent provisioning (agents.create)");
+    }
+    const model = `${brain.provider}/${brain.model}`;
+    const created = await controller.runtime.createProbeAgent({ name, workspace, model });
+    const by = actor?.kind === "operator" ? actor.name : "admin";
+    await controller.events.append({
+      kind: "brain.sandbox-created",
+      subjectType: "brain",
+      subjectId: brain.id,
+      actor: by,
+      payload: { agentId: created.id, name, workspace, model },
+    });
+    log.info("brain.sandbox-created", { brain: brain.name, agentId: created.id, name, workspace, by });
+    return { sandbox: { agentId: created.id, name, workspace, model }, status: "created" };
+  });
+
+  // Kill = agents.delete (terverifikasi scripts/reap-agents.mjs, gateway
+  // 2026.7.1, butuh operator.admin yang identitas ini sudah pegang). Aturan
+  // "hanya IDLE" hidup DI SERVER, bukan di UI (pola D67): tombol yang tak
+  // ditampilkan bukan pengaman.
+  route("POST", "/api/work/brains/{id}/sandboxes/kill", async ({ id }, body, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may kill a sandbox");
+    const brain = await controller.brains.get(id);
+    if (!brain) throw notFound(`unknown brain ${id}`);
+    const agentId = String(body?.agentId ?? "").trim();
+    if (!agentId) throw badRequest("agentId is required");
+    const live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+    if (!agentsForBrain(brain, live).some((a) => String(a.id ?? "") === agentId)) {
+      throw notFound(`agent ${agentId} is not a live sandbox of this brain`);
+    }
+    const busy = await busyAgentsByRef();
+    const running = busy.get(agentId);
+    if (running) {
+      throw conflict(`sandbox is running ${running.taskId} — stop the task before killing it`);
+    }
+    if (typeof controller.runtime?.deleteAgent !== "function") {
+      throw badRequest("this runtime has no agent reaping (agents.delete)");
+    }
+    const result = await controller.runtime.deleteAgent({ agentId });
+    const by = actor?.kind === "operator" ? actor.name : "admin";
+    await controller.events.append({
+      kind: "brain.sandbox-killed",
+      subjectType: "brain",
+      subjectId: brain.id,
+      actor: by,
+      payload: { agentId, removedBindings: result.removedBindings },
+    });
+    log.info("brain.sandbox-killed", { brain: brain.name, agentId, by });
+    return { killed: true, agentId, removedBindings: result.removedBindings };
   });
 
   // --- agents ---------------------------------------------------------------

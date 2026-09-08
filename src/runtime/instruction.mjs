@@ -13,6 +13,8 @@
 // keputusan routing, jadi ia tidak bisa berbeda dari kenyataan. Itulah alasan
 // bagian ini tidak dititipkan ke berkas skill: berkas bisa basi, ini tidak.
 
+import { extractUploadRefs } from "../domain/workspace-files.mjs";
+
 /**
  * Kalimat tentang effort, dan kenapa ia perlu ada.
  *
@@ -42,15 +44,15 @@ function effortLine(brain) {
  */
 export const deliverablesDirFor = (taskId) => `deliverables/${taskId}`;
 
-/** Rujukan tmp/uploads/ yang disebut sebuah instruksi task (D76). */
-export function extractUploadRefs(text) {
-  const out = [];
-  for (const m of String(text ?? "").matchAll(/tmp\/uploads\/[A-Za-z0-9._\-/]+/g)) {
-    const ref = m[0].replace(/[.,;:)]+$/, "");
-    if (!out.includes(ref)) out.push(ref);
-  }
-  return out;
-}
+/**
+ * Rujukan lampiran yang disebut sebuah instruksi task (D76). Ekstraksinya
+ * tinggal di domain/workspace-files.mjs sejak D77 — pola rujukan adalah
+ * kebijakan lampiran (staging vs per-task), dan preamble hanyalah salah satu
+ * konsumennya; adopsi per-task adalah konsumen yang lain, dan dua salinan
+ * pola akan menyimpang tepat di tempat yang paling merusak: path yang
+ * diperintahkan preamble untuk dihapus.
+ */
+export { extractUploadRefs };
 
 /**
  * Baris pembuka preamble — penanda stabil bahwa sebuah pesan dibungkus oleh
@@ -86,10 +88,12 @@ export function buildPreamble({ task, brain = null, role = null, workspacePath =
 
   lines.push(`Tulis hasil ke: ${deliverablesDirFor(task.id)}/`);
 
-  // Lampiran operator (D76): hidupnya menit, bukan permanen. Instruksi
-  // eksplisit menghapus SEGERA setelah dimuat — satu-satunya tempat agen bisa
-  // tahu bahwa berkas ini beda kontrak dengan docs/ — dan penyapu TTL di
-  // main.mjs menutup celah bila instruksi tidak dijalankan.
+  // Lampiran operator (D76, D77): hidupnya menit, bukan permanen. Sejak D77
+  // rujukan yang disebut deskripsi adalah salinan per-task
+  // (deliverables/<task-id>/tmp/uploads/…) hasil adopsi — agen menghapus
+  // miliknya sendiri tanpa merampas lampiran task lain. Instruksi eksplisit
+  // menghapus SEGERA setelah dimuat, dan penyapu TTL di main.mjs menutup
+  // celah bila instruksi tidak dijalankan.
   const uploadRefs = extractUploadRefs(task.description);
   if (uploadRefs.length > 0) {
     lines.push(

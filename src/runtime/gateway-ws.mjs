@@ -447,6 +447,21 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
       return { id: payload?.agentId ?? payload?.id ?? name, name };
     },
 
+    /**
+     * D78 (Process Manager): reaps one agent at the gateway via agents.delete.
+     *
+     * Verified live by scripts/reap-agents.mjs on gateway 2026.7.1: the op
+     * needs operator.admin — the same scope this identity already spends on
+     * agents.create — and answers {removedBindings}. The gateway refuses to
+     * delete an agent with an active run, but the controller refuses EARLIER
+     * (409 on a busy agent) so an operator never aims a kill at the sandbox
+     * under a running task from a settings page.
+     */
+    async deleteAgent({ agentId }) {
+      const payload = await request("agents.delete", { agentId }, { timeoutMs: 30_000 });
+      return { removedBindings: payload?.removedBindings ?? 0 };
+    },
+
     async health() {
       try {
         const h = await connect();

@@ -26,7 +26,7 @@ import { resolveLevel, Level } from "./brains.mjs";
 import { LEVEL_TO_QUALITY, ROLE_CATEGORY } from "./decompose.mjs";
 import { Status } from "./state-machine.mjs";
 import { WakeReason } from "../scheduler/scheduler.mjs";
-import { resolveWorkspaceFile } from "./workspace-files.mjs";
+import { adoptUploadsForTask, resolveWorkspaceFile } from "./workspace-files.mjs";
 import { shortId } from "./repositories.mjs";
 import { deliverablesDirFor } from "../runtime/instruction.mjs";
 
@@ -171,6 +171,15 @@ export async function createDocTask(controller, { projectId, text, refs = [], ro
   // sama (shortId) yang dipakai default create.
   const taskId = shortId("TASK");
   const deliverable = `${deliverablesDirFor(taskId)}/${DOC_DELIVERABLE_FILE[role] ?? "review.md"}`;
+  // Adopsi lampiran (D77): rujukan tmp/uploads/ di instruksi diganti salinan
+  // per-task, jadi agen menghapus miliknya sendiri — bukan berkas staging
+  // yang mungkin masih dirujuk task lain dari pesan yang sama.
+  const adoption = await adoptUploadsForTask(
+    project.workspace_path,
+    taskId,
+    buildDocInstruction({ role, request: text, refs: clean, deliverable }),
+  );
+  const finalRefs = clean.map((ref) => adoption.map[ref] ?? ref);
   // Judul menyebut berkas pertama yang dirujuk: sebuah kartu kanban bertuliskan
   // "Dokumen: review keamanannya" tidak memberi tahu dokumen yang mana, dan
   // itulah satu-satunya hal yang membedakan task ini dari task DOC berikutnya.
@@ -180,7 +189,7 @@ export async function createDocTask(controller, { projectId, text, refs = [], ro
     projectId,
     workerId: worker.id,
     title: `Dokumen (${role}): ${subject}${String(text).slice(0, 80)}`.slice(0, 160),
-    description: buildDocInstruction({ role, request: text, refs: clean, deliverable }),
+    description: adoption.text,
     qualityClass: LEVEL_TO_QUALITY[effectiveLevel] ?? "L3",
     // reviewer MEMBACA; lease baca dibagi (D22), jadi sebuah review tidak
     // perlu mengunci workspace dan menghalangi builder yang sedang menulis.
@@ -200,9 +209,10 @@ export async function createDocTask(controller, { projectId, text, refs = [], ro
     role,
     level: effectiveLevel,
     levelExplicit: Boolean(level),
-    refs: clean,
+    refs: finalRefs,
+    uploadsAdopted: adoption.adopted.length,
     brain: brain.name,
     by: actor,
   });
-  return { ok: true, task, role, level: effectiveLevel, brain, refs: clean, deliverable, preferred: pick.names };
+  return { ok: true, task, role, level: effectiveLevel, brain, refs: finalRefs, deliverable, preferred: pick.names };
 }

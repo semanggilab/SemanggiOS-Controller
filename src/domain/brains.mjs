@@ -173,6 +173,7 @@ export function createBrains(store, { now, shortId }) {
     tpm: row.tpm ?? null,
     tpd: row.tpd ?? null,
     contextWindowTokens: row.context_window_tokens ?? null,
+    minSandboxes: row.min_sandboxes ?? 0,
     level: row.level,
     enabled: Boolean(row.enabled),
   });
@@ -221,6 +222,17 @@ export function createBrains(store, { now, shortId }) {
     if (!Number.isInteger(n) || n <= 0) throw new Error(`brain "${name}": ${field} must be a positive integer or null`);
     return n;
   };
+  // D80: lantai sandbox harus integer kecil — 0 berarti "tidak pernah dibuat
+  // otomatis" dan itu default-nya. Plafon 99 bukan batas fisik gateway,
+  // melainkan penolakan angka ketik-salah (999) yang akan membuat keeper
+  // melahirkan sebuah armada.
+  const minSandboxesOrThrow = (v, name) => {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 0 || n > 99) {
+      throw new Error(`brain "${name}": minSandboxes must be an integer between 0 and 99`);
+    }
+    return n;
+  };
   // Accepts the parsed object (API) and stores canonical JSON text (schema).
   const fixedResetOrNull = (v, name) => {
     if (v === null || v === undefined || v === "") return null;
@@ -264,6 +276,7 @@ export function createBrains(store, { now, shortId }) {
       tpm,
       tpd,
       contextWindowTokens,
+      minSandboxes = 0,
       level = Level.NORMAL,
       enabled = true,
     }) {
@@ -280,6 +293,7 @@ export function createBrains(store, { now, shortId }) {
       if (!Object.values(Level).includes(level)) {
         throw new Error(`level must be one of ${Object.values(Level).join("|")}, got "${level}"`);
       }
+      const minSandboxesVal = minSandboxesOrThrow(minSandboxes, name);
       const id = shortId("BRN");
       // POC-6: defaults come from the driver registry — windows, types, tier
       // and rates in one place, so what a new Brain gets and what the D63
@@ -300,9 +314,9 @@ export function createBrains(store, { now, shortId }) {
         `INSERT INTO brains (id, name, description, provider, model, thinking, effort_mode,
                              effort_evidence, mode, acp_agent, quota_reset_short_ms, quota_reset_long_ms,
                              quota_tier, quota_short_type, quota_long_type, quota_fixed_reset,
-                             rpm, rpd, tpm, tpd, context_window_tokens,
+                             rpm, rpd, tpm, tpd, context_window_tokens, min_sandboxes,
                              level, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, slug(name), description, provider, model, thinking, effortMode, effortEvidence,
          mode, acpAgent, short, long,
          tier, shortType, longType, fixedReset,
@@ -311,6 +325,7 @@ export function createBrains(store, { now, shortId }) {
          rateOrDriver(tpm, driverDefaults.rates.tpm, "tpm"),
          rateOrDriver(tpd, driverDefaults.rates.tpd, "tpd"),
          rateOrNull(contextWindowTokens, "contextWindowTokens", name),
+         minSandboxesVal,
          level, enabled ? 1 : 0, now(), now()],
       );
       return brains.get(id);
@@ -374,6 +389,9 @@ export function createBrains(store, { now, shortId }) {
         ["contextWindowTokens", "context_window_tokens"],
       ]) {
         if (patch[field] !== undefined) put(column, rateOrNull(patch[field], field, before.name));
+      }
+      if (patch.minSandboxes !== undefined) {
+        put("min_sandboxes", minSandboxesOrThrow(patch.minSandboxes, before.name));
       }
       if (patch.level !== undefined) {
         if (!Object.values(Level).includes(patch.level)) throw new Error(`invalid level "${patch.level}"`);

@@ -750,3 +750,39 @@ test("fleet sandbox overview (D79): dedupe lintas brain, counts armada, filter s
     await api.close();
   }
 });
+
+// D80: lantai sandbox per Brain — kolom min_sandboxes. Validasi di domain
+// (create/update), terekspos apa adanya lewat API; 0 adalah default dan
+// berarti "tidak pernah dibuat otomatis".
+test("min_sandboxes: default 0, bisa di-set saat create, dipatch, dan ditolak di luar 0..99", async () => {
+  const h = await buildHarness();
+  const api = await startApi(h);
+  try {
+    const plain = await api.call("POST", "/api/work/brains", { name: "floor-plain", provider: "zai", model: "glm-4.7" });
+    assert.equal(plain.status, 200);
+    assert.equal(plain.body.brain.minSandboxes, 0, "tanpa angka = tanpa lantai");
+
+    const floored = await api.call("POST", "/api/work/brains", { name: "floor-two", provider: "zai", model: "glm-4.7", minSandboxes: 2 });
+    assert.equal(floored.status, 200);
+    assert.equal(floored.body.brain.minSandboxes, 2);
+
+    const patched = await api.call("PATCH", `/api/work/brains/${floored.body.brain.id}`, { minSandboxes: 3 });
+    assert.equal(patched.status, 200);
+    assert.equal(patched.body.brain.minSandboxes, 3);
+
+    // Ketik-salah 999 akan membuat keeper melahirkan sebuah armada —
+    // plafon 99 ada untuk itu, bukan untuk membatasi gateway.
+    const tooBig = await api.call("PATCH", `/api/work/brains/${floored.body.brain.id}`, { minSandboxes: 999 });
+    assert.equal(tooBig.status, 400);
+    assert.match(tooBig.body.error, /between 0 and 99/);
+
+    const negative = await api.call("PATCH", `/api/work/brains/${floored.body.brain.id}`, { minSandboxes: -1 });
+    assert.equal(negative.status, 400);
+
+    const list = await api.call("GET", "/api/work/brains");
+    const row = list.body.brains.find((b) => b.id === floored.body.brain.id);
+    assert.equal(row.minSandboxes, 3, "GET list membawa lantai — halaman Brain dan keeper membaca sumber yang sama");
+  } finally {
+    await api.close();
+  }
+});

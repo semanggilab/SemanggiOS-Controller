@@ -113,6 +113,15 @@ class SqliteStore {
       `);
     }
 
+    // D80: lantai sandbox per Brain (0 = tidak pernah dibuat otomatis). Baris
+    // lama mendapat 0 lewat DEFAULT — itu perilaku yang benar, bukan backfill:
+    // armada yang tidak pernah meminta provisioning otomatis tidak boleh
+    // mulai menumbuhkan agen hanya karena kolomnya muncul.
+    const brainColsMin = cols("brains");
+    if (brainColsMin.length > 0 && !brainColsMin.includes("min_sandboxes")) {
+      this.#db.exec(`ALTER TABLE brains ADD COLUMN min_sandboxes INTEGER NOT NULL DEFAULT 0`);
+    }
+
     // D51: penghitung retry kuota jendela pendek. Default 0: task warisan
     // belum pernah gagal karenanya.
     if (taskCols.length > 0 && !taskCols.includes("quota_retries")) {

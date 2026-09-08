@@ -9,6 +9,7 @@ import { createScheduler } from "./scheduler/scheduler.mjs";
 import { nullLogger } from "./domain/logger.mjs";
 import { createOperators } from "./domain/operators.mjs";
 import { createBrains, brainsFromRoutingConfig } from "./domain/brains.mjs";
+import { createSandboxProvision } from "./domain/sandbox-provision.mjs";
 import { createBrainMap } from "./domain/brain-map.mjs";
 import { createThinkingLevels } from "./domain/thinking-levels.mjs";
 import { createGatewayModelsCache } from "./domain/gateway-models.mjs";
@@ -80,7 +81,18 @@ export async function createController({
 
   // D42: admission resolves Brain names from the brains table (seeded above),
   // so it is wired after seeding, with the catalog as fallback.
-  const admission = createAdmission({ repos, events, policy, brains, runtime, config, now, log: log.child({ component: "admission" }) });
+  // D80: provisioning otomatis dibangun di sini — on-demand admission dan
+  // keeper main.mjs berbagi SATU objek supaya pagarnya (claude-code, baris
+  // resource, concurrency_limit) tidak bisa berbeda pendapat antar pemanggil.
+  const sandboxProvision = createSandboxProvision({
+    repos,
+    brains,
+    runtime,
+    events,
+    now,
+    log: log.child({ component: "sandbox-provision" }),
+  });
+  const admission = createAdmission({ repos, events, policy, brains, runtime, sandboxProvision, config, now, log: log.child({ component: "admission" }) });
   // D71: gateway hooks the watchdog needs (abortRun/describeSession). A holder
   // rather than direct functions because the session-event sink that owns the
   // describe→verdict mapping is built AFTER the controller (it needs
@@ -100,5 +112,5 @@ export async function createController({
   // (D67) harus tahu baris mana yang akan di-seed ulang pada boot berikutnya —
   // menghapus baris yang masih ada di seed adalah penghapusan yang tidak
   // pernah terjadi.
-  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, config, now, log, runtime, seedResources: resources };
+  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, sandboxProvision, config, now, log, runtime, seedResources: resources };
 }

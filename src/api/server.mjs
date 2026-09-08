@@ -28,6 +28,7 @@ import { buildPlan, LEVEL_TO_QUALITY, ROLE_CATEGORY } from "../domain/decompose.
 import { EventKind } from "../domain/events.mjs";
 import { classify, Intent, Action } from "../interface/intent.mjs";
 import { markRegistered, parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
+import { probeWorkspaceFor } from "../domain/sandbox-provision.mjs";
 import { isPreambleWrapped } from "../runtime/instruction.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
@@ -2609,28 +2610,11 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
 
   function slug(s) { return String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); }
 
-  // D65: the workspace a probe agent lives in. MUST be absolute — the mount
-  // contract says host and container paths are identical, and a relative
-  // workspace is an agent that silently works nowhere (the pre-fix fallback
-  // `workspaces/probe/<provider>` had exactly that defect). Learned from the
-  // live probe fleet (.../workspaces/probe/<provider>) by swapping the
-  // provider leaf; the conventional root is only for a fleet with no probe
-  // agent left to learn from.
-  function probeWorkspaceFor(live, provider) {
-    const anyProbe = live.find(
-      (a) =>
-        String(a?.id ?? "").startsWith("sem-workspaces-probe-") &&
-        String(a?.workspace ?? "").includes("/workspaces/probe/"),
-    );
-    if (anyProbe) {
-      const parts = String(anyProbe.workspace).replace(/\/+$/, "").split("/");
-      parts[parts.length - 1] = slug(provider);
-      return parts.join("/");
-    }
-    const root = process.env.SEMANGGI_PROBE_WORKSPACE_ROOT ??
-      "/opt/semanggi/volumes/shared/service/semanggios/openclaw/workspaces";
-    return `${root}/probe/${slug(provider)}`;
-  }
+  // probeWorkspaceFor (D65) kini tinggal di domain/sandbox-provision.mjs —
+  // jalur operator D78 dan jalur otomatis D80 harus mengambil keputusan
+  // workspace yang sama, dan dua salinan fungsi ini akan berbeda pendapat
+  // tepat saat paling mahal: setelah operator menyetel
+  // SEMANGGI_PROBE_WORKSPACE_ROOT.
 
   async function ensureProbeAgent(live, { provider, model }) {
     if (typeof controller.runtime?.createProbeAgent !== "function") {

@@ -25,14 +25,19 @@
 // (`hello.auth.scopes`), so a device demoted out of admin degrades into case 2
 // instead of sending overrides the gateway will reject.
 //
-// PROVISIONING STAYS A SCRIPT
+// PROVISIONING — SCRIPT UNTUK OPERATOR, OTOMATIS DALAM PAGAR (D80)
 //
 // `agents.create` is admin-gated (`src/gateway/methods/core-descriptors.ts`),
-// and the controller now holds admin, so it *could* create agents at runtime.
-// It deliberately does not. Fleet shape is an operator decision with
-// consequences beyond one task, and a control plane that reshapes its own fleet
-// while scheduling is far harder to reason about after an incident. See
-// `scripts/provision-agents.mjs`.
+// and the controller holds admin, so it can create agents at runtime. Until
+// D78 it deliberately did not — fleet shape is an operator decision with
+// consequences beyond one task — and that stance lived here as
+// "PROVISIONING STAYS A SCRIPT". D80 reversed it BY OPERATOR REQUEST, but the
+// reversal kept the original worry and answered it with fences instead of
+// trust: automatic creation only ever names `sem-auto-*` agents, never touches
+// claude-code (ACP agents are routing-pinned), is capped per model by
+// resources.concurrency_limit, and requires an explicit resource row — no row,
+// no fleet. The rules live in `domain/sandbox-provision.mjs`; the operator's
+// bulk path remains `scripts/provision-agents.mjs`.
 
 // OpenClaw clamps an unsupported reasoning effort down to the nearest level it
 // does support, silently:

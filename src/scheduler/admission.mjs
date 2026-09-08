@@ -36,6 +36,10 @@ export function createAdmission({
   // "glm-5-2-max"), even brains seeded FROM the catalog never matched it.
   brains = null,
   runtime,
+  // D80: provisioning on-demand. Optional karena admission harus tetap bisa
+  // dibangun tanpa gateway provisioning (harness test, runtime AgentOS
+  // read-only) — tanpanya perilakunya identik pra-D80: parkir dan selesai.
+  sandboxProvision = null,
   config = {},
   now = () => Date.now(),
   log = nullLogger,
@@ -445,18 +449,41 @@ export function createAdmission({
       // A quota refusal is not a generic runtime problem: it names the model
       // and carries a reset time, so record it against the resource and park
       // the task where the queue can show a real ETA (POC-3 E8).
-      // No agent is configured for the routed model. Under operator.write the
-      // controller cannot create one and must not substitute a different model,
-      // so this parks as a resource problem an operator can act on — which is
-      // exactly P4-03's "availability decides dispatch or wait, never which
-      // model" (D14).
+      // No agent is configured for the routed model. The controller must not
+      // substitute a different model — that part of D14 never changes — but
+      // since D80 it MAY grow an agent for the SAME model (see below), and if
+      // it cannot or may not, this parks as a resource problem an operator can
+      // act on, which is exactly P4-03's "availability decides dispatch or
+      // wait, never which model".
       if (err.name === "AgentUnavailableError") {
+        // D80: parkir tetap jawabannya, tapi sekarang parkir yang menumbuhkan
+        // jalan keluarnya — bila semua pagar lolos (Brain aktif untuk model
+        // ini, ada baris resource, armada model masih di bawah
+        // concurrency_limit, bukan claude-code), satu sandbox dibuat SEKARANG
+        // dan task dicoba lagi nyaris seketika. Ini pembalikan eksplisit
+        // operator atas keputusan lama "controller tidak pernah membentuk
+        // armadanya sendiri" (D32); kegagalan provisioning tidak pernah
+        // mengubah hasil: task parkir WAIT_RESOURCE seperti sebelum D80.
+        let provisioned = null;
+        if (sandboxProvision) {
+          provisioned = await sandboxProvision
+            .maybeProvisionForBrain({ candidate: plan.candidate, reason: `task ${task.id}` })
+            .catch((perr) => ({ created: false, why: "create-failed", error: String(perr.message ?? perr) }));
+        }
         log.warn("resource.no-agent", {
           task: task.id, exec: execution.id,
           workspace: err.workspacePath, provider: err.provider, model: err.model,
           available: err.available?.map((a) => a.model) ?? [],
+          provisioned: provisioned ? (provisioned.created ? provisioned.agent.name : provisioned.why) : "off",
         });
-        return wait(Status.WAIT_RESOURCE, err.message);
+        return wait(
+          Status.WAIT_RESOURCE,
+          err.message,
+          // Agen yang baru dibuat perlu beberapa detik sebelum bisa menerima
+          // run; backoff 30 detik biasa akan menunda dispatch pertama yang
+          // berhasil tanpa alasan — tapi HANYA jalur ini yang dipercepat.
+          provisioned?.created ? { nextRetryAt: now() + 3_000 } : {},
+        );
       }
 
       // POC-6 (D63): a driver-fatal refusal — groq's 413 structural input

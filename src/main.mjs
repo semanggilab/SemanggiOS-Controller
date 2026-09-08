@@ -251,8 +251,29 @@ async function main() {
   uploadTimer.unref?.();
   void uploadSweep();
 
+  // D80: keeper lantai sandbox — setiap Brain aktif dengan min_sandboxes > 0
+  // dijaga armadanya dari bawah, dibatasi concurrency_limit resource dan
+  // pagar claude-code (domain/sandbox-provision.mjs). Timer polos, bukan
+  // event-driven: lantai adalah keadaan yang diinginkan, dan keadaan yang
+  // diinginkan dicek ulang secara berkala — sama seperti reconciler D72,
+  // yang juga tidak menunggu diundang. Matikan dengan SEMANGGI_SANDBOX_KEEPER=0.
+  const sandboxKeeperMs = Number(process.env.SEMANGGI_SANDBOX_KEEPER_MS ?? 60_000);
+  let sandboxKeeperTimer = null;
+  if (controller.sandboxProvision && sandboxKeeperMs > 0 && process.env.SEMANGGI_SANDBOX_KEEPER !== "0") {
+    sandboxKeeperTimer = setInterval(() => {
+      void controller.sandboxProvision
+        .enforceMinimums({ actor: "keeper" })
+        .then((out) => {
+          if (out.created > 0) log.info("sandbox-keeper.created", { created: out.created, perBrain: out.perBrain });
+        })
+        .catch((err) => log.warn("sandbox-keeper.failed", { error: String(err.message ?? err) }));
+    }, sandboxKeeperMs);
+    sandboxKeeperTimer.unref?.();
+  }
+
   const shutdown = () => {
     clearInterval(reconcileTimer);
+    if (sandboxKeeperTimer) clearInterval(sandboxKeeperTimer);
     controller.scheduler.stop();
     void runtime.close?.();
     void agentos?.close?.();

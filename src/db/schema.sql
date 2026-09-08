@@ -359,6 +359,13 @@ CREATE TABLE IF NOT EXISTS brains (
   tpm                      INTEGER,
   tpd                      INTEGER,
   context_window_tokens    INTEGER,
+  -- D80: lantai sandbox hidup untuk Brain ini. 0 (default) = tidak pernah
+  -- dibuat otomatis. Keeper dan jalur on-demand admission membuat agen sampai
+  -- lantai ini, dibatasi concurrency_limit resource (provider, model) —
+  -- batas yang sama yang dipakai admission untuk konkurensi run, supaya
+  -- "berapa agen boleh hidup" tidak pernah melebihi "berapa run boleh jalan".
+  -- Plafon 99 bukan batas gateway, melainkan penolakan angka ketik-salah.
+  min_sandboxes  INTEGER NOT NULL DEFAULT 0 CHECK (min_sandboxes BETWEEN 0 AND 99),
   level          TEXT NOT NULL DEFAULT 'normal'
                  CHECK (level IN ('low','normal','critical')),
   -- D64: `category` dihapus. Jalur dispatch (brainMap.resolve) tidak pernah

@@ -2725,3 +2725,35 @@ Tiga konsekuensi yang mengikat:
 **Yang perbaikan ini TIDAK selesaikan.** Dari 17 agen yang gateway iklankan, tidak ada satu pun bernama `claude`, `claude-opus`, atau `claude-sonnet` — agen ACP tidak muncul di `agents.list`. Setelah D85, dispatch claude-code **gagal keras** dengan alasan yang benar alih-alih diam-diam memakai GLM. Jalur suksesnya masih terbuka dan MUST diverifikasi dengan mengirim permintaan (aturan 4), bukan ditebak: apakah agen role memerlukan mapping `agents.entries.*.runtime.acp.agent` (yang docs OpenClaw sebut diperiksa sebelum dispatch), atau apakah dispatch harness harus memakai `sessions_spawn({ runtime: "acp", agentId })` alih-alih RPC `agent`.
 
 **Test:** 561 → 568. Tes lama *"claude-code routes on workspace alone"* DIGANTI, bukan diperbaiki: ia menegaskan bahwa Brain claude-code tanpa `acpAgent` boleh dirutekan ke agen mana pun — bug ini, dikodifikasi sebagai kontrak. Regresi yang dipaku: harness memilih `acpAgent` meski `preferAgentId` menunjuk agen lain; armada tanpa agen ACP mengembalikan null alih-alih agen worker; jalur override tidak menyerahkan harness ke agen asing; Brain tanpa `acpAgent` tidak cocok; pesan galat menyebut agen ACP; Brain non-harness tidak berubah perilaku.
+
+## D86 — Jalur ACP tidak terjangkau dari RPC: diukur, dan sementara ini buntu
+
+**Pertanyaan yang D85 tinggalkan:** setelah salah-rute dihentikan, bagaimana Brain harness benar-benar dijalankan? D85 membuat dispatch gagal jujur dengan *"no live ACP harness agent named …"*; D86 menjawab kenapa agen itu tidak akan pernah ada, dan itu bukan soal penamaan.
+
+**Yang diukur, semuanya dengan mengirim permintaan (aturan 4), OpenClaw 2026.8.2 (0965053):**
+
+| Jalur | Hasil |
+|---|---|
+| `agent` + `runtime:"acp"` | `invalid agent params: at root: unexpected property 'runtime'` |
+| `sessions.create` + `runtime:"acp"` | `unexpected property 'runtime'` |
+| `sessions.spawn` / `acp.spawn` | `unknown method` |
+| HTTP `/api`, `/api/acp`, `/api/sessions`, `/openapi.json` | 404 |
+| HTTP `/acp`, `/rpc` | 200 tapi Control UI SPA, bukan API |
+| plugin `admin-http-rpc` | kontrak `gatewayMethodDispatch` — transport lain untuk method yang SAMA |
+| `/acp status` dikirim sebagai pesan `agent` | ditelan model: `[agent/embedded] embedded run … model=glm-5.2` |
+
+Method yang device kita lihat: `agent`, `agents.list`, `sessions.{create,list,patch,reset,resolve,subscribe}`. Tidak satu pun menyentuh ACP.
+
+**Temuan paling menentukan — dan paling berbahaya:** `agents.entries.<id>.runtime.type = "acp"` **diterima, tersimpan, hot-reload, dan diiklankan** — lalu **diabaikan**. Agen uji `acp-repro` dengan `runtime.acp.agent = "claude-opus"` menjalankan run-nya pada `google/gemini-3.1-flash-lite` (`sessions.describe`: 11.764 token input, `status: done`), nol container `openclaw.acp=1`, nol `.claude-home`, nol proses adapter. `agents.list` bahkan melaporkan `agentRuntime.source: "implicit"` — runtime yang kita konfigurasi tidak tercermin sama sekali, jadi klien tidak punya cara mendeteksi selisihnya.
+
+Inilah bentuk kegagalan yang sama dengan D85, satu lapis lebih dalam: konfigurasi diterima, perilaku tidak mengikutinya, dan tidak ada yang berbunyi.
+
+**Konsekuensi:** ACP eksklusif untuk permukaan percakapan (Control UI, channel, `/acp`, tool `sessions_spawn` yang ternyata tool AGEN, bukan method gateway). Control plane tidak punya permukaan itu. **Jalur harness Semanggi buntu di sisi upstream, bukan di sisi kita.**
+
+**Keputusan operator (2026-09-09):** menempuh jalur permintaan fitur ke OpenClaw — meminta `agent` menghormati `runtime.type=acp` milik agen tujuan (perubahan terkecil; tidak ada API baru, hanya konsistensi dengan konfigurasi yang gateway sudah simpan). Laporan lengkap dengan langkah reproduksi dan keluaran verbatim: `openclaw-feature-request-acp-over-rpc.md`.
+
+Dua permintaan kecil yang menyertainya, dan berguna terlepas dari fiturnya: `agents.list` mencerminkan runtime yang dikonfigurasi, dan `agent` **menolak** alih-alih menurunkan diam-diam bila tidak bisa menghormati `runtime.type=acp`.
+
+**Sampai itu mendarat:** Brain `claude-*` akan terus `WAIT_RESOURCE` dengan alasan jujur (D85). Itu keadaan yang benar — bukan sesuatu yang harus "diperbaiki" dengan mengembalikan pencocokan longgar. Alternatif yang tersedia bila Claude dibutuhkan lebih cepat: provider `anthropic` langsung (plugin sudah enabled) sebagai Brain biasa — kehilangan sandbox POC-3 dan gerbang izin, tetapi berjalan di jalur yang sama dengan Brain lain dan sudah terbukti.
+
+**Tidak ada perubahan kode di D86.** Dua agen uji (`sdmk-kader-claude-opus-high`, `acp-repro`) dibuat lalu dihapus; roster kembali ke sembilan agen semula.

@@ -94,6 +94,10 @@ async function main() {
       runtimeRetryWindowMs: Number(process.env.SEMANGGI_RUNTIME_RETRY_WINDOW_MS ?? 6 * 60 * 60 * 1000),
       runtimeRetryBaseMs: Number(process.env.SEMANGGI_RUNTIME_RETRY_BASE_MS ?? 30_000),
       runtimeRetryMaxMs: Number(process.env.SEMANGGI_RUNTIME_RETRY_MAX_MS ?? 15 * 60 * 1000),
+      // D82: jeda sebelum end-frame non-bersih boleh memfinalisasi eksekusi.
+      // Gateway 2026.8.2 mengirim end(length) prematur lalu koreksi end(stop)
+      // ~400ms kemudian; tanpa jeda ini, koreksinya selalu terlambat.
+      endGraceMs: Number(process.env.SEMANGGI_END_GRACE_MS ?? 1500),
     },
   });
 

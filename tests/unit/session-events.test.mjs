@@ -21,12 +21,15 @@ function endEvent(runId, { stopReason = "stop", aborted = false, sessionId = "se
   ];
 }
 
-async function sinkFor(h) {
+async function sinkFor(h, { endGraceMs = 0 } = {}) {
   return createSessionEventSink({
     repos: h.repos,
     events: h.events,
     runtime: { connect: async () => ({}), request: async () => ({ subscribed: true }) },
     scheduler: h.scheduler,
+    // Grace 0 = perilaku pra-D82: finalisasi seketika. Tes kebijakan (requeue,
+    // abort, describe) tidak peduli jeda; tes jebolannya sendiri yang mengatur.
+    config: { endGraceMs },
   });
 }
 
@@ -725,4 +728,88 @@ test("an operator abort still CANCELS — auto-retry never overrules intent", as
   });
   assert.equal((await h.repos.tasks.get(task.id)).status, Status.CANCELLED,
     "abort is a verdict, not a transient failure");
+});
+
+// ── D82: end-frame prematur dari gateway 2026.8.2 ──────────────────────────
+
+test("a premature end(length) superseded by end(stop) inside the grace completes the run", async () => {
+  // Terukur live (TASK-4CA0D674#3, 2026-09-08): settled-turn yang gagal
+  // finalization memicu end(length), gateway mengganti turn-nya dengan
+  // terminal fallback reply lalu mengirim end(stop) ~400ms kemudian. Frame
+  // pertama tidak boleh membekukan baris execution sebelum koreksi tiba.
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "flaky turn" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sink = await sinkFor(h, { endGraceMs: 40 });
+
+  await sink.handle("agent", {
+    runId: execution.id, stream: "lifecycle", sessionKey: "k",
+    data: { phase: "end", stopReason: "length", startedAt: 1, endedAt: 2 },
+  });
+  // Masih di dalam jendela grace: belum ada vonis apa pun.
+  assert.equal((await h.repos.executions.get(execution.id)).finalized_at, null,
+    "end non-bersaham tidak memfinalisasi seketika");
+
+  await sink.handle("agent", {
+    runId: execution.id, stream: "lifecycle", sessionKey: "k",
+    data: { phase: "end", stopReason: "stop", startedAt: 1, endedAt: 3 },
+  });
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE,
+    "koreksi stop menang tanpa menunggu grace habis");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE);
+  assert.equal((await h.repos.executions.get(execution.id)).result, "stop");
+
+  // Setelah koreksi diterapkan, timer jendela tidak boleh menembak belakangan.
+  await new Promise((r) => setTimeout(r, 70));
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.COMPLETE,
+    "flush grace yang basi tidak menimpa vonis koreksi");
+});
+
+test("an end(length) with no corrected frame finalizes as failure once the grace expires", async () => {
+  // length yang benar-benar terminal (output cap, TASK-90D214DF#1: 8192 token
+  // output persis) tidak diikuti koreksi apa pun — setelah grace, kegagalan
+  // runtime D75 tetap berjalan.
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "capped output" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sink = await sinkFor(h, { endGraceMs: 15 });
+
+  await sink.handle("agent", {
+    runId: execution.id, stream: "lifecycle", sessionKey: "k",
+    data: { phase: "end", stopReason: "length", startedAt: 1, endedAt: 2 },
+  });
+  assert.equal((await h.repos.executions.get(execution.id)).finalized_at, null);
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal((await h.repos.executions.get(execution.id)).status, ExecutionStatus.FAILED);
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.QUEUED, "D75 requeue tetap jalan lewat jalur grace");
+});
+
+test("a late end frame after finalize is logged, not applied twice", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const task = await queuedTask(h, { project, worker, title: "t" });
+  await h.scheduler.notify();
+  const execution = await h.repos.executions.latest(task.id);
+  const sink = await sinkFor(h);
+
+  await sink.handle(...endEvent(execution.id));
+  const logs = [];
+  const noisySink = await createSessionEventSink({
+    repos: h.repos,
+    events: h.events,
+    runtime: { connect: async () => ({}), request: async () => ({ subscribed: true }) },
+    scheduler: h.scheduler,
+    config: { endGraceMs: 0 },
+    log: { info: (evt, fields) => logs.push([evt, fields]), warn() {}, error() {} },
+  });
+  await noisySink.applyEnd(execution.id, { phase: "end", stopReason: "stop", aborted: false }, {});
+  assert.ok(logs.some(([evt, fields]) => evt === "run.ended-ignored" && fields.stopReason === "stop"),
+    "end yang datang setelah final tercatat dengan stopReason-nya");
+  assert.equal((await h.repos.tasks.get(task.id)).status, Status.COMPLETE,
+    "vonis tidak berubah oleh frame terlambat");
 });

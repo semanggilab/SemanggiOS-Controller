@@ -150,6 +150,19 @@ export function createSessionEventSink({
   // session, and the lifecycle `end` event (which has both) closes the loop.
   const pendingUsage = new Map();
 
+  // Keyed by runId. OpenClaw 2026.8.2 can emit a PREMATURE lifecycle
+  // `end {stopReason:"length"}` when a settled turn fails finalization, then
+  // replace the turn with a terminal fallback reply and emit the REAL end
+  // (`stop`) ~400ms later — measured live, TASK-4CA0D674#3 2026-09-08: the
+  // controller finalized FAILED at 11:50:04.816 on the first frame and the
+  // truthful `stop` landed at 11:50:05.197 into the "already final" guard.
+  // One flaky turn burned a D75 retry and mislabeled finished work as failure.
+  // Non-clean end frames therefore wait out a short grace window here; a newer
+  // end frame for the same run supersedes whatever is still waiting. Clean
+  // ends (`stop`) and operator aborts stay immediate — nothing corrects them.
+  const pendingEnds = new Map(); // runId -> { timer, data, payload }
+  const endGraceMs = () => Number(config?.endGraceMs ?? 1500);
+
   /**
    * The shared tail of every "this run is over, here is the outcome" path:
    * execution status, task follows where the state machine allows, retry
@@ -234,7 +247,17 @@ export function createSessionEventSink({
       // record for it would corrupt the audit trail.
       return { handled: false, reason: "unknown execution" };
     }
-    if (execution.finalized_at) return { handled: false, reason: "already final" };
+    if (execution.finalized_at) {
+      // Measured (2026-09-08): the 2026.8.2 corrected `stop` frame landing
+      // here used to vanish silently, which is exactly why the premature
+      // `length` above stayed invisible for a whole debugging session.
+      log.info("run.ended-ignored", {
+        exec: runId, stopReason: data?.stopReason ?? null, aborted: Boolean(data?.aborted),
+        lateMs: now() - execution.finalized_at,
+        hint: "an end frame arrived after the execution was already final — gateway re-emit or corrected verdict",
+      });
+      return { handled: false, reason: "already final" };
+    }
 
     const verdict = classifyRunEnd(data);
     const sessionKey = payload?.sessionKey ?? null;
@@ -757,6 +780,45 @@ export function createSessionEventSink({
     return true;
   }
 
+  /**
+   * The grace-window gate in front of applyEnd for lifecycle `end` frames
+   * (see pendingEnds). Clean verdicts pass straight through; non-clean ones
+   * wait, and the newest frame for the same run wins — the 2026.8.2 corrected
+   * `stop` arriving after a premature `length` must not find the row frozen.
+   */
+  async function onLifecycleEnd(payload) {
+    const runId = payload?.runId;
+    const data = payload?.data ?? {};
+    const verdict = classifyRunEnd(data);
+    const immediate =
+      verdict.execution === ExecutionStatus.COMPLETE || verdict.task === Status.CANCELLED;
+
+    if (runId && pendingEnds.has(runId)) {
+      const held = pendingEnds.get(runId);
+      clearTimeout(held.timer);
+      pendingEnds.delete(runId);
+      log.info("run.end-superseded", {
+        exec: runId, from: held.data?.stopReason ?? null, to: data.stopReason ?? null,
+        hint: "a newer end frame replaced one still inside its grace window",
+      });
+    }
+
+    if (immediate || !runId || endGraceMs() <= 0) {
+      await applyEnd(runId, data, payload);
+      return;
+    }
+    pendingEnds.set(runId, {
+      data,
+      payload,
+      timer: setTimeout(() => {
+        pendingEnds.delete(runId);
+        applyEnd(runId, data, payload).catch((err) => {
+          log.error("session-event.failed", { evtName: "agent(end-flush)", error: String(err.message).slice(0, 300) });
+        });
+      }, endGraceMs()),
+    });
+  }
+
   /** Wired to the adapter's onEvent. Never throws: see the adapter's guard. */
   async function handle(name, payload) {
     try {
@@ -804,7 +866,7 @@ export function createSessionEventSink({
         return;
       }
       if (payload?.data?.phase !== "end") return;
-      const result = await applyEnd(payload.runId, payload.data, payload);
+      await onLifecycleEnd(payload);
       // The structured line is emitted by applyEnd; nothing to add here.
     } catch (err) {
       // Losing one event must not kill the subscription; the reconciler will

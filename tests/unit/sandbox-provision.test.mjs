@@ -300,6 +300,75 @@ test("grow: workspace ber-legacy setup state dipindah satu kali, nama slot tetap
     "event merekam workspace yang benar-benar dipakai");
 });
 
+test("grow: nama yang terkunci deletion-cleanup dipakai ulang sebagai variasi -r, lantai tetap tercapai", async () => {
+  // Diukur di cluster 2026-09-08: gateway 2026.8 mengembalikan INVALID_REQUEST
+  // "deletion cleanup is still pending" untuk nama yang baru di-delete — dan
+  // pembersihan itu tidak pernah datang (>10 menit, termasuk untuk workspace
+  // buatan 2026.8 sendiri). Trim lalu grow dalam satu menit adalah siklus normal
+  // D81; tanpa variasi nama, lantai tak pernah terisi lagi.
+  const live = [];
+  const seenNames = [];
+  const provision = createSandboxProvision({
+    brains: { list: async () => [brain({ minSandboxes: 1 })] },
+    runtime: {
+      listAgents: async () => live.slice(),
+      createProbeAgent: async ({ name, workspace }) => {
+        seenNames.push(name);
+        if (!/-r[a-z0-9-]+$/.test(name)) {
+          const err = new Error(`agent "${name}" deletion cleanup is still pending`);
+          err.code = "INVALID_REQUEST";
+          throw err;
+        }
+        const agent = { id: name, name, workspace, model: { primary: "zai/glm-4.7" } };
+        live.push(agent);
+        return { id: name, name };
+      },
+      deleteAgent: async ({ agentId }) => {
+        const i = live.findIndex((a) => a.id === agentId);
+        if (i >= 0) live.splice(i, 1);
+        return { removedBindings: 1 };
+      },
+    },
+    repos: { resources: { get: async () => ({ concurrency_limit: 4 }) } },
+    events: { append: async () => {} },
+    log: quietLog,
+  });
+  const grow = await provision.reconcileAll();
+  assert.equal(grow.created, 1, "variasi nama adalah jalan keluar, bukan kegagalan");
+  assert.equal(seenNames.length, 2, "satu percobaan ulang saja");
+  assert.match(seenNames[1], /^sem-auto-glm-4-7-1-r[a-z0-9-]+$/, "variasi menempel di nomor slotnya");
+  assert.equal(live.length, 1);
+
+  // Siklus lengkap: pangkas (floor 0) — variasi dipangkas sebagaimana slot
+  // biasa, prefiks sem-auto- adalah satu-satunya syaratnya.
+  const provision2 = createSandboxProvision({
+    brains: { list: async () => [brain({ minSandboxes: 0 })] },
+    runtime: {
+      listAgents: async () => live.slice(),
+      createProbeAgent: async ({ name, workspace }) => {
+        seenNames.push(name);
+        const agent = { id: name, name, workspace, model: { primary: "zai/glm-4.7" } };
+        live.push(agent);
+        return { id: name, name };
+      },
+      deleteAgent: async ({ agentId }) => {
+        const i = live.findIndex((a) => a.id === agentId);
+        if (i >= 0) live.splice(i, 1);
+        return { removedBindings: 1 };
+      },
+    },
+    repos: {
+      resources: { get: async () => ({ concurrency_limit: 4 }) },
+      tasks: { list: async () => [] },
+      workers: { get: async () => null },
+    },
+    events: { append: async () => {} },
+    log: quietLog,
+  });
+  await provision2.reconcileAll();
+  assert.equal(live.length, 0, "floor 0 memangkas variasi sebagaimana slot biasa");
+});
+
 // --- end-to-end lewat admission ----------------------------------------------
 
 test("admission: parkir no-agent menumbuhkan sandbox, dan percobaan berikutnya dispatch", async () => {

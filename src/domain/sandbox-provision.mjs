@@ -95,20 +95,36 @@ export function createSandboxProvision({ brains, runtime, repos, events, log, no
     try {
       created = await runtime.createProbeAgent({ name, workspace, model });
     } catch (err) {
-      // OpenClaw 2026.8 menolak agents.create ke workspace ber-"legacy setup
-      // state": direktorum agen yang dipangkas TINGGAL di NFS (agents.delete
-      // melepas binding, bukan folder), dan gateway baru menganggap tata letak
-      // lamanya harus dimigrasi dulu. Nama slot deterministik justru selalu
-      // menabrak direktorum yatang itu — tanpa pemulihan, siklus pangkas-tumbuh
-      // D81 terkunci selamanya pada satu path. Pemulihan: pindah ke path segal
-      // SATU KALI (nama tetap, konvergensi tetap); memulihkan path lama adalah
-      // pekerjaan `openclaw doctor --fix` di gateway (runbook upgrade 2026.8).
-      if (!/Legacy workspace setup state/.test(String(err.message ?? ""))) throw err;
-      workspace = `${workspace}-r${shortId("W")}`.toLowerCase();
-      log.warn("brain.sandbox-auto-relocate", {
-        name, workspace, brain: brain.name,
-        hint: "stale workspace dir from a reaped agent; openclaw doctor --fix reclaims the old path",
-      });
+      // Dua kunci keadaan gateway 2026.8 yang membuat nama/path deterministik
+      // gagal dipakai ulang, keduanya terukur di cluster 2026-09-08:
+      // (a) "Legacy workspace setup state … openclaw doctor --fix" — direktorum
+      //     agen yang dipangkas TINGGAL di NFS (agents.delete melepas binding,
+      //     bukan folder) dan gateway baru menuntut migrasi untuk tata letaknya;
+      // (b) "deletion cleanup is still pending" — nama yang baru di-delete
+      //     terkunci sampai pembersihan asinkron gateway selesai, dan pada
+      //     build itu pembersihannya tidak pernah datang (>10 menit, termasuk
+      //     untuk workspace segal buatan 2026.8 sendiri).
+      // Tanpa pemulihan, siklus pangkas-tumbuh D81 terkunci selamanya pada satu
+      // nama/path. Pemulihannya SATU percobaan ulang: pindah workspace (a), atau
+      // variasi nama berakhiran -r<short> (b). Konvergensi dihitung dari JUMLAH
+      // agen hidup, bukan nama, jadi variasi tidak menumpuk melebihi lantai.
+      const msg = String(err.message ?? "");
+      if (/Legacy workspace setup state/.test(msg)) {
+        workspace = `${workspace}-r${shortId("W")}`.toLowerCase();
+        log.warn("brain.sandbox-auto-relocate", {
+          name, workspace, brain: brain.name,
+          hint: "stale workspace dir from a reaped agent; openclaw doctor --fix reclaims the old path",
+        });
+      } else if (/deletion cleanup is still pending/.test(msg)) {
+        name = `${name}-r${shortId("R")}`.slice(0, 63).toLowerCase();
+        workspace = `${probeWorkspaceFor(live, brain.provider)}-${name}`;
+        log.warn("brain.sandbox-auto-rename", {
+          name, brain: brain.name,
+          hint: "gateway keeps deleted names locked until async cleanup; fleet counts live agents, so a variant name converges the same",
+        });
+      } else {
+        throw err;
+      }
       created = await runtime.createProbeAgent({ name, workspace, model });
     }
     await events.append({
@@ -219,9 +235,11 @@ export function createSandboxProvision({ brains, runtime, repos, events, log, no
       const ours = fleet.filter((a) => String(a?.name ?? "").startsWith(AUTO_PREFIX));
       const busy = await busyAgentsByRef(repos);
       // sbx- (on-demand) sebelum slot keeper, nomor slot besar sebelum kecil.
+      // Akhiran -r<short> (variasi nama pemulihan, lihat createOne) tetap
+      // dibaca sebagai nomor slotnya.
       const rank = (a) => {
         const name = String(a.name);
-        const slot = name.match(/-(\d+)$/);
+        const slot = name.match(/-(\d+)(?:-r[a-z0-9-]+)?$/);
         return (name.includes("-sbx-") ? 1_000_000 : 0) + (slot ? Number(slot[1]) : 0);
       };
       ours.sort((a, b) => rank(b) - rank(a));

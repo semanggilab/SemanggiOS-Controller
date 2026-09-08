@@ -89,9 +89,28 @@ export function createSandboxProvision({ brains, runtime, repos, events, log, no
 
   async function createOne(brain, { name, reason, actor }) {
     const live = await liveAgents();
-    const workspace = `${probeWorkspaceFor(live, brain.provider)}-${name}`;
+    let workspace = `${probeWorkspaceFor(live, brain.provider)}-${name}`;
     const model = `${brain.provider}/${brain.model}`;
-    const created = await runtime.createProbeAgent({ name, workspace, model });
+    let created;
+    try {
+      created = await runtime.createProbeAgent({ name, workspace, model });
+    } catch (err) {
+      // OpenClaw 2026.8 menolak agents.create ke workspace ber-"legacy setup
+      // state": direktorum agen yang dipangkas TINGGAL di NFS (agents.delete
+      // melepas binding, bukan folder), dan gateway baru menganggap tata letak
+      // lamanya harus dimigrasi dulu. Nama slot deterministik justru selalu
+      // menabrak direktorum yatang itu — tanpa pemulihan, siklus pangkas-tumbuh
+      // D81 terkunci selamanya pada satu path. Pemulihan: pindah ke path segal
+      // SATU KALI (nama tetap, konvergensi tetap); memulihkan path lama adalah
+      // pekerjaan `openclaw doctor --fix` di gateway (runbook upgrade 2026.8).
+      if (!/Legacy workspace setup state/.test(String(err.message ?? ""))) throw err;
+      workspace = `${workspace}-r${shortId("W")}`.toLowerCase();
+      log.warn("brain.sandbox-auto-relocate", {
+        name, workspace, brain: brain.name,
+        hint: "stale workspace dir from a reaped agent; openclaw doctor --fix reclaims the old path",
+      });
+      created = await runtime.createProbeAgent({ name, workspace, model });
+    }
     await events.append({
       kind: "brain.sandbox-auto-created",
       subjectType: "brain",

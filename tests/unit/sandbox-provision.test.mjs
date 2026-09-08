@@ -260,6 +260,46 @@ test("on-demand: kegagalan createProbeAgent kembali sebagai why, tidak throw", a
   assert.match(out.error, /gateway says no/);
 });
 
+test("grow: workspace ber-legacy setup state dipindah satu kali, nama slot tetap", async () => {
+  // Diukur di cluster 2026-09-08: gateway OpenClaw 2026.8 menolak agents.create
+  // ke direktorum yang dibuat gateway lama ("Legacy workspace setup state
+  // requires migration … run openclaw doctor --fix"). agents.delete melepas
+  // binding tapi meninggalkan folder di NFS, jadi nama slot deterministik
+  // menabrak direktorum agen yang dipangkas — siklus pangkas-tumbuh D81
+  // terkunci pada satu path selamanya tanpa pemulihan ini.
+  const live = [];
+  const seen = [];
+  const events = [];
+  const provision = createSandboxProvision({
+    brains: { list: async () => [brain({ minSandboxes: 1 })] },
+    runtime: {
+      listAgents: async () => live.slice(),
+      createProbeAgent: async ({ name, workspace }) => {
+        seen.push(workspace);
+        if (!/-r[a-z0-9-]+$/.test(workspace)) {
+          const err = new Error(`Legacy workspace setup state requires migration for ${workspace}; run openclaw doctor --fix.`);
+          err.code = "UNAVAILABLE";
+          throw err;
+        }
+        const agent = { id: name, name, workspace, model: { primary: "zai/glm-4.7" } };
+        live.push(agent);
+        return { id: name, name };
+      },
+      deleteAgent: async () => ({ removedBindings: 1 }),
+    },
+    repos: { resources: { get: async () => ({ concurrency_limit: 4 }) } },
+    events: { append: async (e) => events.push(e) },
+    log: quietLog,
+  });
+  const out = await provision.reconcileAll();
+  assert.equal(out.created, 1, "relokasi workspace bukan kegagalan provisioning");
+  assert.equal(seen.length, 2, "tepat satu percobaan ulang, bukan loop");
+  assert.match(seen[1], /-r[a-z0-9-]+$/, "workspace kedua bercadangan relokasi");
+  assert.equal(live[0].name, "sem-auto-glm-4-7-1", "nama slot deterministik tidak berubah — konvergensi tetap");
+  assert.ok(events.some((e) => e.kind === "brain.sandbox-auto-created" && e.payload.workspace === seen[1]),
+    "event merekam workspace yang benar-benar dipakai");
+});
+
 // --- end-to-end lewat admission ----------------------------------------------
 
 test("admission: parkir no-agent menumbuhkan sandbox, dan percobaan berikutnya dispatch", async () => {

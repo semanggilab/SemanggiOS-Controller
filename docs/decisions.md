@@ -2697,3 +2697,31 @@ Vonis: eksekusi FAILED (kebenaran tentang PERCOBAAN itu), task → **QUEUED** le
 **Terverifikasi live:** baris glm-5.2 disembuhkan `quota.no-clock-reset` pada pass pertama pasca-deploy; TASK-4CA0D674 (yang tombol Run again-nya tadinya ditolak) DISPATCHED; WAIT_QUOTA kosong.
 
 **Tes:** 558 → 561 (jangkar: clockless zai → jendela panjang, provider tak dikenal → 30 mnt, resetsAt terstruktur tetap menang; penyembuhan: baris NULL dibalik, jangkar masa depan dihormati; probe: sukses → AVAILABLE, agen probe dipilih, kegagalan tidak memperpanjang jangkar hidup, jangkar lewat di-jangkar ulang via sinyal yang dikeraskan, claude-code/run-hidup/jangkar-iminen/model-tanpa-agen dilewati).
+
+## D85 — Brain harness dicocokkan pada nama agen ACP, bukan pada "agen mana pun di workspace"
+
+**Gejalanya menyamar sebagai kuota.** TASK-5A24B39E dirutekan ke Brain `claude-opus-high` (`mode: acp`, `acpAgent: claude-opus`) lalu parkir `WAIT_RESOURCE` dengan pesan *"⚠️ Usage limit reached for 5 hour. Your limit will reset at 2026-09-09 03:34:02"*. Operator yang menangkapnya: **langganan Claude-nya sedang sehat**, dan kalimat "Your limit will reset at …" adalah milik ZAI, bukan Anthropic. Run itu memakai kuota provider lain.
+
+**Sebabnya satu baris di `agent-registry.mjs`:**
+
+```js
+const wantModel = ignoreModel || isHarnessRouted(candidate) ? null : modelKey(...)
+```
+
+Untuk harness, pencocokan model **dimatikan tanpa ada yang menggantikannya**. Yang tersisa di `matches()` hanyalah filter workspace — dan `preferAgentId` (agen milik worker) diperiksa lebih dulu. Jadi `sdmk-kader-architect` (zai/glm-5.2) lolos, dan dispatch mencatatnya `via: "exact"` seolah pencocokan berhasil.
+
+**Asumsi yang dipegang komentar lama tidak pernah terbukti.** Ia berbunyi *"dispatched to an orchestrator agent that then drives the Claude harness over ACP"*. Bukti bahwa itu tidak terjadi, dikumpulkan 2026-09-08: **nol** container berlabel `openclaw.acp=1` (termasuk exited), **nol** `.claude-home` di seluruh workspace, **nol** `session/request_permission` dalam 24 jam, **nol** galat wrapper di log — sementara transkrip TASK-90D214DF mencatat `exec` **tiga kali** dan task `COMPLETE`. Wrapper `semanggi-acp-claude` (yang membuat `.claude-home` sebagai langkah PERTAMA) tidak pernah dieksekusi; konfigurasinya benar, `harness-bootstrap` mendaftarkannya tiap start, image `semanggi/sandbox-claude` ada di node. Yang tidak ada hanyalah pemanggilnya.
+
+**Yang hilang lebih luas dari model yang salah:** run harness melewati SELURUH kontrak POC-3 — sandbox `--cap-drop ALL --read-only`, `.claude-home` durable di NFS, dan interposer gerbang izin (P3-03, P3-04) — tanpa meninggalkan satu baris log pun. Sebuah task L3 yang menjalankan shell tiga kali tanpa satu izin pun ditanyakan.
+
+**Keputusan:** untuk `provider === "claude-code"`, `acpAgent` **MENGGANTIKAN** pencocokan model, bukan sekadar mematikannya. Agen dicocokkan pada `id`-nya sendiri — distinction yang sama yang `agentsForBrain` (brain test, 2026-09-06) sudah buat untuk provider ini, kini berlaku juga di jalur dispatch.
+
+Tiga konsekuensi yang mengikat:
+
+1. **Berlaku juga saat `ignoreModel`.** Jalur override admin sengaja berhenti memeriksa model, jadi justru di sanalah agen asing paling mudah lolos. Override model tidak mengubah agen mana yang sah untuk sebuah harness.
+2. **Brain harness tanpa `acpAgent` tidak cocok dengan apa pun.** "Tidak ada yang cocok" adalah jawaban yang benar; menerima agen mana pun adalah bug ini.
+3. **Pesan galat menyebut nama agen ACP**, bukan `claude-code/claude-code`. Pesan lama mengirim operator mencari agen bermodel yang tidak akan pernah ada.
+
+**Yang perbaikan ini TIDAK selesaikan.** Dari 17 agen yang gateway iklankan, tidak ada satu pun bernama `claude`, `claude-opus`, atau `claude-sonnet` — agen ACP tidak muncul di `agents.list`. Setelah D85, dispatch claude-code **gagal keras** dengan alasan yang benar alih-alih diam-diam memakai GLM. Jalur suksesnya masih terbuka dan MUST diverifikasi dengan mengirim permintaan (aturan 4), bukan ditebak: apakah agen role memerlukan mapping `agents.entries.*.runtime.acp.agent` (yang docs OpenClaw sebut diperiksa sebelum dispatch), atau apakah dispatch harness harus memakai `sessions_spawn({ runtime: "acp", agentId })` alih-alih RPC `agent`.
+
+**Test:** 561 → 568. Tes lama *"claude-code routes on workspace alone"* DIGANTI, bukan diperbaiki: ia menegaskan bahwa Brain claude-code tanpa `acpAgent` boleh dirutekan ke agen mana pun — bug ini, dikodifikasi sebagai kontrak. Regresi yang dipaku: harness memilih `acpAgent` meski `preferAgentId` menunjuk agen lain; armada tanpa agen ACP mengembalikan null alih-alih agen worker; jalur override tidak menyerahkan harness ke agen asing; Brain tanpa `acpAgent` tidak cocok; pesan galat menyebut agen ACP; Brain non-harness tidak berubah perilaku.

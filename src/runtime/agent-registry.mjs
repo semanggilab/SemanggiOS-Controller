@@ -69,13 +69,43 @@ export function modelKey(provider, model) {
 }
 
 /**
- * `claude-code` runs are dispatched to an orchestrator agent that then drives
- * the Claude harness over ACP (POC-3). The harness model is not the agent's
- * model, so matching the agent on `claude-code/claude-code` would never
- * succeed and would be meaningless if it did. Workspace still has to match.
+ * `claude-code` runs reach the Claude harness over ACP (POC-3). The harness
+ * model is not the agent's model, so matching the agent on
+ * `claude-code/claude-code` would never succeed and would be meaningless if
+ * it did. Workspace still has to match.
+ *
+ * D85 — APA YANG SALAH SEBELUMNYA
+ *
+ * Komentar lama di sini berbunyi "dispatched to an orchestrator agent that
+ * then drives the Claude harness", dan `resolve()` bertindak sesuai itu:
+ * pencocokan model DIMATIKAN untuk harness, tanpa ada yang menggantikannya.
+ * Akibatnya setiap agen di workspace itu lolos — termasuk `preferAgentId`
+ * milik worker, yang selalu diperiksa lebih dulu.
+ *
+ * Terukur 2026-09-08 pada TASK-5A24B39E: dirutekan ke Brain `claude-opus-high`
+ * (`acpAgent: claude-opus`), dijalankan oleh `sdmk-kader-architect` pada
+ * `zai/glm-5.2`, dan dicatat `via: "exact"` seolah pencocokan berhasil.
+ * Buktinya datang dari pesan kuotanya sendiri: "Usage limit reached for
+ * 5 hour. Your limit will reset at ..." adalah kalimat milik ZAI, bukan
+ * Anthropic. Operator melihatnya karena langganan Claude-nya justru sehat.
+ *
+ * Yang hilang bukan sekadar model yang benar. Run itu memakai kuota provider
+ * LAIN, dan melewati seluruh kontrak POC-3 — sandbox `--cap-drop ALL`,
+ * `.claude-home` di NFS, dan interposer gerbang izin — tanpa meninggalkan
+ * satu baris log pun. Nol container `openclaw.acp=1`, nol `.claude-home`,
+ * nol `session/request_permission` dalam 24 jam, sementara transkrip
+ * TASK-90D214DF mencatat `exec` tiga kali.
+ *
+ * Karena itu harness kini dicocokkan pada NAMA agen ACP (`acpAgent`), bukan
+ * pada model dan bukan pada "agen mana pun di workspace ini".
  */
 function isHarnessRouted(candidate) {
   return candidate?.provider === "claude-code";
+}
+
+/** Nama agen ACP yang dipaku sebuah kandidat harness, ternormalisasi. */
+function acpAgentOf(candidate) {
+  return String(candidate?.acpAgent ?? "").trim().toLowerCase() || null;
 }
 
 export function createAgentRegistry({ runtime, ttlMs = 30_000, now = () => Date.now() } = {}) {
@@ -113,7 +143,11 @@ export function createAgentRegistry({ runtime, ttlMs = 30_000, now = () => Date.
     // (operator.admin). The routed model is then guaranteed by the override
     // itself, so requiring the agent to also match would reject perfectly good
     // agents and park work for nothing.
-    const wantModel = ignoreModel || isHarnessRouted(candidate) ? null : modelKey(candidate.provider, candidate.model);
+    const harness = isHarnessRouted(candidate);
+    // D85: untuk harness, `acpAgent` MENGGANTIKAN pencocokan model — bukan
+    // sekadar mematikannya. Lihat catatan di isHarnessRouted.
+    const wantAcpAgent = harness ? acpAgentOf(candidate) : null;
+    const wantModel = ignoreModel || harness ? null : modelKey(candidate.provider, candidate.model);
 
     // A preference-mode level is never sent to the gateway, so requiring the
     // agent to advertise it would park work for a parameter nobody will use.
@@ -122,6 +156,18 @@ export function createAgentRegistry({ runtime, ttlMs = 30_000, now = () => Date.
 
     const matches = (a) => {
       if (workspacePath && a.workspace !== workspacePath) return false;
+      if (harness) {
+        // Berlaku juga saat `ignoreModel` — override model TIDAK mengubah
+        // agen mana yang sah untuk sebuah harness. Justru sebaliknya: jalur
+        // override itulah yang paling mudah menyerahkan run ke agen asing,
+        // karena ia sengaja berhenti memeriksa model.
+        //
+        // Tanpa `acpAgent`, sebuah Brain harness tidak bisa dirutekan sama
+        // sekali. Mengembalikan "tidak ada yang cocok" adalah jawaban yang
+        // benar — menerima agen mana pun adalah bug yang D85 perbaiki.
+        if (!wantAcpAgent) return false;
+        return String(a.id ?? "").toLowerCase() === wantAcpAgent;
+      }
       if (wantModel && a.model !== wantModel) return false;
       // Only checked when the agent tells us what it supports AND we are not
       // overriding the model: with an override the advertised levels belong to
@@ -155,8 +201,18 @@ export function createAgentRegistry({ runtime, ttlMs = 30_000, now = () => Date.
       ? `agents in that workspace offer: ${[...new Set(inWorkspace.map((a) => a.model ?? "?"))].join(", ")}`
       : `no agent is configured for workspace ${workspacePath}`;
 
+    // D85: kegagalan harness MUST menyebut nama agen ACP yang dicari. Pesan
+    // lama ("no agent providing claude-code/claude-code") menunjuk model yang
+    // memang tidak akan pernah ada dan mengirim operator mencari hal yang
+    // salah; yang sebenarnya kurang adalah agen bernama `acpAgent`.
     const effort = candidate?.thinking ? ` at thinking="${candidate.thinking}"` : "";
-    const want = ignoreModel ? "any agent" : `an agent providing ${modelKey(candidate.provider, candidate.model)}${effort}`;
+    const want = isHarnessRouted(candidate)
+      ? acpAgentOf(candidate)
+        ? `the ACP harness agent "${acpAgentOf(candidate)}" this Brain pins`
+        : "an ACP harness agent (this Brain pins none — set acpAgent on it)"
+      : ignoreModel
+        ? "any agent"
+        : `an agent providing ${modelKey(candidate.provider, candidate.model)}${effort}`;
     throw new AgentUnavailableError(
       `no ${want} for ${workspacePath}; ` +
         `${detail}. Provision one with scripts/provision-agents.mjs ` +

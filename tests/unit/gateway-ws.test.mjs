@@ -495,19 +495,57 @@ test("a worker's own agent wins when it already satisfies the routing decision",
   await rt.close();
 });
 
-test("claude-code routes on workspace alone, since the harness model is not the agent model", async () => {
-  // The orchestrator agent runs glm-4.7 and drives the Claude harness over ACP
-  // (POC-3). Matching it against "claude-code/claude-code" would never succeed.
+// D85 MENGGANTI tes lama di sini: "claude-code routes on workspace alone,
+// since the harness model is not the agent model". Tes itu menegaskan bahwa
+// sebuah Brain claude-code TANPA `acpAgent` boleh dirutekan ke agen mana pun
+// di workspace — dan itulah bug-nya, dikodifikasi sebagai kontrak.
+//
+// Terukur 2026-09-08 (TASK-5A24B39E): Brain `claude-opus-high` dijalankan
+// oleh `sdmk-kader-architect` pada zai/glm-5.2. Ketahuan dari pesan kuotanya —
+// "Your limit will reset at ..." adalah kalimat ZAI, bukan Anthropic —
+// sementara langganan Claude operator sedang sehat. Run itu memakai kuota
+// provider lain dan melewati sandbox + gerbang izin POC-3 tanpa jejak.
+//
+// Asumsi "orchestrator agent yang menggerakkan harness" tidak pernah terbukti:
+// nol container `openclaw.acp=1` dan nol `.claude-home` di seluruh workspace.
+test("D85: claude-code dirutekan ke agen ACP yang dipaku acpAgent", async () => {
   const { FakeWS, sent } = fakeSocketFactory({
-    agents: [{ id: "orchestrator", workspace: "/nfs/w/executions/TASK-1", model: { primary: "zai/glm-4.7" } }],
+    agents: [
+      { id: "orchestrator", workspace: "/nfs/w/executions/TASK-1", model: { primary: "zai/glm-4.7" } },
+      { id: "claude-opus", workspace: "/nfs/w/executions/TASK-1", model: { primary: "anthropic/claude-opus" } },
+    ],
   });
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
   await rt.dispatch({
     ...baseDispatch,
+    // agent_ref worker sengaja menunjuk orchestrator: preferAgentId diperiksa
+    // lebih dulu, dan itulah jalan masuk bug lama.
     worker: { id: "W1", agent_ref: "orchestrator" },
-    candidate: { provider: "claude-code", model: "claude-code", mode: "acp" },
+    candidate: { provider: "claude-code", model: "claude-code", mode: "acp", acpAgent: "claude-opus" },
   });
-  assert.equal(sent.find((f) => f.method === rt.dispatchMethod).params.agentId, "orchestrator");
+  assert.equal(sent.find((f) => f.method === rt.dispatchMethod).params.agentId, "claude-opus");
+  await rt.close();
+});
+
+test("D85: claude-code tanpa agen ACP hidup MENOLAK dispatch, bukan jatuh ke agen lain", async () => {
+  const { FakeWS } = fakeSocketFactory({
+    agents: [{ id: "orchestrator", workspace: "/nfs/w/executions/TASK-1", model: { primary: "zai/glm-4.7" } }],
+  });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  await assert.rejects(
+    () =>
+      rt.dispatch({
+        ...baseDispatch,
+        worker: { id: "W1", agent_ref: "orchestrator" },
+        candidate: { provider: "claude-code", model: "claude-code", mode: "acp", acpAgent: "claude-opus" },
+      }),
+    (err) => {
+      // Pesannya MUST menyebut agen ACP yang dicari — bukan model
+      // claude-code/claude-code yang tidak akan pernah ada.
+      assert.match(err.message, /claude-opus/);
+      return true;
+    },
+  );
   await rt.close();
 });
 

@@ -100,7 +100,9 @@ test("the handshake sends the token and waits for hello-ok", async () => {
 // The nonce belongs to `device`, which a token-auth client does not send.
 test("the connect frame carries no root-level nonce", async () => {
   const { FakeWS, sent } = fakeSocketFactory({ sendChallenge: true });
-  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  // This is deliberately the token-only branch. Other tests exercise the
+  // device-auth branch, where the challenge nonce belongs inside `device`.
+  const rt = createGatewayRuntime({ token: "t", identityPath: null }, { WebSocketImpl: FakeWS });
   await rt.connect();
   const params = sent.find((f) => f.method === "connect").params;
   assert.equal(params.nonce, undefined, "a root nonce makes the gateway reject the connection");

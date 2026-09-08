@@ -2686,6 +2686,10 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     let live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
     let { match, message } = resolveTestAgent(live, { provider, model, acpAgent });
     let provisioned = false;
+    // Set when the claude-code path verified the harness via config and
+    // probed an orchestrator instead — the result must say what was and was
+    // not tested rather than implying a claude run happened.
+    let acpNote = null;
 
     // D65: an ordinary provider with no matching agent gets a probe agent
     // provisioned right here, then tested. claude-code never does: it is
@@ -2716,27 +2720,54 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       }
     }
 
-    // 2026.8.2 keeps ACP harness agents (e.g. "claude-opus") in the gateway
-    // CONFIG, not in the live list: dispatchable by id, invisible to
-    // agents.list (measured on the cluster — 9 live agents, none of them
-    // the harness 90D214DF successfully ran on). Dispatch reaches config-
-    // only agents, so the honest test for them is the dispatch itself.
-    // `listConfiguredAgents` is optional: a runtime without it falls
-    // through to the live-only message unchanged.
+    // 2026.8.2 moved ACP harness agents (e.g. "claude-opus") out of the
+    // dispatch surface entirely: they live in the gateway CONFIG
+    // (`acp.allowedAgents` + the acpx plugin's agent map), agents.list
+    // reports only live orchestrators, and `agent.run` on a harness id is
+    // refused with "unknown agent id" (all three measured on the cluster).
+    // Dispatch reaches the harness through an orchestrator with the name
+    // riding in the instruction preamble. The honest connection test for a
+    // config-only harness agent is therefore two-part: the config says the
+    // harness exists, and a dispatch probe to a live orchestrator proves the
+    // path tasks actually take. `listAcpAgents` is optional (null when the
+    // gateway cannot answer): a runtime without it falls through to the
+    // live-only message unchanged.
     if (!match && provider === "claude-code" && acpAgent) {
-      const configured = (await controller.runtime?.listConfiguredAgents?.().catch(() => [])) ?? [];
-      const needle = String(acpAgent).toLowerCase();
-      if (configured.some((id) => String(id ?? "").toLowerCase() === needle)) {
-        match = { id: acpAgent };
-      } else if (configured.length > 0) {
-        return {
-          ok: false,
-          reason: "no-agent",
-          message:
-            `No agent named "${acpAgent}" exists on the gateway — not live, and not among its ` +
-            `${configured.length} configured agent ids. On OpenClaw 2026.8.2 ACP harness agents are ` +
-            `config entries: add it to the gateway's agents config, then test again.`,
-        };
+      const acpIds = await controller.runtime?.listAcpAgents?.().catch(() => null);
+      if (acpIds !== null && acpIds !== undefined) {
+        const needle = String(acpAgent).toLowerCase();
+        if (acpIds.some((id) => String(id ?? "").toLowerCase() === needle)) {
+          // Any live non-probe orchestrator proves the dispatch path; the
+          // harness itself is only exercised by a real task, and the result
+          // says so rather than claiming a claude run happened.
+          const orchestrator =
+            live.filter((a) => !/^sem-workspaces-probe-/.test(String(a?.id ?? ""))).sort((a, b) => String(a.id).localeCompare(String(b.id)))[0] ??
+            live[0];
+          if (orchestrator) {
+            match = { id: orchestrator.id };
+            acpNote =
+              `"${acpAgent}" is a configured ACP harness agent; the dispatch probe ran on orchestrator ` +
+              `"${orchestrator.id}" (harness agents are not directly dispatchable on OpenClaw 2026.8.2). ` +
+              `The harness itself is exercised on the first real task.`;
+          } else {
+            return {
+              ok: false,
+              reason: "no-agent",
+              message:
+                `"${acpAgent}" is configured as an ACP harness agent, but the gateway has no live orchestrator ` +
+                `agent to dispatch through — tasks routed to this Brain would park. Provision an agent first.`,
+            };
+          }
+        } else {
+          return {
+            ok: false,
+            reason: "no-agent",
+            message:
+              `"${acpAgent}" is not one of the gateway's ACP harness agents ` +
+              `(allowed: ${acpIds.join(", ")}). Fix the Brain's acpAgent, or add the harness agent to the ` +
+              `gateway's acp.allowedAgents config.`,
+          };
+        }
       }
     }
 
@@ -2748,7 +2779,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       throw badRequest("this runtime does not support connection testing");
     }
     const result = await controller.runtime.testAgent({ agentId, thinking: effectiveThinking });
-    return { ok: result.ok, agentId, thinking: effectiveThinking, provisioned, ...result };
+    return { ok: result.ok, agentId, thinking: effectiveThinking, provisioned, ...(acpNote ? { message: acpNote } : {}), ...result };
   }
 
   route("POST", "/api/work/brains/{id}/test", async ({ id }) => {

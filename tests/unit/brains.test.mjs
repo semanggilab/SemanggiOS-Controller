@@ -355,14 +355,16 @@ test("POST .../brains/test connection-tests an unsaved draft the same way", asyn
 
 // ── config-only ACP harness agents (2026.8.2) ───────────────────────────────
 //
-// On OpenClaw 2026.8.2, agents.list reports only LIVE agents; the ACP
-// harness agents claude-code Brains pin (e.g. "claude-opus") live in the
-// gateway config and are dispatchable by id while being invisible to the
-// live list. Measured on the cluster: dispatch with agentId "claude-opus"
-// succeeds while the live list holds 9 unrelated agents. A connection test
-// that only checks fleet membership therefore fails healthy harnesses.
+// On OpenClaw 2026.8.2, ACP harness agents (e.g. "claude-opus") are not
+// dispatchable ids: they live in the gateway config's acp.allowedAgents /
+// acpx plugin map, agents.list reports only live orchestrators, and
+// agent.run on a harness id answers "unknown agent id" (all measured on the
+// cluster; 90D214DF ran claude-code through orchestrator sdmk-kader-architect
+// with the harness name in the instruction). The connection test therefore
+// verifies the harness via config and dispatch-probes a live orchestrator —
+// and says so in the result instead of implying a claude run happened.
 
-test("connection test dispatch-probes a claude-code acpAgent that is configured but not live", async () => {
+test("connection test config-verifies a claude-code acpAgent and probes a live orchestrator", async () => {
   const h = await buildHarness();
   const brain = await h.brains.create({
     name: "claude-opus-harness-test",
@@ -372,7 +374,7 @@ test("connection test dispatch-probes a claude-code acpAgent that is configured 
     acpAgent: "claude-opus",
   });
   h.runtime.listAgents = async () => [{ id: "sdmk-kader-architect", model: { primary: "zai/glm-5.2" } }];
-  h.runtime.listConfiguredAgents = async () => ["sdmk-kader-architect", "claude-opus"];
+  h.runtime.listAcpAgents = async () => ["claude", "claude-opus", "claude-sonnet"];
   const tested = [];
   h.runtime.testAgent = async ({ agentId }) => {
     tested.push(agentId);
@@ -383,14 +385,45 @@ test("connection test dispatch-probes a claude-code acpAgent that is configured 
     const res = await api.call("POST", `/api/work/brains/${brain.id}/test`, {});
     assert.equal(res.status, 200);
     assert.equal(res.body.ok, true, JSON.stringify(res.body));
-    assert.equal(res.body.agentId, "claude-opus");
-    assert.deepEqual(tested, ["claude-opus"], "the dispatch probe targets the config-only harness agent id");
+    assert.equal(res.body.agentId, "sdmk-kader-architect");
+    assert.deepEqual(tested, ["sdmk-kader-architect"]);
+    assert.match(res.body.message, /configured ACP harness agent/);
+    assert.match(res.body.message, /not directly dispatchable/);
   } finally {
     await api.close();
   }
 });
 
-test("connection test names the config gap when the acpAgent is nowhere on the gateway", async () => {
+test("connection test prefers a non-probe orchestrator for the dispatch probe", async () => {
+  const h = await buildHarness();
+  const brain = await h.brains.create({
+    name: "claude-orchestrator-choice",
+    provider: "claude-code",
+    model: "claude-code",
+    mode: "acp",
+    acpAgent: "claude-opus",
+  });
+  h.runtime.listAgents = async () => [
+    { id: "sem-workspaces-probe-google-x", model: { primary: "google/gemini" } },
+    { id: "sdmk-kader-architect", model: { primary: "zai/glm-5.2" } },
+  ];
+  h.runtime.listAcpAgents = async () => ["claude-opus"];
+  const tested = [];
+  h.runtime.testAgent = async ({ agentId }) => {
+    tested.push(agentId);
+    return { ok: true, status: "completed", agentId };
+  };
+  const api = await startApi(h);
+  try {
+    const res = await api.call("POST", `/api/work/brains/${brain.id}/test`, {});
+    assert.equal(res.body.ok, true, JSON.stringify(res.body));
+    assert.deepEqual(tested, ["sdmk-kader-architect"], "a disposable probe agent is never the orchestrator proof");
+  } finally {
+    await api.close();
+  }
+});
+
+test("connection test lists the allowed harness agents when the acpAgent is unknown", async () => {
   const h = await buildHarness();
   const brain = await h.brains.create({
     name: "claude-missing",
@@ -400,15 +433,15 @@ test("connection test names the config gap when the acpAgent is nowhere on the g
     acpAgent: "claude-opus",
   });
   h.runtime.listAgents = async () => [{ id: "sdmk-kader-architect", model: { primary: "zai/glm-5.2" } }];
-  h.runtime.listConfiguredAgents = async () => ["sdmk-kader-architect"];
+  h.runtime.listAcpAgents = async () => ["claude", "claude-sonnet"];
   const api = await startApi(h);
   try {
     const res = await api.call("POST", `/api/work/brains/${brain.id}/test`, {});
     assert.equal(res.status, 200);
     assert.equal(res.body.ok, false);
     assert.equal(res.body.reason, "no-agent");
-    assert.match(res.body.message, /not among its 1 configured agent ids/);
-    assert.match(res.body.message, /agents config/);
+    assert.match(res.body.message, /not one of the gateway's ACP harness agents/);
+    assert.match(res.body.message, /claude, claude-sonnet/);
   } finally {
     await api.close();
   }

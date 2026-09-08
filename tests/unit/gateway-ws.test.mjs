@@ -1039,35 +1039,34 @@ test("listModels asks for view:configured and returns the models array", async (
   await rt.close();
 });
 
-test("listModels falls back to empty params when the scoped view answers empty", async () => {
+test("listModels accepts an empty configured set without a legacy retry", async () => {
   const seen = [];
   const { FakeWS } = fakeSocketFactory({
     methods: ["connect", "agent.run", "agents.list", "models.list"],
     onRequest: (f) => {
       if (f.method === "models.list") {
         seen.push(f.params ?? {});
-        return f.params?.view === "configured"
-          ? { ok: true, payload: { models: [] } }
-          : { ok: true, payload: { models: [{ id: "glm-4.7", provider: "zai" }] } };
+        return { ok: true, payload: { models: [] } };
       }
       return { ok: true, payload: { runId: "r" } };
     },
   });
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
   const models = await rt.listModels();
-  assert.equal(models.length, 1, "the legacy empty-params call is the fallback for older gateways");
-  assert.deepEqual(seen, [{ view: "configured" }, {}]);
+  assert.equal(models.length, 0, "an honestly-empty catalog is an answer, not a prompt to re-ask differently");
+  assert.deepEqual(seen, [{ view: "configured" }]);
   await rt.close();
 });
 
-// ── config-declared agents (2026.8.2 ACP harness) ───────────────────────────
+// ── config-declared ACP harness agents (2026.8.2) ───────────────────────────
 //
-// agents.list only reports LIVE agents; ACP harness agents like "claude-opus"
-// are config entries — dispatchable by id, invisible to the live list. The
-// brain connection test needs this second source to stop reporting healthy
-// harness agents as missing.
+// agents.list reports only live orchestrators; ACP harness agents like
+// "claude-opus" live in the gateway config (acp.allowedAgents plus the acpx
+// plugin's agent map) and are NOT dispatchable ids ("unknown agent id",
+// measured). listAcpAgents is the only gateway-side answer to "does this
+// harness agent exist".
 
-test("listConfiguredAgents reads agent ids from config.get's agents.entries map", async () => {
+test("listAcpAgents unions acp.allowedAgents with the acpx plugin agent map", async () => {
   const { FakeWS } = fakeSocketFactory({
     methods: ["connect", "agent.run", "agents.list", "config.get"],
     onRequest: (f) => {
@@ -1075,7 +1074,10 @@ test("listConfiguredAgents reads agent ids from config.get's agents.entries map"
         return {
           ok: true,
           payload: {
-            config: { agents: { entries: { "claude-opus": { runtime: { acp: {} } }, "sdmk-kader-architect": {} } } },
+            config: {
+              acp: { enabled: true, allowedAgents: ["claude", "claude-opus"] },
+              plugins: { entries: { acpx: { enabled: true, config: { agents: { "claude-sonnet": { command: "/bin/x" } } } } } },
+            },
             resolved: {},
           },
         };
@@ -1084,31 +1086,47 @@ test("listConfiguredAgents reads agent ids from config.get's agents.entries map"
     },
   });
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
-  const ids = await rt.listConfiguredAgents();
-  assert.deepEqual(ids.sort(), ["claude-opus", "sdmk-kader-architect"]);
+  const ids = await rt.listAcpAgents();
+  assert.deepEqual(ids.sort(), ["claude", "claude-opus", "claude-sonnet"]);
   await rt.close();
 });
 
-test("listConfiguredAgents tolerates the legacy agents.list array shape", async () => {
+test("listAcpAgents returns null when config.get is not advertised", async () => {
+  const { FakeWS } = fakeSocketFactory({ methods: ["connect", "agent.run", "agents.list"] });
+  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
+  const ids = await rt.listAcpAgents();
+  assert.equal(ids, null, "null — not [] — so callers can tell 'no harness configured' from 'cannot ask'");
+  await rt.close();
+});
+
+// ── models.list owner requirement (2026.8.2) ─────────────────────────────────
+//
+// A gateway with multiple configured agents refuses ownerless requests:
+// INVALID_REQUEST "Multiple agents are configured, but this Gateway request
+// has no explicit owner. Set agentId to one of the configured agents."
+// (measured live). The adapter retries with the first config entry as owner.
+
+test("listModels retries with a config-entry owner when the ownerless call is refused", async () => {
+  const calls = [];
   const { FakeWS } = fakeSocketFactory({
-    methods: ["connect", "agent.run", "agents.list", "config.get"],
+    methods: ["connect", "agent.run", "agents.list", "models.list", "config.get"],
     onRequest: (f) => {
+      if (f.method === "models.list") {
+        calls.push(f.params ?? {});
+        return f.params?.agentId
+          ? { ok: true, payload: { models: [{ id: "glm-5.2", provider: "zai" }] } }
+          : { ok: false, error: { code: "INVALID_REQUEST", message: "Multiple agents are configured, but this Gateway request has no explicit owner. Set agentId to one of the configured agents." } };
+      }
       if (f.method === "config.get") {
-        return { ok: true, payload: { config: { agents: { list: [{ id: "old-agent" }, { name: "nameless" }] } } } };
+        return { ok: true, payload: { config: { agents: { entries: { main: {}, other: {} } } }, resolved: {} } };
       }
       return { ok: true, payload: { runId: "r" } };
     },
   });
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
-  const ids = await rt.listConfiguredAgents();
-  assert.deepEqual(ids, ["old-agent", "nameless"]);
-  await rt.close();
-});
-
-test("listConfiguredAgents returns [] when config.get is not advertised", async () => {
-  const { FakeWS } = fakeSocketFactory({ methods: ["connect", "agent.run", "agents.list"] });
-  const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
-  const ids = await rt.listConfiguredAgents();
-  assert.deepEqual(ids, []);
+  const models = await rt.listModels();
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, "glm-5.2");
+  assert.deepEqual(calls, [{ view: "configured" }, { view: "configured", agentId: "main" }]);
   await rt.close();
 });

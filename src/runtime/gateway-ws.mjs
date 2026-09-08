@@ -485,55 +485,79 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
     async listModels() {
       await connect();
       if (!hello?.features?.methods?.includes("models.list")) return [];
-      // 2026.8.2 scopes the answer: `view:"configured"` is the onboarded set
-      // this cache exists to show, while an empty-params call that older
-      // gateways answered fine measurably returns 0 models there. Ask the
-      // new way first, keep the old way as fallback, and log a failure
-      // instead of swallowing it — a silent empty cache reads as "no models
-      // onboarded" and sends the operator hunting a phantom.
+      // 2026.8.2 scopes the answer twice over: `view:"configured"` is the
+      // onboarded set this cache exists to show (an empty-params call that
+      // older gateways answered measurably returns 0 models there), AND a
+      // gateway with multiple configured agents refuses ownerless requests
+      // ("Multiple agents are configured … Set agentId"). The owner for a
+      // controller-wide listing is arbitrary — any configured agent sees the
+      // same catalog — so the first config entry is used, deterministically.
       const modelsFrom = (payload) => {
         const models = payload?.models ?? payload ?? [];
         return Array.isArray(models) ? models : [];
       };
+      const ownerRetry = async (err) => {
+        if (!/no explicit owner|Multiple agents are configured/i.test(String(err?.message ?? ""))) throw err;
+        let agentId = null;
+        try {
+          const cfg = await request("config.get", {});
+          const entries = cfg?.config?.agents?.entries;
+          if (entries && typeof entries === "object" && !Array.isArray(entries)) {
+            agentId = Object.keys(entries)[0] ?? null;
+          }
+        } catch {
+          /* no owner available — let the original error stand */
+        }
+        if (!agentId) throw err;
+        return modelsFrom(await request("models.list", { view: "configured", agentId }));
+      };
       try {
-        const configured = modelsFrom(await request("models.list", { view: "configured" }));
-        if (configured.length > 0) return configured;
-        return modelsFrom(await request("models.list", {}));
+        let models = [];
+        try {
+          models = modelsFrom(await request("models.list", { view: "configured" }).catch(ownerRetry));
+        } catch {
+          // Older gateways rejected the view param outright; ask the way
+          // they understood (still with the owner retry — the refusal to
+          // scope and the requirement for an owner are independent).
+          models = modelsFrom(await request("models.list", {}).catch(ownerRetry));
+        }
+        return models;
       } catch (err) {
         log.warn("gateway.models-list-failed", { error: String(err?.message ?? err).slice(0, 200) });
         return [];
       }
     },
 
-    /// Config-declared agents, as distinct from live ones. 2026.8.2 keeps
-    /// ACP harness agents (e.g. "claude-opus") as CONFIG entries — present
-    /// in `config.get`'s snapshot under agents.entries, dispatchable by id,
-    /// but absent from `agents.list`, which only reports provisioned agents.
-    /// Callers that need "does this agent exist at all" must look here when
-    /// the live list misses; callers that need "will it answer a dispatch
-    /// right now" should still trust the live list plus a dispatch probe.
-    async listConfiguredAgents() {
+    /// ACP harness agent ids the gateway knows from its CONFIG — the union of
+    /// `acp.allowedAgents` and the acpx plugin's agent map. 2026.8.2 keeps
+    /// harness agents (e.g. "claude-opus") OUT of agents.list, which reports
+    /// only live orchestrators, and refuses `agent.run` on harness ids
+    //  ("unknown agent id", measured) — dispatch reaches the harness through
+    /// an orchestrator agent with the name riding in the instruction. This
+    /// list is therefore the only gateway-side answer to "does this harness
+    /// agent exist".
+    async listAcpAgents() {
       await connect();
-      if (!hello?.features?.methods?.includes("config.get")) return [];
+      if (!hello?.features?.methods?.includes("config.get")) return null;
       try {
         const payload = await request("config.get", {});
-        const config = payload?.config ?? {};
-        const resolved = payload?.resolved ?? {};
-        const entriesFrom = (snapshot) => {
-          if (!snapshot || typeof snapshot !== "object") return null;
-          const agents = snapshot.agents ?? null;
-          if (agents?.entries && typeof agents.entries === "object" && !Array.isArray(agents.entries)) {
-            return Object.keys(agents.entries);
-          }
-          if (Array.isArray(agents?.list)) {
-            return agents.list.map((a) => a?.id ?? a?.name).filter((id) => typeof id === "string");
-          }
-          return null;
+        const idsFrom = (snapshot) => {
+          if (!snapshot || typeof snapshot !== "object") return [];
+          const allowed = Array.isArray(snapshot.acp?.allowedAgents)
+            ? snapshot.acp.allowedAgents.filter((id) => typeof id === "string")
+            : [];
+          const pluginAgents = snapshot.plugins?.entries?.acpx?.config?.agents;
+          const pluginIds =
+            pluginAgents && typeof pluginAgents === "object" && !Array.isArray(pluginAgents)
+              ? Object.keys(pluginAgents)
+              : [];
+          return [...new Set([...allowed, ...pluginIds])];
         };
-        return entriesFrom(config) ?? entriesFrom(resolved) ?? [];
+        const ids = idsFrom(payload?.config);
+        return ids.length > 0 ? ids : idsFrom(payload?.resolved);
       } catch (err) {
-        log.warn("gateway.config-get-failed", { error: String(err?.message ?? err).slice(0, 200) });
-        return [];
+        log.warn("gateway.acp-config-failed", { error: String(err?.message ?? err).slice(0, 200) });
+        return null;
       }
     },
 

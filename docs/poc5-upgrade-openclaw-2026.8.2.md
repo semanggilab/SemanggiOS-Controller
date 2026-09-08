@@ -1,351 +1,312 @@
-# POC-5 — Upgrade Gateway OpenClaw 2026.7.1 → 2026.8.2
+# POC-5 — OpenClaw 2026.8.2 di atas AgentOS 0.7.7
 
-Disusun 2026-09-02, dikerjakan langsung di `kub01-01`. Semua klaim kontrak di bawah
-**diverifikasi dengan mengirim permintaan** ke gateway 2026.8.2 yang nyata berjalan
-(sebagaimana pelajaran D34/D38/D41 — membaca `dist` bukan bukti), kecuali yang secara
-eksplisit ditandai belum teruji. Bukti mentah: probe di `/tmp/kilo/poc5-probe/` dan log lab.
+**Tanggal review/eksekusi:** 2026-09-08  
+**Target:** OpenClaw Gateway 2026.8.2 (commit rilis 0965053f)  
+**Baseline produksi:** OpenClaw 2026.7.1, AgentOS fork agentos-v0.7.7  
+**Status:** **POC lab selesai — LULUS BERSYARAT. Produksi belum dinaikkan.**
+
+Dokumen ini memperbarui POC-5 setelah POC-7 berhasil menaikkan AgentOS ke
+0.7.7. Semua pengujian upgrade dilakukan pada salinan state dan gateway lab
+terisolasi di kub01-01. Gateway produksi tetap memakai 2026.7.1.
 
 ---
 
-## 0. Ringkasan satu paragraf
+## 1. Keputusan
 
-2026.8.2 adalah rilis stabil terbaru (dirilis 2026-09-01) dan **memang membawa mekanisme
-pengikatan harness** yang ditunggu sejak D18 — tetapi bentuknya bukan `agentRuntime.acp.agent`
-di RPC, melainkan **`agents.entries.<id>.runtime.acp.agent` di config**, yang ditegakkan di
-resolusi target ACP saat spawn, bukan di dispatch `agent`. Lompatan 7.1→8.2 sekaligus
-menabrak pergantian kontrak besar "OpenClaw 2.0" (8.1): handshake WS, nama parameter RPC,
-format config, penyimpanan sesi ke SQLite per-agen, dan gerbang persetujuan kapabilitas
-plugin. Adapter controller **pasti** harus berubah. Yang membuat POC ini mendesak bukan
-hanya fiturnya: **gateway 8.1 sudah pernah dijalankan terhadap state produksi hari ini
-(13:12Z) dan memigrasikan sesi ke SQLite, lalu 7.1 dikembalikan di atasnya** — klaster
-sedang berjalan dalam keadaan hibrida yang tidak pernah direncanakan.
+OpenClaw 2026.8.2 dapat dipakai bersama AgentOS 0.7.7 dengan satu perubahan
+kompatibilitas wajib: konfigurasi agen 8.2 memakai agents.entries berbentuk map,
+sedangkan 7.1 memakai agents.list berbentuk array. Adapter AgentOS sekarang membaca
+dan menulis format 8.2, dengan fallback untuk 7.1.
 
-## 1. Fakta rilis (diverifikasi terhadap registry dan image)
+Hasil utama:
 
-```
-ghcr.io/openclaw/openclaw:2026.7.1   terpasang sekarang (dasar image semanggi 202609021233)
-ghcr.io/openclaw/openclaw:2026.8.1   ADA  rilis 2026-08-31  commit ea806575  "OpenClaw 2.0"
-ghcr.io/openclaw/openclaw:2026.8.2   ADA  rilis 2026-09-01  commit 0965053f  ← target POC ini
-ghcr.io/openclaw/openclaw:2026.8.3   TIDAK ADA — 8.2 adalah yang terbaru
-```
+- gateway 8.2 lab hidup dan healthy di 127.0.0.1:18790;
+- doctor --fix memigrasikan config/state dan mempertahankan **17 agen**;
+- probe RPC nyata lulus untuk protocol 4, 372 metode, dispatch agent,
+  create/delete agen, dan agents.entries;
+- patch AgentOS lulus **103/103 test terarah** dan typecheck;
+- permission bridge ACP lulus tiga kasus: level rendah otomatis, L3 approve
+  dieksekusi, serta reject tidak dieksekusi dan tidak bocor;
+- token OAuth harness valid; direct ACP membalas POC5-AUTH-OK;
+- plugin resmi lab acpx, groq, zai, dan cerebras aktif dengan capability consent;
+- backup SQLite diuji restore dan seluruh integrity check lulus.
 
-- 8.1 adalah rilis raksasa (~2.400+ PR): UI web baru, onboarding, **sesi & transkrip
-  pindah ke SQLite per-agen**, konsolidasi config, kepercayaan plugin, paket provider resmi.
-- 8.2 didominasi perbaikan atas 8.1, dan justru **tentang keselamatan upgrade**:
-  *"stop incomplete session migrations before claiming success"*, *"keep newer
-  configuration"*, *"repair supported legacy v17 agent databases"*, ditambah
-  `openclaw update cleanup --dry-run` untuk mengelola arsip rollback migrasi.
-- Peringatan downgrade 8.1 (kutipan rilis): sesi yang dibuat setelah migrasi SQLite
-  *"will not appear in older releases"*; sebelum turun versi harus me-restore arsip
-  transkrip legacy lewat CLI versi baru. **Peringatan ini sudah terlanggar di produksi
-  hari ini — lihat §5.**
-- Gerbang deprecation SDK plugin bertanggal **2026-09-01 — sudah aktif** (subpath
-  `plugin-sdk-*` pindah ke `openclaw/plugin-sdk/...`). Plugin eksternal kita (`acpx`,
-  `zai`, pin 2026.7.1) masih termuat di atas 8.2 (dibuktikan §3), tetapi ini area yang
-  harus diukur ulang tiap kali plugin di-re-pin.
+Produksi belum di-upgrade. Syarat rollout yang tersisa adalah mengulang pemeriksaan
+administratif dengan identitas device AgentOS yang memiliki scope lengkap, lalu
+melakukan deploy stop-first dalam jendela perubahan.
 
-## 2. Yang dicari sejak D18/D34, dan bentuk aslinya di 8.2
+## 2. Koreksi atas dokumen lama
 
-Pertanyaan lama: bagaimana membuat `acpAgent` di katalog Brain menjadi **routing yang
-ditegakkan**, bukan niat. Jawaban 8.2 — diukur dari config schema, dist, dan gateway hidup:
+| Asumsi lama | Kondisi aktual |
+|---|---|
+| AgentOS belum 0.7.7 | POC-7 selesai; fork 0.7.7 berjalan di cluster. |
+| Ada 5 agen | State aktual berisi **17 agen**; semuanya bertahan di lab 8.2. |
+| OAuth tidak valid | Sudah valid; direct ACP menghasilkan POC5-AUTH-OK. |
+| Controller pasti perlu diubah | Controller sudah menangani UUID frame, device connect top-level, message + idempotencyKey, dan normalisasi thinking. |
+| Permission bridge belum diuji | Sudah lulus tiga skenario wajib. |
+| AgentOS hanya menulis agents.list | Patch dual-format agents.entries/list sudah diterapkan dan diuji. |
+| Plugin lama sekadar bisa dimuat | Paket resmi 8.2 acpx/groq/zai/cerebras aktif di lab dengan consent. |
+| Migrasi mengganti semua transkrip | **214 JSONL legacy dan 5 SQLite agen hidup berdampingan**; keduanya harus dipertahankan selama masa rollback. |
 
-1. **Bidangnya ada di entri agen config, namanya `runtime`, bukan `agentRuntime`.**
-   `AgentEntrySchema` menerima `runtime: {type:"acp", acp:{agent, backend, mode, cwd}}`.
-   Kunci `agentRuntime` di config adalah hal lain (kebijakan referensi id di peta model)
-   dan **tetap ditolak** sebagai pengikat harness.
+## 3. Topologi POC
 
-2. **RPC tidak bisa menyetelnya.** `agents.create` dan `agents.update` menolak `runtime`
-   maupun `agentRuntime` (`unexpected property`). Pengikatannya hanya lewat config —
-   berkas, atau CLI `openclaw config set` (terbukti masih bekerja di 8.2). Konsekuensi
-   untuk provisioner (tugas #5): menulis config, bukan RPC.
+### 3.1 Produksi
 
-3. **Penegakkannya hidup di resolusi target ACP, bukan di dispatch `agent`.** Dari
-   `acp-spawn` 8.2: saat sebuah sesi/spawn menunjuk `agentId = X` dan X adalah config
-   agent dengan `runtime.type:"acp"`, gateway memetakan X → `X.runtime.acp.agent` secara
-   deterministik; menunjuk config agent biasa sebagai target ACP **ditolak eksplisit**:
-   > `agentId "X" is an OpenClaw config agent, not an ACP harness. Use runtime="subagent"
-   > or omit runtime ... or configure agents.entries.*.runtime.type="acp" with runtime.acp.agent.`
+Pada saat pengukuran:
 
-4. **Dispatch `agent` tetap tidak mengenal harness.** `agent {agentId:"claude-opus"}` →
-   `unknown agent id "claude-opus"` (harness bukan agen; ini yang membuat Test Connection
-   Brain claude-code/* cocok secara literal gagal — D18 tetap akurat untuk gejalanya).
-   Menyetel `runtime` pada agen `main` **tidak** mengubah dispatch ke `main` — terukur:
-   dispatch tetap jalan sebagai agen OpenClaw biasa dan gagal di provider modelnya.
-   `sessions_spawn` bukan metode operator (372 metode, tidak ada).
+~~~text
+AgentOS     semanggi/agentos:2026090601
+Gateway     semanggi/openclaw-gateway:2026083001 (OpenClaw 2026.7.1)
+Controller  semanggi/work-controller:2026090405
+~~~
 
-Jadi pola penegakan yang benar untuk Semanggi di 8.2:
+Gateway produksi tidak disentuh oleh POC upgrade.
 
-```
-acp.allowedAgents dibatasi (jangan berisi id harness mentah)
-agents.entries.claude-opus  = { runtime: {type:"acp", acp:{agent:"claude-opus"}} }   ← alias
-agents.entries.claude-sonnet= { runtime: {type:"acp", acp:{agent:"claude-sonnet"}} }
-katalog Brain: acpAgent = "claude-opus" (nama alias/config agent)
-instruksi orchestrator: spawn ACP agentId "claude-opus"
-→ gateway menegaskan: alias itu hanya bisa berarti harness claude-opus, selamanya
-```
+### 3.2 Lab
 
-Instruksi tetap diperlukan untuk MEMICU spawn (itu sifat ACP: harness dipanggil
-per-sesi oleh orchestrator), tetapi **pemetaan nama→harness kini milik gateway**, dan
-menamai harness mentah di luar `allowedAgents` ditolak. Itu perbedaan nyata dari
-`acp.defaultAgent` global yang tidak bisa ditegakkan per-Brain (D18).
+~~~text
+root        /root/poc5-20260907/lab
+container   poc5-gateway-20260907
+image       semanggi/openclaw-gateway:poc5-20260907
+listen      127.0.0.1:18790
+status      healthy
+~~~
 
-**Belum terbukti end-to-end**: lab tidak punya docker.sock untuk spawn sandbox harness
-dan token OAuth langganan Claude memang sedang tidak sah (butir 4b readiness). Bukti
-routing hidup (kegagalan yang menyebut harness yang dipilih) wajib diulang di jendela
-upgrade dengan kredensial yang valid.
+Lab memakai salinan independen state, config, dan secret. Create/delete agen hanya
+terjadi di lab. Tidak ada dua gateway yang menulis state root produksi yang sama.
 
-## 3. Bukti lab — 8.2 di atas salinan state produksi
+## 4. Bukti eksekusi
 
-Metode: salinan state kritis (tanpa `npm`, 98 MB; `npm` di-bind-mount read-only dari
-produksi) dijalankan sebagai container biasa di kub01-01, port lokal, token lab.
-Identitas perangkat controller direplikasi sehingga pairing dan scope `operator.admin`
-terbukti hidup. Gateway produksi tidak disentuh.
+### 4.1 Snapshot dan restore
 
-### 3.1 Boot pertama ditolak — tiga gerbang sekaligus
+Snapshot berada di /root/poc5-20260907/snapshot. Database SQLite dicadangkan,
+dipulihkan ke lokasi uji, lalu diperiksa integritasnya. Semua pemeriksaan lulus.
 
-```
-Invalid config at /lab/config/openclaw.json:
-  openclaw.json:150 — meta: Unrecognized key: "lastTouchedAt"
-  agents.ownership: multi-agent rosters require agents.ownership="explicit" ...
-OpenClawStateDatabaseSchemaMigrationRequiredError: ... (audit-events-v2) ...
-  run openclaw doctor --fix to migrate it.
-```
+Inventaris menemukan:
 
-`doctor --fix` (jalur yang disarankan pesan galatnya sendiri) menuntaskan semuanya:
+- 214 transkrip JSONL legacy;
+- 5 database SQLite per-agen;
+- 17 agen aktif setelah normalisasi config;
+- tidak ada execution aktif saat snapshot;
+- keadaan task: 1 BLOCKED, 15 COMPLETE, 35 WAIT_DEP.
 
-- `agents.list` (array) → **`agents.entries`** (map, kunci = id agen); kelima agen selamat.
-- `agents.ownership: "explicit"` ditambahkan; `meta` ditulis ulang menjadi
-  `{lastTouchedVersion:"2026.8.2", migrations:{...}}`.
-- State DB dimigrasikan bertingkat (v10, v12–v15, 48, audit-events-v2) — tabel mati
-  dihapus, ledger audit dipindah ke skema lifecycle ber-versi.
-- Entri registry basis-data agen yang foldernya sudah tidak ada dibersihkan
-  (sisa agen POC lama), dengan peringatan yang jujur.
+JSONL dan SQLite harus dipertahankan bersama. Rollback image saja tidak memulihkan
+visibilitas riwayat untuk gateway lama.
 
-### 3.2 Gerbang persetujuan kapabilitas plugin — gateway menolak siap
+### 4.2 Migrasi config/state
 
-```
-OpenClaw plugin verification failed; refusing to report the gateway ready.
-- Plugin "acpx" requires capability consent; rerun with --accept-capabilities.
-- Plugin "zai" requires capability consent; ...
-- Plugin "groq" requires capability consent; ...
-```
+Boot awal 8.2 pada salinan state meminta migrasi. Jalur resmi doctor --fix:
 
-Ini perilaku baru 8.x (plugin trust): tanpa persetujuan operator, gateway **keluar**,
-bukan jalan tanpa plugin. Setelah `openclaw plugins enable <p> --accept-capabilities`
-untuk ketiganya, gateway hidup sehat:
+- mengubah agents.list array menjadi agents.entries map;
+- menetapkan agents.ownership menjadi explicit;
+- menulis metadata config versi 2026.8.2;
+- menyelesaikan migrasi database;
+- membersihkan registry yatim tanpa menghapus 17 agen aktif.
 
-```
-http server listening (15 plugins: acpx, anthropic, browser, ..., google, ...)
-[plugins] embedded acpx runtime backend registered lazily
-healthz → {"ok":true,"status":"live"}
-```
+Sesudah capability consent plugin, gateway ready dan health check live. Peringatan
+lab yang tersisa tidak memblokir POC: beberapa file secret provider tidak tersedia
+di salinan, metadata skill lama, heartbeat owner kosong, dan memory main tidak ikut
+dibuat di lab terisolasi.
 
-**acpx dan zai pin 2026.7.1 termuat bersih di atas 8.2.** Itu bukti termuat, bukan bukti
-jalur kritisnya (spawn harness, interposer izin di stdio) — lihat §6.
+### 4.3 Probe RPC nyata
 
-### 3.3 Perubahan kontrak WS/RPC yang mematahkan klien 7.1 (semua terukur)
+| Pemeriksaan | Hasil |
+|---|---|
+| Protocol | 4 |
+| Metode yang diiklankan | 372 |
+| Metode dispatch | agent |
+| Frame ID | UUID/string diterima |
+| Payload dispatch | message dan idempotencyKey |
+| Create agen uji | Berhasil |
+| Delete agen uji | Berhasil; jumlah kembali ke 17 |
+| agents.entries | Hadir, 17 entri |
+| agents.list | Tidak hadir setelah migrasi |
+| Schema baru | Ditemukan |
+| Binding ikut terhapus | 0 |
 
-| Permukaan | 7.1 | 8.2 (bukti galat asli) |
+Ada satu agen probe tersisa sebelum run terakhir sehingga hitungan awal probe adalah
+18; create/delete terakhir mengembalikan state ke 17. Controller saat ini sudah
+kompatibel dengan handshake dan dispatch 8.2.
+
+### 4.4 Patch AgentOS 0.7.7
+
+Perubahan:
+
+- lib/openclaw/domains/agent-config.ts membaca entries lebih dulu, mengubah map ke
+  bentuk internal, menulis entries tanpa duplikasi id, dan fallback ke list;
+- lib/openclaw/client/native-ws-gateway-client.ts menyimpan kedua bentuk raw config
+  serta memakai replace path agents.entries.*.skills;
+- test domain, native client, dan boundary safety diperbarui untuk dua format.
+
+Patch masuk ke commit fork AgentOS **5f7357db** bersama perubahan UI D77/D78 dari
+sesi deploy lain. Lima berkas POC-5 tercatat dalam stat commit itu, tetapi commit-nya
+tidak berdiri sendiri.
+
+Hasil test:
+
+~~~text
+test terarah + typecheck     103/103 lulus, exit 0
+full suite awal              1061/1065 lulus
+boundary setelah update      79/81 lulus
+~~~
+
+Empat kegagalan awal terdiri dari dua assertion boundary yang diperbarui oleh patch
+dan dua baseline UI Semanggi yang sudah dikenal. Setelah update, dua kegagalan yang
+tersisa adalah:
+
+1. tipe sidebar upstream tidak memasukkan route Semanggi;
+2. daftar grup Settings upstream tidak memasukkan grup Semanggi.
+
+Keduanya berasal dari ekstensi UI Semanggi, bukan regresi OpenClaw. Klaim yang benar:
+**suite patch hijau; full suite mempunyai dua expected failure**.
+
+### 4.5 Permission bridge dan OAuth
+
+Permission bridge lulus:
+
+1. level rendah diizinkan otomatis;
+2. L3 approve mengeksekusi operasi;
+3. L3 reject tidak mengeksekusi operasi dan tidak bocor.
+
+Interposer ACP ini tidak bergantung pada scope operator.approvals atau
+operator.questions milik UI AgentOS. Token OAuth juga valid dan direct ACP
+menghasilkan POC5-AUTH-OK.
+
+### 4.6 Compatibility matrix AgentOS
+
+Script kompatibilitas AgentOS 0.7.7 dijalankan terhadap gateway lab:
+
+~~~text
+native gateway coverage  65/74 operasi (88%)
+CLI fallback             0 (CLI tidak dipasang di container probe)
+exit                     1
+~~~
+
+Exit 1 bukan kegagalan parsing agents.entries. Sebanyak 29 operasi administratif
+ditolak karena token probe tidak memiliki operator.read/operator.admin; misalnya
+update.status menghasilkan FORBIDDEN: missing scope: operator.admin. Sembilan operasi
+lain belum didukung matriks 0.7.7. Sementara itu, probe schema khusus, create/delete
+RPC, dan test adapter semuanya lulus.
+
+Sebelum rollout, command ini harus diulang dengan device identity AgentOS yang sudah
+dipasangkan. Token lab terbatas tidak boleh dipakai untuk memberi vonis seluruh
+permukaan administratif.
+
+## 5. Perubahan kontrak 7.1 → 8.2
+
+| Permukaan | 7.1 | 8.2 |
 |---|---|---|
-| connect `auth` | `auth:{token, device}` | `device` **pindah ke param connect level atas**; `auth` hanya token/password/deviceToken — `unexpected property 'device'` |
-| connect `client.id` | bebas | enum resmi; `gateway-client` masih sah, nilai lain `must be equal to one of the allowed values` |
-| id frame | angka diterima | `at /id: must be string` |
-| protokol | 4 | 4 (ok) |
-| metode | 218 | **372**; `agent.run` **hilang**, kembali `agent` (negosiasi DISPATCH_METHODS di `gateway-ws.mjs` menyelamatkan kita, lagi) |
-| dispatch prompt | `prompt` | **`message`** wajib (`unexpected property 'prompt'`) |
-| idempotensi | opsional (dihormati) | **`idempotencyKey` wajib** |
-| `deliver` | boolean | boolean (`must be boolean`) — tetap |
-| `workspaceDir` di dispatch | ditolak | tetap ditolak (D14 berlanjut) |
-| `agents.create` | `{name, workspace, model}` | sama + `id` tidak diterima; `runtime`/`agentRuntime` ditolak |
-| `agents.update`/`agents.delete` | `{id}` | **`agentId`** (`must have required property 'agentId'`) |
-| `config.set`/`config.patch` | path/value | **`raw`** (config utuh) — CLI `openclaw config set/get` tetap bekerja |
-| `agents.list` bentuk agen | `agentRuntime:{id,source}` | `agentRuntime:{id, cloudPlacementSupported, devicePlacementSupported, source}` + `thinkingLevels` kini `[{id,label}]` |
+| connect device | di dalam auth | level atas payload connect |
+| frame id | angka dapat diterima | string/UUID |
+| dispatch | bentuk lama | agent + message + idempotencyKey |
+| update/delete agen | id | agentId |
+| config agen | agents.list array | agents.entries map |
+| config set/patch | path/value | raw config + hash |
+| thinking levels | nilai sederhana | objek id/label |
+| sesi | JSONL dominan | SQLite per-agen + arsip legacy |
+| plugin | tanpa gerbang baru | capability consent wajib |
 
-Yang menggembirakan: `sessions.subscribe`, `sessions.messages.subscribe`,
-`sessions.compaction.branch` semuanya masih ada, dan ada pendatang baru yang relevan:
-**`sessions.fork`** (kandidat menutup "FORK tidak membawa riwayat"), `sessions.rewind`,
-`models.probe`.
+Controller sudah menangani handshake/dispatch. Patch AgentOS menangani dua bentuk
+config. Sesi, usage, dan operasi administratif tetap wajib masuk smoke test rollout.
 
-## 4. Estimasi kerja adapter controller (BREAKING, tidak opsional)
+## 6. Harness binding 8.2
 
-Setiap titik di §3.3 yang disentuh controller harus diubah dan diuji ulang:
+Pengikatan harness tersedia di:
 
-1. `gateway-ws.mjs`: connect (device ke level atas), id frame string, dispatch
-   `message` + `idempotencyKey` selalu.
-2. Registry agen: bentuk `agents.list` baru; pemetaan agen-Brain tetap berjalan
-   (id/model/workspace tak berubah bentuk).
-3. Penyelesaian run: event `agent` lifecycle masih teramati di lab (`phase:"error"`
-   dengan `runId`+`sessionKey` terbawa) — jalur `session-events.mjs` kemungkinan besar
-   selamat, tetapi bentuk payload `session.message` (transkrip D33/D40) dan usage
-   (akuntansi D17) **harus diukur ulang**, bukan diasumsikan.
-4. Probe level thinking (D38): `thinkingLevels` kini objek — probe dan penyimpanan
-   `thinking_levels` menyesuaikan; dan validasi `thinking` terhadap model default
-   (D21) harus diukur ulang apakah sudah diperbaiki di 8.2.
-5. Interposer izin: kontrak `acp-permission-interposer.mjs` terhadap acpx 2026.7.1
-   di atas gateway 8.2 — jalur stdio tidak berubah oleh gateway, tapi ini gerbang
-   yang gagalnya senyap; wajib `permission-bridge-verify.sh` tiga kasus.
+~~~text
+agents.entries.<agent-id>.runtime = {
+  type: \"acp\",
+  acp: { agent: \"<harness-id>\", backend: \"...\", mode: \"...\", cwd: \"...\" }
+}
+~~~
 
-## 5. Keadaan produksi yang sudah tidak murni (temuan paling penting hari ini)
+Field runtime tidak diterima oleh agents.create/update; provisioner harus menulis
+config 8.2. Penegakan terjadi saat target ACP di-resolve, bukan dengan dispatch
+harness ID langsung. Adopsi binding ini bukan syarat upgrade dasar dan sebaiknya
+menjadi perubahan terpisah setelah rollout stabil.
 
-Jejak di `/opt/semanggi/volumes/shared/service/semanggios/openclaw/state`:
+## 7. Kriteria penerimaan
 
-```
-11:13:51Z  openclaw.sqlite.bak.20260902111351          (backup sebelum sesuatu)
-13:11:49Z  openclaw.sqlite.bak.20260902131149          (backup sebelum migrasi)
-13:12:15Z  session-sqlite-migration-runs/session-sqlite-1788354735212-13b0c960.json
-           openClawVersion: 2026.8.1 · startedAt 13:12:15.212Z · completedAt .771Z
-13:23Z     openclaw.json ditulis ulang (semua .bak seharian)
-~13:26Z    service kini: semanggi/openclaw-gateway:202609021233 — dasar 2026.7.1
-```
-
-Artinya: **gateway 8.1 (image custom 202609021250, ada di node) sudah dijalankan
-terhadap state produksi pukul 13:12Z**, memigrasikan sesi ke SQLite per-agen
-(`agents/*/agent/openclaw-agent.sqlite`, berkas lama dipindah ke
-`session-sqlite-import-archive/*.imported-*`), lalu **7.1 dikembalikan di atasnya**
-tanpa me-restore arsip transkrip legacy — persis jalur yang diperingatkan rilis 8.1.
-
-Kondisi saat ini (diverifikasi):
-
-- Tidak ada sesi file-backed baru yang dibuat 7.1 setelah 13:26Z (klaster diam) —
-  belum ada generasi ganda.
-- Riwayat sesi lama kini **hanya hidup di dalam SQLite per-agen yang 7.1 tidak baca**:
-  CONTINUE pada task lama akan diam-diam mulai sesi kosong (gejala yang sama dengan
-  batasan FORK). Tidak ada korupsi — hanya kebutaan.
-- Controller dan AgentOS ikut restart di jendela yang sama (image 20260902121 /
-  202609021121) dan 324 test controller tetap hijau — tapi tidak ada yang menguji
-  transkrip lama lewat 7.1.
-
-Kesimpulan untuk POC ini: state produksi **sudah setengah dimigrasikan**. Upgrade ke
-8.2 bukan lagi lompatan bersih 7.1→8.2 melainkan **melanjutkan migrasi yang sudah
-dimulai** — dan justru karena manifest migrasinya ada, 8.2 tahu harus idempoten.
-Menghindari 8.2 sekarang berarti membiarkan riwayat sesi terkunci di format yang
-gateway yang berjalan tidak bisa baca. Argumen "tunda upgrade" dari
-`upgrade-openclaw.md` tidak lagi berlaku: kerusakan bertahapnya sudah dimulai.
-
-## 6. Risiko yang tersisa, terurut dari yang paling nyata
-
-1. **Adapter controller + registry + transkrip (§4)** — pasti, diperkirakan 1–1,5 hari
-   termasuk tes regresi per perubahan kontrak.
-2. **AgentOS.** D32: AgentOS menulis `openclaw.json` langsung dengan bentuk 7.1
-   (`agents.list`, `workspaceId`, `modelId`). Di 8.2 config kanoniknya `agents.entries`.
-   Doctor mentolerir `list` saat migrasi, tapi tulisan AgentOS pasca-upgrade bisa
-   menumbuhkan kembali bentuk lama. AgentOS dan gateway satu compatibility changeset
-   (D30): validasi ulang, kemungkinan rebuild. 0,5–2 hari (paling tidak pasti).
-3. **Jalur ACP kritis: acpx spawn + interposer izin + sandbox.** acpx 2026.7.1 termuat
-   di 8.2 (§3.2) tapi spawn harness lewat docker.sock dan sadapan stdio interposer
-   tidak teruji di lab. `permission-bridge-verify.sh` tiga kasus TIDAK BOLEH dilewati —
-   dan sekarang masih terhalang token OAuth yang tidak sah (butir 4b readiness,
-   `claude setup-token` + secret `claude_code_oauth` adalah prasyarat operator).
-4. **Plugin di gerbang SDK 2026-09-01.** acpx/zai pin 2026.7.1 masih lolos hari ini;
-   re-pin ke 8.2 wajib disertai pengukuran ulang effort GLM (D19: katalog plugin bisa
-   mempersempit level) dan level thinking per model (D38).
-5. **SQLite per-agen di atas NFS.** Lab berjalan di disk lokal; produksi menaruh
-  `openclaw-agent.sqlite` per agen di NFS — area WAL yang sudah dua kali muncul di
-   changelog 8.x. Awasi `slow SQLite transaction hold` (sudah terlihat sekali di lab
-   dengan disk lokal) dan pertimbangkan `openclaw backup sqlite` sebagai alat backup
-   baru (ada di 8.x: `sqlite create|list|verify|restore`).
-6. **Perilaku default baru**: `tools.sessions.visibility` default melebar di 8.2
-   ("shared-agent operators should set ... when they need narrower access") — setel
-   eksplisit agar tidak bergantung pada default; `agents.defaults.heartbeat.agentId`
-   diperingatkan saat kosong (harmless, tapi setelah doctor layak diisi).
-
-## 7. Rencana eksekusi (jendela upgrade)
-
-Fase 0 — prasyarat operator (blokir bila tidak):
-- Perbarui token harness: `claude setup-token`, secret `claude_code_oauth`.
-- Backup + **uji restore** (pola D30): state kritis + config; tambahkan
-  `openclaw backup sqlite create|verify` dari image 8.2 bila ingin arsip kanonis.
-
-Fase 1 — latihan di lab (ulangi §3 di atas, bila mau):
-- Salin state ke direktori kerja; jalankan 8.2; `doctor --fix`; konfirmasi boot sehat,
-  `agents.list` utuh, device pairing + scope terbaca, `secrets audit` bersih
-  **sebagai uid 1000** (jebakan root di readiness.md masih berlaku).
-
-Fase 2 — image custom:
-- `docker buildx build --build-arg OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:2026.8.2`
-  di atas `images/openclaw-gateway/Dockerfile` (ARG sudah ada; entripoint, wrapper,
-  interposer tidak menyentuh kontrak yang berubah — tapi lihat fase 4).
-- Bersihkan disk node build dulu (D41); JANGAN hapus tag yang sedang dipakai service.
-- Verifikasi entrypoint SEBELUM deploy: `docker inspect --format '{{json .Config.Entrypoint}}'`
-  (pembalap Dockerfile yang salah — D41 — masih di sekitar).
-
-Fase 3 — deploy gateway:
-- Setelah adapter controller (fase 4) siap dan teruji; `stop-first` sudah kontrak stack.
-- Boot pertama akan menolak config/state 7.1 → jalankan `doctor --fix` (sekali; §3.1
-  membuktikan jalurnya), lalu `plugins enable acpx|zai|groq --accept-capabilities`
-  (keputusan operator yang disengaja — kepercayaan plugin), restart.
-- Distribusi image tanpa registry tetap `docker save | scp | docker load` ke
-  10.10.0.10/12/13/14 (`nohup`, polling log — jebakan timeout SSH).
-
-Fase 4 — verifikasi terautentikasi (urutan mengecek yang paling bisa gagal senyap):
-1. `healthz` + `docker service ps` (task baru Running, bukan Failed — "converged"
-   bisa berarti rollback, D41).
-2. Pairing device controller, `secrets audit` bersih, kelima agen terlihat,
-   `agents.list` bentuk baru terbaca adapter baru.
-3. Dispatch E2E lewat controller: task → COMPLETE + usage tercatat (D17) + transkrip
-   dua sisi (D33/D40) + blok mentah.
-4. Probe level thinking per model (D38) — kalibrasi ulang setelah schema berubah.
-5. `permission-bridge-verify.sh` tiga kasus (gerbang izin L0–L3).
-6. Pengikatan harness: setel `agents.entries.*.runtime.acp.agent` + `allowedAgents`
-   terbatas; buktikan routing hidup (kegagalan yang menyebut harness yang benar)
-   dengan kredensial valid.
-7. AgentOS: buat/ubah agen dari UI AgentOS; pastikan tulisannya tidak menumbuhkan
-   kembali `agents.list`; halaman Semanggi terbuka terautentikasi.
-
-Fase 5 — setelah stabil:
-- `openclaw update cleanup --dry-run` dulu, baru buang arsip original migrasi
-  (menyimpan ruang; melepas hak rollback — kesengajaan, bukan kebetulan).
-
-Rollback: `docker service rollback` mengembalikan image, **bukan state**. Karena sesi
-sudah dimigrasikan ke SQLite (bahkan sebelum POC ini), turun ke 7.1 kembali berarti
-kebutaan riwayat — keadaan hari ini. Jalur pulih yang sebenarnya: scale 0, restore
-state dari backup fase 0, kembalikan tag lama, naikkan lagi. Jangan pernah dua
-gateway terhadap satu state root (kontrak POC-1).
-
-## 8. Perkiraan effort
-
-| Tahap | Isi | Perkiraan |
+| Kriteria | Status | Bukti |
 |---|---|---|
-| Prasyarat + backup | token harness, backup + uji restore | 0,5 hari |
-| Adapter controller + tes regresi | §4 penuh | 1–1,5 hari |
-| Build + lab + deploy | image 8.2, doctor, consent, distribusi | 0,5–1 hari |
-| Verifikasi kontrak | dispatch, transkrip, usage, probe level, gerbang izin | 1 hari |
-| AgentOS | validasi tulis config bentuk baru, rebuild bila perlu | 0,5–2 hari |
-| Pengikatan harness + katalog Brain | alias runtime.acp.agent, allowedAgents, uji routing | 0,5 hari |
-| **Total** | | **4–6,5 hari kerja** |
+| Image gateway 8.2 dibangun | LULUS | semanggi/openclaw-gateway:poc5-20260907 |
+| Backup dapat dipulihkan | LULUS | restore + integrity check SQLite |
+| Config/state dapat dimigrasikan | LULUS | doctor selesai, gateway healthy |
+| Semua agen bertahan | LULUS | 17 entri |
+| Kontrak controller dasar | LULUS | protocol 4, 372 metode, create/delete |
+| AgentOS memahami config 8.2 | LULUS | patch dual-format + 103/103 test |
+| Plugin resmi | LULUS | acpx/groq/zai/cerebras + consent |
+| OAuth harness | LULUS | POC5-AUTH-OK |
+| Permission bridge | LULUS | auto/approve/reject |
+| Matrix administratif penuh | BERSYARAT | ulangi dengan device identity berscope |
+| Upgrade gateway produksi | BELUM | sengaja di luar POC lab |
 
-Bandingkan 6.11→7.1 (5,5–8 hari): lompatan kontraknya lebih besar, tetapi kali ini
-ada lab yang terbukti, negosiasi metode sudah ada di adapter, dan state sudah
-setengah jalan termigrasi.
+**Vonis:** POC-5 lulus bersyarat. Tidak ditemukan blocker pada skema agen,
+handshake, dispatch dasar, plugin, OAuth, atau permission bridge.
 
-## 9. Rekomendasi
+## 8. Runbook rollout produksi
 
-1. **Lanjutkan ke 8.2 sebagai pekerjaan tersendiri** — bukan karena fitur, tapi karena
-   state produksi sudah disentuh 8.1 dan riwayat sesi saat ini terkunci dari gateway
-   yang berjalan. Menunda tidak menjaga status quo; status quo-nya sudah retak.
-2. Selesaikan dulu prasyarat token harness (sudah menjadi butir tersendiri di
-   readiness.md sejak D34) — tanpa itu, verifikasi gerbang izin dan routing harness
-   sama-sama buta.
-3. Kerjakan adapter controller sebagai PR terpisah yang lulus 324+ test terhadap
-   kontrak 8.2 **sebelum** jendela deploy, supaya jendela itu hanya berisi infrastruktur.
-4. Jangan mengadopsi `sessions.fork`/`sessions.rewind`/`sessions.compaction.branch`
-   dalam pekerjaan ini — catat sebagai kandidat pekerjaan lanjutan (menutup batasan
-   FORK), agar upgrade tetap satu-ubahannya.
+### Fase 0 — sebelum perubahan
 
-## Lampiran A — jejak eksekusi lab (ringkas)
+1. Pastikan tidak ada task DISPATCHED/RUNNING dan execution aktif.
+2. Rekam digest image dan status service.
+3. Buat snapshot state/config/secrets serta backup SQLite; uji restore.
+4. Pertahankan 214 JSONL dan 5 SQLite; jangan cleanup migrasi.
+5. Verifikasi scope device AgentOS untuk operasi yang benar-benar digunakan.
 
-```
-lab    : docker run ghcr.io/openclaw/openclaw:2026.8.2 (state salinan, npm RO, port 18790)
-boot-1 : ditolak — meta.lastTouchedAt; agents.ownership; audit-events-v2
-doctor : list→entries (5 agen), ownership=explicit, v10–v15+48, registry bersih
-consent: plugins enable acpx|zai|groq --accept-capabilities → ready, 15 plugins
-hello  : protocol 4, 372 metode, scopes [operator.admin] (device identity lama diterima)
-probe  : prompt→message; idempotencyKey wajib; deliver boolean; workspaceDir ditolak;
-         id→agentId; runtime/agentRuntime ditolak di agents.create/update;
-         config.set/patch→raw; agent{claude-opus}→unknown agent id;
-         main.runtime=acp tidak mengubah dispatch; sessions_spawn bukan RPC
-cli    : openclaw config set/get bekerja; `openclaw acp` (bridge) kini subcommand resmi
-```
+### Fase 1 — deploy
 
-Probe lengkap: `/tmp/kilo/poc5-probe/{probe,enforce,route}.mjs` (berjalan di dalam
-container image 8.2, memakai `device-identity.mjs` controller apa adanya).
+1. Gunakan image POC atau rebuild reproducibly dari 2026.8.2.
+2. Gunakan update order stop-first.
+3. Jalankan doctor --fix hanya bila gateway memintanya.
+4. Berikan consent hanya kepada plugin yang disetujui.
+5. Pastikan task service baru Running dan tidak diam-diam rollback.
+
+### Fase 2 — smoke test
+
+1. Health/readiness, log, pairing device, dan secrets audit.
+2. AgentOS: tampilkan 17 agen; create/update/delete agen uji; pastikan config tetap
+   agents.entries dan tidak menumbuhkan agents.list.
+3. Controller: satu task kecil sampai COMPLETE; periksa lifecycle, usage, dan
+   transkrip dua sisi.
+4. Ulangi compatibility matrix dengan device identity AgentOS.
+5. Ulangi permission bridge tiga kasus.
+6. Periksa pembacaan riwayat SQLite dan keberadaan JSONL legacy.
+
+### Fase 3 — observasi dan cleanup
+
+Amati transaksi SQLite lambat, error provider/plugin, usage, lifecycle, dan restart.
+Cleanup arsip migrasi hanya sesudah masa rollback ditutup dan harus diawali dry-run.
+
+### Rollback
+
+Rollback image saja tidak cukup. Jalur aman:
+
+1. scale gateway ke 0;
+2. pulihkan state/config dari snapshot teruji;
+3. kembalikan image 2026.7.1;
+4. scale naik dan verifikasi health serta visibilitas sesi.
+
+Rollback AgentOS 0.7.7 juga harus memulihkan instance-protection.json versi yang
+cocok sesuai POC-7; rollback source saja dapat mengunci login.
+
+## 9. Artefak
+
+~~~text
+snapshot lab     /root/poc5-20260907/snapshot
+state lab        /root/poc5-20260907/lab
+gateway lab      poc5-gateway-20260907
+image POC        semanggi/openclaw-gateway:poc5-20260907
+AgentOS fork     /root/agentos-fork
+patch commit     5f7357db
+~~~
+
+File AgentOS yang membawa perubahan POC-5:
+
+~~~text
+lib/openclaw/domains/agent-config.ts
+lib/openclaw/client/native-ws-gateway-client.ts
+tests/openclaw-agent-config.test.ts
+tests/openclaw-native-ws-gateway-client.test.ts
+tests/openclaw-boundary-safety.test.ts
+~~~

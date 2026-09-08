@@ -206,10 +206,11 @@ export function createAgentRegistry({ runtime, ttlMs = 30_000, now = () => Date.
     // memang tidak akan pernah ada dan mengirim operator mencari hal yang
     // salah; yang sebenarnya kurang adalah agen bernama `acpAgent`.
     const effort = candidate?.thinking ? ` at thinking="${candidate.thinking}"` : "";
+    // Frasa disusun agar tetap wajar di dalam template `no ${want} for …`.
     const want = isHarnessRouted(candidate)
       ? acpAgentOf(candidate)
-        ? `the ACP harness agent "${acpAgentOf(candidate)}" this Brain pins`
-        : "an ACP harness agent (this Brain pins none — set acpAgent on it)"
+        ? `live ACP harness agent named "${acpAgentOf(candidate)}" (pinned by this Brain)`
+        : "ACP harness agent — this Brain pins none, set acpAgent on it"
       : ignoreModel
         ? "any agent"
         : `an agent providing ${modelKey(candidate.provider, candidate.model)}${effort}`;

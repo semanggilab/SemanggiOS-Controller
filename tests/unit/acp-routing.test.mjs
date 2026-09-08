@@ -95,6 +95,9 @@ test("D85: kegagalan menyebut nama agen ACP, bukan model yang tidak akan pernah 
     () => registry.resolveOrThrow({ workspacePath: WS, candidate: harnessCandidate(), ignoreModel: false }),
     (err) => {
       assert.match(err.message, /claude-opus/, "pesan MUST menyebut agen ACP yang dicari");
+      // Pesan operator dibaca saat sesuatu sedang salah; tata bahasanya
+      // bagian dari kejelasannya.
+      assert.ok(!/\bno the\b/.test(err.message), `frasa janggal "no the ...": ${err.message}`);
       assert.ok(
         !/providing claude-code\/claude-code/.test(err.message),
         "MUST TIDAK menyuruh operator mencari agen bermodel claude-code/claude-code — model itu tidak akan pernah ada",

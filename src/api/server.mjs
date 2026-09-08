@@ -1412,10 +1412,14 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   // di sini: Brain adalah endpoint routing (model + thinking + mode), bukan
   // fakta model, dan grain-nya memang berbeda.
   route("GET", "/api/work/model-map", async () => {
-    const [resources, levels, brainsList] = await Promise.all([
+    const [resources, levels, brainsList, gwModels] = await Promise.all([
       repos.resources.list(),
       controller.thinkingLevels.list(),
       controller.brains.list(),
+      // Cache, bukan gateway: sebuah page load bukan alasan membayar RPC
+      // (aturan yang sama dengan GET /gateway/models). "Refresh Models"
+      // adalah satu-satunya jalur yang benar-benar bertanya.
+      controller.gatewayModels?.list?.().catch(() => []) ?? [],
     ]);
     const catalog = controller.policy.catalogEntries();
     // `deleteBlockers` ikut per baris (D67) supaya UI tidak perlu menebak
@@ -1423,7 +1427,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     // fakta server, dan menghitungnya ulang di klien adalah tempat
     // keduanya diam-diam berbeda pendapat.
     const rows = [];
-    for (const row of mergeModelMap(resources, levels)) {
+    for (const row of mergeModelMap(resources, levels, gwModels)) {
       const active = await repos.resources.activeCount(row.provider, row.model);
       rows.push({ ...row, deleteBlockers: modelDeleteBlockers(row, catalog, controller.seedResources ?? [], brainsList, active) });
     }
@@ -2425,7 +2429,12 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
 
   route("POST", "/api/work/gateway/models/refresh", async () => {
     const live = await controller.runtime?.listModels?.().catch(() => []) ?? [];
-    const models = await controller.gatewayModels?.replaceAll?.(live) ?? live;
+    // D84: dua RPC, satu baris cache. contextWindow/maxTokens TIDAK ada di
+    // models.list (diukur live di 2026.8.2) — keduanya datang dari config.get.
+    // Kegagalan sisi batas tidak boleh menjatuhkan refresh daftar model, jadi
+    // ia jatuh ke daftar kosong dan kolomnya tinggal NULL.
+    const limits = await controller.runtime?.modelLimits?.().catch(() => []) ?? [];
+    const models = await controller.gatewayModels?.replaceAll?.(live, limits) ?? live;
     log.info("gateway-models.refreshed", { count: models.length });
     return { models };
   });

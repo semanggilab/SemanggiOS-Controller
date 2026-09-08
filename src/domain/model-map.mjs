@@ -25,7 +25,7 @@
  *   (sudah presented: levels/effortMode/evidence/updatedAt).
  * @returns {Array<object>} baris Model Map, terurut provider lalu model.
  */
-export function mergeModelMap(resources, thinkingLevels) {
+export function mergeModelMap(resources, thinkingLevels, gatewayModels = []) {
   const key = (provider, model) =>
     `${String(provider ?? "").trim().toLowerCase()}/${String(model ?? "").trim().toLowerCase()}`;
 
@@ -68,8 +68,22 @@ export function mergeModelMap(resources, thinkingLevels) {
     if (!row.sources.includes("thinking-levels")) row.sources.push("thinking-levels");
   }
 
+  // D84: batas per model dari cache gateway. Baris BARU tidak dibuat dari
+  // sini — sebuah model yang diiklankan gateway tetapi tidak punya baris
+  // resource maupun thinking-levels bukan baris Model Map; menampilkannya
+  // akan membuat halaman ini mengklaim kebijakan yang tidak pernah ada.
+  // Yang ditempelkan hanyalah angka pada baris yang memang sudah berdiri.
+  for (const g of gatewayModels ?? []) {
+    const row = byKey.get(key(g?.provider, g?.id ?? g?.model));
+    if (!row) continue;
+    row.contextWindow = g.contextWindow ?? null;
+    row.maxTokens = g.maxTokens ?? null;
+  }
+
   return [...byKey.values()]
     .map((row) => ({
+      contextWindow: null,
+      maxTokens: null,
       creditClass: null,
       concurrencyLimit: null,
       quotaPolicy: null,

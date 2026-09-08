@@ -288,3 +288,47 @@ test("DELETE model-map menghapus KEDUA sisi + event, dan menolak baris yang diru
     await api.close();
   }
 });
+
+// --- D84: contextWindow/maxTokens dari cache gateway ---------------------------
+//
+// Angka batas per model TIDAK ada di models.list — diukur live di 2026.8.2,
+// satu entri berisi persis {id, provider, name, reasoning, available}. Ia
+// datang dari config.get, disimpan di baris cache yang sama, dan ditempelkan
+// ke baris Model Map yang SUDAH berdiri. Yang dipaku di sini adalah batas
+// itu: sebuah model yang diiklankan gateway tetapi tanpa resource maupun
+// thinking-levels bukan baris Model Map, dan menempelkannya akan membuat
+// halaman ini mengklaim kebijakan yang tidak pernah ada.
+
+test("D84: batas gateway menempel pada baris yang ada, tidak membuat baris baru", () => {
+  const rows = mergeModelMap(
+    [{ provider: "zai", model: "glm-5.2", credit_class: "paid", concurrency_limit: 2 }],
+    [{ provider: "zai", model: "glm-5.2", levels: ["off", "high"], effortMode: "guaranteed", updatedAt: 1 }],
+    [
+      { provider: "zai", id: "glm-5.2", contextWindow: 200000, maxTokens: 8192 },
+      // Diiklankan gateway, tetapi tidak punya baris di kedua tabel Model Map.
+      { provider: "mistral-custom", id: "voxtral-mini-tts-latest", contextWindow: 32000, maxTokens: 4096 },
+    ],
+  );
+  assert.equal(rows.length, 1, "baris hanya lahir dari resources/thinking-levels, bukan dari cache gateway");
+  assert.equal(rows[0].contextWindow, 200000);
+  assert.equal(rows[0].maxTokens, 8192);
+});
+
+test("D84: baris tanpa padanan di cache tetap tampil dengan batas null", () => {
+  const rows = mergeModelMap(
+    [{ provider: "google", model: "gemini-3.1-flash-lite" }],
+    [],
+    [{ provider: "zai", id: "glm-5.2", contextWindow: 200000, maxTokens: 8192 }],
+  );
+  assert.equal(rows.length, 1);
+  // null, bukan 0: "gateway tidak melaporkannya" dan "nol" adalah dua jawaban
+  // berbeda, dan 0 di kolom context window terbaca sebagai model yang lumpuh.
+  assert.equal(rows[0].contextWindow, null);
+  assert.equal(rows[0].maxTokens, null);
+});
+
+test("D84: pemanggil lama (dua argumen) tidak berubah perilaku", () => {
+  const rows = mergeModelMap([{ provider: "zai", model: "glm-5.2" }], []);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].contextWindow, null);
+});

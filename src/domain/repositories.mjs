@@ -9,7 +9,7 @@ import {
   isExecutionTerminal,
 } from "./state-machine.mjs";
 import { PROFILES } from "./brains.mjs";
-import { isQuotaErrorMessage } from "./quota-windows.mjs";
+import { isQuotaErrorMessage, quotaAnchorFallbackMs } from "./quota-windows.mjs";
 import { nullLogger } from "./logger.mjs";
 
 /**
@@ -1212,13 +1212,24 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       // let them through and a Gemini wall never became a scheduling fact.
       const is429 = status === 429 || isQuotaErrorMessage(message);
       if (!is429) return resources.get(provider, model);
+      // D84: the final `?? now() + quotaAnchorFallbackMs(provider)` is the
+      // wedge fix. OpenClaw 2026.8.2 refusals arrive as text with no
+      // resetsAt/retryAfter ("Usage limit reached for 5 hour. Your limit
+      // will reset at …"), and a QUOTA_EXHAUSTED row with a NULL clock is
+      // NEVER released by the scheduler's window pass — glm-5.2 sat exhausted
+      // for hours after recovering (measured 2026-09-08). A clockless signal
+      // is now priced at the provider's LONG window from the hit (the same
+      // conservative call D63 makes for clockless ETAs — the message does not
+      // say WHICH window drained). The recovery probe (quota-recovery.mjs)
+      // bounds that conservatism to its cadence: reality is re-measured, and
+      // a probe failure never extends a live anchor.
       const at = resetsAt
         ? resetsAt < 1e12
           ? resetsAt * 1000 // provider sends epoch seconds
           : resetsAt
         : retryAfterSeconds
           ? now() + retryAfterSeconds * 1000
-          : null;
+          : now() + quotaAnchorFallbackMs(provider);
       return resources.setAvailability(provider, model, "QUOTA_EXHAUSTED", {
         nextAvailableAt: at,
         windowKind: rateLimitType,

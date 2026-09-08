@@ -10,6 +10,7 @@ import { nullLogger } from "./domain/logger.mjs";
 import { createOperators } from "./domain/operators.mjs";
 import { createBrains, brainsFromRoutingConfig } from "./domain/brains.mjs";
 import { createSandboxProvision } from "./domain/sandbox-provision.mjs";
+import { createQuotaRecovery } from "./domain/quota-recovery.mjs";
 import { createBrainMap } from "./domain/brain-map.mjs";
 import { createThinkingLevels } from "./domain/thinking-levels.mjs";
 import { createGatewayModelsCache } from "./domain/gateway-models.mjs";
@@ -93,6 +94,15 @@ export async function createController({
     log: log.child({ component: "sandbox-provision" }),
   });
   const admission = createAdmission({ repos, events, policy, brains, runtime, sandboxProvision, config, now, log: log.child({ component: "admission" }) });
+  // D84: probe pemulihan kuota — satu run minimal per model ter-exhaust per
+  // pass, mengukur "bisa digunakan" alih-alih menebak jangkar waktunya.
+  const quotaRecovery = createQuotaRecovery({
+    repos,
+    runtime,
+    config,
+    now,
+    log: log.child({ component: "quota-recovery" }),
+  });
   // D71: gateway hooks the watchdog needs (abortRun/describeSession). A holder
   // rather than direct functions because the session-event sink that owns the
   // describe→verdict mapping is built AFTER the controller (it needs
@@ -112,5 +122,5 @@ export async function createController({
   // (D67) harus tahu baris mana yang akan di-seed ulang pada boot berikutnya —
   // menghapus baris yang masih ada di seed adalah penghapusan yang tidak
   // pernah terjadi.
-  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, sandboxProvision, config, now, log, runtime, seedResources: resources };
+  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, sandboxProvision, quotaRecovery, config, now, log, runtime, seedResources: resources };
 }

@@ -56,7 +56,18 @@ export function createScheduler({ admission, repos, events = null, config = {}, 
     const released = [];
     for (const r of resources) {
       if (r.availability !== "QUOTA_EXHAUSTED") continue;
-      if (r.next_available_at == null || r.next_available_at > now()) continue;
+      // D84: a row with NO clock (pre-D84 signals whose text carried no
+      // resetsAt — glm-5.2 sat wedged exactly like this) is released rather
+      // than skipped: reality re-probes via the next dispatch, and a model
+      // that is genuinely still exhausted refuses again with a signal that
+      // NOW always carries an anchor. One flap cycle beats wedged forever.
+      if (r.next_available_at == null) {
+        await repos.resources.setAvailability(r.provider, r.model, "AVAILABLE", { source: "quota-no-clock" });
+        log.info("quota.no-clock-reset", { provider: r.provider, model: r.model });
+        released.push(`${r.provider}/${r.model}`);
+        continue;
+      }
+      if (r.next_available_at > now()) continue;
       await repos.resources.setAvailability(r.provider, r.model, "AVAILABLE", { source: "quota-window" });
       log.info("quota.window-reset", { provider: r.provider, model: r.model, windowKind: r.window_kind ?? null });
       released.push(`${r.provider}/${r.model}`);

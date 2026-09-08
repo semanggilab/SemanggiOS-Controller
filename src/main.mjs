@@ -280,9 +280,33 @@ async function main() {
     sandboxKeeperTimer.unref?.();
   }
 
+  // D84: probe pemulihan kuota — baris QUOTA_EXHAUSTED adalah TEBAKAN tentang
+  // kapan provider pulih; satu run minimal per model per pass mengukur
+  // kenyataannya dan melepas baris begitu model benar-benar bisa dipakai
+  // (terukur 2026-09-08: glm-5.2 pulih jauh sebelum jangkar 5 jamnya).
+  // Pemulihan memicu QUOTA_RESET supaya task yang parkir di WAIT_QUOTA
+  // langsung dievaluasi ulang. Matikan dengan SEMANGGI_QUOTA_PROBE=0.
+  const quotaProbeMs = Number(process.env.SEMANGGI_QUOTA_PROBE_MS ?? 10 * 60_000);
+  let quotaProbeTimer = null;
+  if (controller.quotaRecovery && quotaProbeMs > 0 && process.env.SEMANGGI_QUOTA_PROBE !== "0") {
+    quotaProbeTimer = setInterval(() => {
+      void controller.quotaRecovery
+        .run()
+        .then((out) => {
+          if (out.recovered.length > 0) {
+            log.info("quota-probe.recovered", { models: out.recovered });
+            return controller.scheduler.notify(WakeReason.QUOTA_RESET);
+          }
+        })
+        .catch((err) => log.warn("quota-probe.failed", { error: String(err.message ?? err) }));
+    }, quotaProbeMs);
+    quotaProbeTimer.unref?.();
+  }
+
   const shutdown = () => {
     clearInterval(reconcileTimer);
     if (sandboxKeeperTimer) clearInterval(sandboxKeeperTimer);
+    if (quotaProbeTimer) clearInterval(quotaProbeTimer);
     controller.scheduler.stop();
     void runtime.close?.();
     void agentos?.close?.();

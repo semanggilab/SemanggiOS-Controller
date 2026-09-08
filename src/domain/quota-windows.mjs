@@ -95,6 +95,31 @@ export function isRetryableWindow(shortMs) {
   return Number.isFinite(shortMs) && shortMs > 0 && shortMs < RETRYABLE_SHORT_WINDOW_MS;
 }
 
+/** Anchor default saat sinyal kuota TIDAK membawa jam (D84).
+ *
+ * OpenClaw 2026.8.2 mengirim penolakan kuota sebagai teks tanpa resetsAt;
+ * baris QUOTA_EXHAUSTED tanpa next_available_at tidak pernah dilepaskan pass
+ * jendela scheduler (terukur: glm-5.2 terjebak berjam-jam). Keluarga
+ * per-menit memakai jendela pendeknya sendiri; keluarga langganan memakai
+ * jendela PANJANG (keputusan yang sama dengan ETA clockless D63 — sinyal
+ * tanpa jam tidak menyebut jendela mana yang habis). Probe pemulihan
+ * (quota-recovery.mjs) membatasi biaya konservatisme itu ke ± kadensi probe,
+ * dan probe yang gagal tidak pernah memperpanjang jangkar hidup. Provider
+ * tak dikenal → 30 menit.
+ */
+export const NULL_CLOCK_FALLBACK_MS = 30 * 60_000;
+
+export function quotaAnchorFallbackMs(provider) {
+  const windows = QUOTA_WINDOWS_BY_PROVIDER[String(provider ?? "")];
+  if (!windows) return NULL_CLOCK_FALLBACK_MS;
+  // Jendela pendek seukuran retry adalah jamnya sendiri (D52: tembok yang
+  // hilang dalam hitungan menit ditunggu, bukan diprobe pada horizon harian);
+  // keluarga lain — sinyal tanpa jam tidak menyebut jendela MANA yang habis —
+  // memakai jendela PANJANG, dengan probe pemulihan membatasi
+  // konservatismenya.
+  return isRetryableWindow(windows.shortMs) ? windows.shortMs : windows.longMs;
+}
+
 const WINDOW_LABELS = new Map([
   [60_000, "per-minute"],
   [5 * 60_000, "5-minute"],

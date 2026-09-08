@@ -708,3 +708,45 @@ test("DELETE /api/work/brains/{id} is admin-only and names what it cleared", asy
     await api.close();
   }
 });
+
+test("fleet sandbox overview (D79): dedupe lintas brain, counts armada, filter status", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h); // worker.agent_ref = "doc-worker"
+  const b1 = await h.brains.create({ name: "glm-a", provider: "zai", model: "glm-5.2", level: Level.NORMAL });
+  await h.brains.create({ name: "glm-b", provider: "zai", model: "glm-5.2", level: Level.NORMAL });
+  // Dua brain sama provider+model — doc-worker memuaskan keduanya; kartu
+  // status yang menghitungnya dua kali berbohong.
+  h.runtime.listAgents = async () => [
+    { id: "doc-worker", model: { primary: "zai/glm-5.2" } },
+    { id: "sem-workspaces-probe-zai-glm-5-2", model: { primary: "zai/glm-5.2" } },
+  ];
+  const api = await startApi(h);
+  try {
+    const task = await queuedTask(h, { project, worker });
+    await h.repos.tasks.setStatus(task.id, Status.DISPATCHED);
+
+    const res = await api.call("GET", "/api/work/sandboxes");
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.counts, { total: 2, running: 1, idle: 1 });
+    const doc = res.body.sandboxes.find((s) => s.agentId === "doc-worker");
+    // Harness men-seed brain zai/glm-5.2 sendiri (glm-5-2-high) yang terurut
+    // sebelum "glm-a" — pemilik sah first-wins adalah brain PERTAMA dalam
+    // urutan list(), apa pun namanya.
+    const firstOwner = (await h.brains.list()).find((b) => b.provider === "zai" && b.model === "glm-5.2");
+    assert.equal(doc.brainId, firstOwner.id, "dedupe: milik brain pertama dalam urutan list()");
+    assert.equal(doc.brainName, firstOwner.name);
+    assert.equal(doc.status, "RUNNING");
+    assert.equal(doc.taskId, task.id);
+
+    const idle = await api.call("GET", "/api/work/sandboxes?status=IDLE");
+    assert.equal(idle.body.sandboxes.length, 1);
+    assert.equal(idle.body.sandboxes[0].agentId, "sem-workspaces-probe-zai-glm-5-2");
+    // Filter hanya memotong daftar; counts tetap bicara tentang armada penuh.
+    assert.deepEqual(idle.body.counts, { total: 2, running: 1, idle: 1 });
+
+    const bad = await api.call("GET", "/api/work/sandboxes?status=BOSAN");
+    assert.equal(bad.status, 400);
+  } finally {
+    await api.close();
+  }
+});

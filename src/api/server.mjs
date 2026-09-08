@@ -2747,13 +2747,28 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     return busy;
   }
 
-  route("GET", "/api/work/brains/{id}/sandboxes", async ({ id }) => {
-    const brain = await controller.brains.get(id);
-    if (!brain) throw notFound(`unknown brain ${id}`);
-    const live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
-    const agents = agentsForBrain(brain, live);
+  /** Baris sandbox D78/D79 dari satu agent live + dua peta atribusi.
+   *  Dipakai rute per-brain maupun overview armada — bentuk barisnya HARUS
+   *  identik karena UI merender keduanya dengan komponen yang sama. */
+  function sandboxRowFor(a, busy, lastByAgent) {
+    const agentId = String(a.id ?? "");
+    const active = busy.get(agentId) ?? null;
+    const last = active ?? lastByAgent.get(agentId) ?? null;
+    return {
+      agentId,
+      name: a.name ?? agentId,
+      workspace: a.workspace ?? null,
+      status: active ? "RUNNING" : "IDLE",
+      projectId: last?.projectId ?? null,
+      taskId: last?.taskId ?? null,
+      probe: /^sem-workspaces-probe-/.test(agentId) || /^sem-workspaces-probe-/.test(String(a.name ?? "")),
+    };
+  }
+
+  /** Peta atribusi sekali jalan untuk semua brain: task hidup (RUNNING) dan
+   *  task terakhir per agent (IDLE). */
+  async function sandboxAttribution() {
     const busy = await busyAgentsByRef();
-    // Agent idle tetap layak atribusi: task terakhir yang pernah jalan di sana.
     const lastByAgent = new Map();
     for (const task of await repos.tasks.latestByWorker()) {
       const worker = task.worker_id ? await repos.workers.get(task.worker_id) : null;
@@ -2761,21 +2776,46 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         lastByAgent.set(worker.agent_ref, { taskId: task.id, projectId: task.project_id });
       }
     }
-    const sandboxes = agents.map((a) => {
-      const agentId = String(a.id ?? "");
-      const active = busy.get(agentId) ?? null;
-      const last = active ?? lastByAgent.get(agentId) ?? null;
-      return {
-        agentId,
-        name: a.name ?? agentId,
-        workspace: a.workspace ?? null,
-        status: active ? "RUNNING" : "IDLE",
-        projectId: last?.projectId ?? null,
-        taskId: last?.taskId ?? null,
-        probe: /^sem-workspaces-probe-/.test(agentId) || /^sem-workspaces-probe-/.test(String(a.name ?? "")),
-      };
-    });
+    return { busy, lastByAgent };
+  }
+
+  route("GET", "/api/work/brains/{id}/sandboxes", async ({ id }) => {
+    const brain = await controller.brains.get(id);
+    if (!brain) throw notFound(`unknown brain ${id}`);
+    const live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+    const { busy, lastByAgent } = await sandboxAttribution();
+    const sandboxes = agentsForBrain(brain, live).map((a) => sandboxRowFor(a, busy, lastByAgent));
     return { brain: { id: brain.id, name: brain.name, provider: brain.provider, model: brain.model }, sandboxes };
+  });
+
+  // D79: overview armada untuk kartu status halaman Brain — Total/Running/Idle
+  // lintas brain. Satu agent bisa memuaskan DUA brain (provider+model sama);
+  // kartu yang menghitungnya dua kali berbohong, jadi armada MENGDEDUPE per
+  // agentId first-wins (brain pertama dalam urutan list yang memilikinya).
+  // Daftar per-brain (rute atas) TIDAK dedupe — keanggotaan per brain adalah
+  // kebenaran tersendiri di Process Manager brain itu.
+  route("GET", "/api/work/sandboxes", async (_p, _b, query) => {
+    const raw = (query.get("status") ?? "").trim().toUpperCase();
+    if (raw && raw !== "RUNNING" && raw !== "IDLE") {
+      throw badRequest(`status must be RUNNING or IDLE, got "${raw}"`);
+    }
+    const live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+    const { busy, lastByAgent } = await sandboxAttribution();
+    const seen = new Set();
+    const all = [];
+    for (const brain of await controller.brains.list()) {
+      for (const a of agentsForBrain(brain, live)) {
+        const agentId = String(a.id ?? "");
+        if (seen.has(agentId)) continue;
+        seen.add(agentId);
+        all.push({ ...sandboxRowFor(a, busy, lastByAgent), brainId: brain.id, brainName: brain.name });
+      }
+    }
+    const running = all.filter((row) => row.status === "RUNNING").length;
+    return {
+      counts: { total: all.length, running, idle: all.length - running },
+      sandboxes: raw ? all.filter((row) => row.status === raw) : all,
+    };
   });
 
   // Membuat satu sandbox KOSONG untuk brain ini: agents.create dengan model

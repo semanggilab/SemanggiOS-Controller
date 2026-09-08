@@ -536,6 +536,59 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
     /// an orchestrator agent with the name riding in the instruction. This
     /// list is therefore the only gateway-side answer to "does this harness
     /// agent exist".
+    /**
+     * Batas per model — `contextWindow` dan `maxTokens` — dari config gateway.
+     *
+     * BUKAN dari `models.list`. Diukur live di 2026.8.2: satu entri models.list
+     * berisi persis {id, provider, name, reasoning, available}; tidak ada satu
+     * pun angka batas di dalamnya, dan halaman yang menampilkannya dari sana
+     * akan selalu kosong tanpa pernah menyebut kenapa (aturan 4 §4.1 — kontrak
+     * ini diverifikasi dengan mengirim permintaan, bukan dibaca dari dist).
+     *
+     * Dua cabang payload dibaca, `resolved` lebih dulu: `config` adalah apa
+     * yang TERTULIS di openclaw.json, sedangkan `resolved` adalah nilai
+     * EFEKTIF setelah katalog bawaan digabungkan — dan yang menentukan
+     * perilaku run adalah yang efektif. glm-5.1 memperlihatkan bedanya: tidak
+     * menyetel maxTokens sama sekali di file, tetapi berjalan pada 131072 dari
+     * katalog. Menampilkan `config` saja akan melaporkan "tidak diketahui"
+     * untuk model yang batasnya justru diketahui persis.
+     */
+    async modelLimits() {
+      await connect();
+      if (!hello?.features?.methods?.includes("config.get")) return [];
+      try {
+        const payload = await request("config.get", {});
+        const limitsFrom = (snapshot) => {
+          const providers = snapshot?.models?.providers;
+          if (!providers || typeof providers !== "object" || Array.isArray(providers)) return [];
+          const out = [];
+          for (const [provider, entry] of Object.entries(providers)) {
+            // Default provider-level berlaku untuk model yang tidak menyetel
+            // sendiri — aturan yang dinyatakan skema openclaw.json, ditiru di
+            // sini supaya angka yang ditampilkan sama dengan yang dipakai.
+            const fallback = entry?.maxTokens;
+            for (const m of Array.isArray(entry?.models) ? entry.models : []) {
+              if (!m?.id) continue;
+              out.push({
+                provider,
+                model: m.id,
+                contextWindow: m.contextWindow ?? null,
+                maxTokens: m.maxTokens ?? fallback ?? null,
+              });
+            }
+          }
+          return out;
+        };
+        const resolved = limitsFrom(payload?.resolved);
+        return resolved.length > 0 ? resolved : limitsFrom(payload?.config);
+      } catch (err) {
+        // Kegagalan di sini hanya mengosongkan dua kolom tampilan; ia tidak
+        // boleh menjatuhkan "Refresh Models" yang tugas utamanya daftar model.
+        log.warn("gateway.model-limits-failed", { error: String(err?.message ?? err).slice(0, 200) });
+        return [];
+      }
+    },
+
     async listAcpAgents() {
       await connect();
       if (!hello?.features?.methods?.includes("config.get")) return null;

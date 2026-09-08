@@ -492,6 +492,11 @@ CREATE TABLE IF NOT EXISTS gateway_models (
   name       TEXT,
   reasoning  INTEGER NOT NULL DEFAULT 0,
   available  INTEGER NOT NULL DEFAULT 1,
+  -- D84: batas per model, dari config.get — models.list tidak membawanya
+  -- (diukur live di 2026.8.2). NULL = gateway tidak melaporkannya; itu
+  -- jawaban yang berbeda dari nol.
+  context_window INTEGER,
+  max_tokens     INTEGER,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (provider, model)
 );

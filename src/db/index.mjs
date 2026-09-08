@@ -122,6 +122,16 @@ class SqliteStore {
       this.#db.exec(`ALTER TABLE brains ADD COLUMN min_sandboxes INTEGER NOT NULL DEFAULT 0`);
     }
 
+    // D84: contextWindow/maxTokens per model di cache gateway. Tidak ada
+    // backfill: nilainya hanya diketahui gateway, dan "Refresh Models"
+    // berikutnya yang mengisinya. NULL sampai saat itu adalah jawaban jujur —
+    // menebaknya di sini akan menampilkan angka yang tidak pernah diukur.
+    const gwCols = cols("gateway_models");
+    if (gwCols.length > 0 && !gwCols.includes("context_window")) {
+      this.#db.exec(`ALTER TABLE gateway_models ADD COLUMN context_window INTEGER`);
+      this.#db.exec(`ALTER TABLE gateway_models ADD COLUMN max_tokens INTEGER`);
+    }
+
     // D51: penghitung retry kuota jendela pendek. Default 0: task warisan
     // belum pernah gagal karenanya.
     if (taskCols.length > 0 && !taskCols.includes("quota_retries")) {

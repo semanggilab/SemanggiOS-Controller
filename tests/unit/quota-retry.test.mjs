@@ -5,7 +5,7 @@
 // recorded the resource signal, so the next task hit the same wall blind.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildHarness, seedBasics, queuedTask } from "../helpers/harness.mjs";
+import { buildHarness, seedBasics, queuedTask, Clock } from "../helpers/harness.mjs";
 import { createSessionEventSink } from "../../src/runtime/session-events.mjs";
 import {
   QUOTA_RETRY_LIMIT,
@@ -16,6 +16,7 @@ import {
   isRetryableWindow,
   isTransientRuntimeError,
   parseQuotaReset,
+  parseUsageLimitReset,
   resourceRetryBackoffMs,
 } from "../../src/domain/quota-windows.mjs";
 import { Status, ExecutionStatus } from "../../src/domain/state-machine.mjs";
@@ -396,4 +397,116 @@ test("a clockless dispatch refusal on a long window parks at the driver's long E
   // hiccup. The zai driver prices the LONG window: no cycle anchor known, so
   // the conservative full window from now.
   assert.equal(parked.next_retry_at, h.clock.now() + 7 * 24 * 3_600_000, "the driver's long window is the clock");
+});
+
+// --- D87: reset clock parsed out of the 8.2 refusal text ---------------------
+
+test("parseUsageLimitReset resolves the harness wall clock's zone with its own window (D87)", () => {
+  // event_log seq 123115, terukur 2026-09-08: penolakan ZAI. Dibaca sebagai
+  // UTC delta-nya 11.37 jam — di luar jendela 5 jam; harness host mencetak
+  // UTC+7 (delta 4.37 jam). Jendelanya sendiri yang memilih zonanya.
+  const ev1 = parseUsageLimitReset(
+    "⚠️ Usage limit reached for 5 hour. Your limit will reset at 2026-09-09 03:34:02",
+    Date.parse("2026-09-08T16:12:01.027Z"),
+  );
+  assert.equal(ev1.resetMs, Date.parse("2026-09-08T20:34:02Z"));
+  assert.equal(ev1.offsetMs, 7 * 3_600_000);
+  assert.equal(ev1.windowMs, 5 * 3_600_000);
+  assert.equal(ev1.windowKind, "5_hour");
+
+  // event_log seq 116639, sumber kedua yang independen: offset yang sama.
+  const ev2 = parseUsageLimitReset(
+    "⚠️ Usage limit reached for 5 hour. Your limit will reset at 2026-09-08 22:17:50",
+    Date.parse("2026-09-08T13:11:24.152Z"),
+  );
+  assert.equal(ev2.resetMs, Date.parse("2026-09-08T15:17:50Z"));
+  assert.equal(ev2.offsetMs, 7 * 3_600_000);
+});
+
+test("a wall clock that already reads UTC is taken as UTC (D87)", () => {
+  const ev = parseUsageLimitReset(
+    "Usage limit reached for 5 hour. Your limit will reset at 2026-09-08 13:00:00",
+    Date.parse("2026-09-08T10:00:00Z"),
+  );
+  assert.equal(ev.resetMs, Date.parse("2026-09-08T13:00:00Z"));
+  assert.equal(ev.offsetMs, 0);
+});
+
+test("an unresolvable clock is discarded but the window survives (D87)", () => {
+  // Jam dinding 35 jam di depan untuk jendela 5 jam: tidak ada zona yang
+  // masuk akal — teks ini bukan jam provider ini (pelajaran salah-rute D85).
+  const ev = parseUsageLimitReset(
+    "Usage limit reached for 5 hour. Your limit will reset at 2026-09-10 03:34:02",
+    Date.parse("2026-09-08T16:12:01Z"),
+  );
+  assert.equal(ev.resetMs, null);
+  assert.equal(ev.windowMs, 5 * 3_600_000);
+  assert.equal(ev.windowKind, "5_hour");
+  assert.equal(ev.offsetMs, null);
+});
+
+test("the POC-3 explicit-UTC session-limit clock needs no disambiguation (D87)", () => {
+  // Terukur POC-3 E8: "You've hit your session limit · resets 9:40am (UTC)".
+  const morning = parseUsageLimitReset(
+    "You've hit your session limit · resets 9:40am (UTC)",
+    Date.parse("2026-09-08T03:00:00Z"),
+  );
+  assert.equal(morning.resetMs, Date.parse("2026-09-08T09:40:00Z"));
+  assert.equal(morning.offsetMs, 0);
+  // Jam itu sudah lewat hari ini → besok (24-jam tanpa am/pm juga diterima).
+  const evening = parseUsageLimitReset(
+    "You've hit your session limit · resets 14:22 (UTC)",
+    Date.parse("2026-09-08T15:00:00Z"),
+  );
+  assert.equal(evening.resetMs, Date.parse("2026-09-09T14:22:00Z"));
+});
+
+test("clock-less refusals parse to nothing (D87)", () => {
+  // Bentuk google yang terukur (FailoverError): tanpa jam, tanpa jendela.
+  assert.equal(
+    parseUsageLimitReset("FailoverError: ⚠️ API rate limit reached. Please try again later.", 1e15),
+    null,
+  );
+  assert.equal(parseUsageLimitReset("quota exceeded", 1e15), null);
+  assert.equal(parseUsageLimitReset(null, 1e15), null);
+});
+
+test("applyQuotaSignal anchors the parsed wall clock, not the 7-day family window (D87)", async () => {
+  const clock = new Clock(Date.parse("2026-09-08T16:12:01Z"));
+  const h = await buildHarness({ clock });
+  await seedBasics(h);
+  // Jam dinding naif 9 jam di depan clock: 2 jam nyata + offset cetak UTC+7.
+  const naive = new Date(clock.now() + 9 * 3_600_000).toISOString().slice(0, 19).replace("T", " ");
+  await h.repos.resources.applyQuotaSignal("zai", "glm-4.7", {
+    status: 429,
+    message: `⚠️ Usage limit reached for 5 hour. Your limit will reset at ${naive}`,
+  });
+  const row = await h.repos.resources.get("zai", "glm-4.7");
+  assert.equal(row.availability, "QUOTA_EXHAUSTED");
+  // D84 would have anchored 7 days; the parsed clock says 2 hours.
+  assert.equal(row.next_available_at, clock.now() + 2 * 3_600_000);
+  assert.equal(row.window_kind, "5_hour");
+  // Baris ini dilepaskan oleh pass jendela pada jam itu — bukan menunggu
+  // probe pemulihan menyembuhkan jangkar 7-hari yang terlalu konservatif.
+  clock.advance(2 * 3_600_000 + 1);
+  await h.scheduler.notify();
+  const released = await h.repos.resources.get("zai", "glm-4.7");
+  assert.equal(released.availability, "AVAILABLE");
+});
+
+test("applyQuotaSignal keeps the D84 family fallbacks for text without a usable clock (D87)", async () => {
+  const h = await buildHarness();
+  await seedBasics(h);
+  // Bentuk google yang terukur: keluarga per-menit → satu menit (D84).
+  await h.repos.resources.applyQuotaSignal("google", "gemini-flash", {
+    status: 429,
+    message: "FailoverError: ⚠️ API rate limit reached. Please try again later.",
+  });
+  let row = await h.repos.resources.get("google", "gemini-flash");
+  assert.equal(row.next_available_at, h.now() + 60_000);
+  assert.equal(row.window_kind, null);
+  // Teks kuota tanpa jam sama sekali: jendela panjang keluarga (D84).
+  await h.repos.resources.applyQuotaSignal("zai", "glm-4.7", { status: 429, message: "quota exceeded" });
+  row = await h.repos.resources.get("zai", "glm-4.7");
+  assert.equal(row.next_available_at, h.now() + 7 * 24 * 3_600_000);
 });

@@ -9,7 +9,7 @@ import {
   isExecutionTerminal,
 } from "./state-machine.mjs";
 import { PROFILES } from "./brains.mjs";
-import { isQuotaErrorMessage, quotaAnchorFallbackMs } from "./quota-windows.mjs";
+import { isQuotaErrorMessage, parseUsageLimitReset, quotaAnchorFallbackMs } from "./quota-windows.mjs";
 import { nullLogger } from "./logger.mjs";
 
 /**
@@ -1212,6 +1212,13 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       // let them through and a Gemini wall never became a scheduling fact.
       const is429 = status === 429 || isQuotaErrorMessage(message);
       if (!is429) return resources.get(provider, model);
+      // D87: teks penolakan 8.2 yang membawa jam dinding + durasi jendela
+      // ("Usage limit reached for 5 hour. Your limit will reset at …")
+      // diselesaikan zonanya oleh jendelanya sendiri (lihat
+      // parseUsageLimitReset) — jam mentah lebih baik dari jendela panjang
+      // D84, dan jam yang gagal disambiguasi mundur ke rantai D84 di bawah.
+      // Prioritas tetap: resetsAt terstruktur > retryAfter > teks > keluarga.
+      const parsed = parseUsageLimitReset(message, now());
       // D84: the final `?? now() + quotaAnchorFallbackMs(provider)` is the
       // wedge fix. OpenClaw 2026.8.2 refusals arrive as text with no
       // resetsAt/retryAfter ("Usage limit reached for 5 hour. Your limit
@@ -1229,10 +1236,14 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           : resetsAt
         : retryAfterSeconds
           ? now() + retryAfterSeconds * 1000
-          : now() + quotaAnchorFallbackMs(provider);
+          : parsed?.resetMs
+            ? parsed.resetMs
+            : parsed?.windowMs
+              ? now() + parsed.windowMs
+              : now() + quotaAnchorFallbackMs(provider);
       return resources.setAvailability(provider, model, "QUOTA_EXHAUSTED", {
         nextAvailableAt: at,
-        windowKind: rateLimitType,
+        windowKind: rateLimitType ?? parsed?.windowKind ?? null,
         signal: message ? String(message).slice(0, 300) : null,
         source: "provider",
       });

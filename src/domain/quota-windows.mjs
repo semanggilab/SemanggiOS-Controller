@@ -90,6 +90,114 @@ export function parseQuotaReset(text) {
   return { resetsAt, rateLimitType };
 }
 
+/**
+ * D87: jam dari teks penolakan 8.2 yang MEMBAWA jam — hanya saja bukan jam
+ * yang bisa dibaca pembaca UTC.
+ *
+ * Terukur di cluster (event_log 2026-09-08, zai dan salah-rute D85):
+ *   "⚠️ Usage limit reached for 5 hour. Your limit will reset at 2026-09-09 03:34:02"
+ * Teks itu punya DUA fakta: durasi jendela ("for 5 hour") dan jam dinding
+ * reset TANPA zona. Harness mencetak waktu lokal hostnya (UTC+7 pada dua
+ * event terukur — delta 4.37j dan 2.11j, keduanya di dalam jendela 5 jam;
+ * dibaca sebagai UTC delta-nya 9–11 jam, di luar jendela). D84 menolak
+ * menebak dan menjangkarnya 7 hari; D87 menyelesaikan ambiguasinya dengan
+ * jendelanya sendiri: offset valid ⇔ 0 < (T − offset) − now ≤ jendela + slack.
+ * Jika tidak ada kandidat offset yang lolos, jam dibuang dan pemanggil
+ * memakai jangkar D84 (teks itu mungkin bukan milik provider ini — pelajaran
+ * salah-rute D85).
+ *
+ * Bentuk kedua (terukur POC-3 E8, langganan Claude):
+ *   "You've hit your session limit · resets 9:40am (UTC)"
+ * — jam eksplisit UTC tanpa tanggal; harinya adalah hari ini (atau besok
+ * bila sudah lewat). Zona eksplisit tidak butuh disambiguasi.
+ *
+ * Header terstruktur (anthropic-ratelimit-*-reset RFC 3339, x-ratelimit-reset-*
+ * Groq durasi Go, RetryInfo retryDelay Google) TIDAK diurai di sini: gateway
+ * 8.2 tidak pernah meneruskannya (terukur — penolakan tiba sebagai teks
+ * saja), jadi memparsenya berarti menguji kode yang tidak pernah berjalan.
+ * Riset per provider terdokumentasi di decisions.md D87.
+ */
+const WALL_CLOCK_UNITS_MS = { second: 1000, minute: 60_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000 };
+
+/** Slack untuk geser jam antar host (30 menit — dua event terukur muat 2–4.5j). */
+export const CLOCK_SKEW_SLACK_MS = 30 * 60_000;
+
+/** Kandidat offset zona (ms) teks lokal harness, urut kepercayaan. */
+const OFFSET_CANDIDATES_MS = [
+  0,
+  7 * 3_600_000,
+  8 * 3_600_000,
+  9 * 3_600_000,
+  5.5 * 3_600_000,
+  3_600_000,
+  -5 * 3_600_000,
+  -8 * 3_600_000,
+];
+
+function hostOffsetMs(nowMs) {
+  // getTimezoneOffset: menit yang harus DITAMBAH ke lokal untuk dapat UTC
+  // (UTC+7 → -420). Offset teks-lokal = kebalikannya.
+  return -new Date(nowMs).getTimezoneOffset() * 60_000;
+}
+
+export function parseUsageLimitReset(text, nowMs = Date.now()) {
+  const raw = String(text ?? "");
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+
+  // 1) Jam dinding eksplisit UTC (bentuk POC-3) — tidak ambigu.
+  const utcClock = raw.match(/resets?\s+(\d{1,2}):(\d{2})\s*(am|pm)?\s*\(UTC\)/i);
+  if (utcClock) {
+    const h12 = Number(utcClock[1]);
+    const pm = utcClock[3]?.toLowerCase() === "pm";
+    const am = utcClock[3]?.toLowerCase() === "am";
+    let hour = h12;
+    if (am) hour = h12 % 12; // 12am → 0
+    else if (pm) hour = (h12 % 12) + 12; // 12pm → 12
+    const minute = Number(utcClock[2]);
+    const today = new Date(now);
+    let reset = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), hour, minute);
+    if (reset <= now) reset += 86_400_000; // jam itu sudah lewat hari ini
+    return { resetMs: reset, windowMs: null, windowKind: null, offsetMs: 0 };
+  }
+
+  // 2) "Usage limit reached for N unit" + "reset at YYYY-MM-DD HH:MM:SS".
+  const windowMatch = raw.match(/usage limit reached for (\d+)\s*(second|minute|hour|day|week)s?\b/i);
+  const windowMs = windowMatch
+    ? Number(windowMatch[1]) * WALL_CLOCK_UNITS_MS[windowMatch[2].toLowerCase()]
+    : null;
+  if (!windowMs) return null;
+
+  const wall = raw.match(/reset(?:s|ling)?\s+(?:at|on)\s+(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/i);
+  if (wall) {
+    const asUtc = Date.UTC(
+      Number(wall[1]), Number(wall[2]) - 1, Number(wall[3]),
+      Number(wall[4]), Number(wall[5]), Number(wall[6]),
+    );
+    const candidates = [...new Set([0, hostOffsetMs(now), ...OFFSET_CANDIDATES_MS])];
+    for (const offset of candidates) {
+      const reset = asUtc - offset;
+      if (reset > now && reset - now <= windowMs + CLOCK_SKEW_SLACK_MS) {
+        return {
+          resetMs: reset,
+          windowMs,
+          windowKind: `${windowMatch[1]}_${windowMatch[2].toLowerCase()}`,
+          offsetMs: offset,
+        };
+      }
+    }
+  }
+
+  // 3) Jam tidak bisa dipercaya (atau tidak ada): jendelanya tetap fakta.
+  //    Pemanggil menjangkarnya now + windowMs — lebih murah hati dari
+  //    jendela panjang D84, dan probe pemulihan tetap membatasi kelewatnya.
+  return {
+    resetMs: null,
+    windowMs,
+    windowKind: `${windowMatch[1]}_${windowMatch[2].toLowerCase()}`,
+    offsetMs: null,
+  };
+}
+
 /** true bila jendela pendek Brain masuk kelas "retry in place" (< 10 menit). */
 export function isRetryableWindow(shortMs) {
   return Number.isFinite(shortMs) && shortMs > 0 && shortMs < RETRYABLE_SHORT_WINDOW_MS;

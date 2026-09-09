@@ -51,6 +51,36 @@ import { nullLogger } from "../domain/logger.mjs";
  * still report stopReason "stop", and treating a cancellation as success would
  * mark work complete that nobody finished.
  */
+/**
+ * Mengembalikan id execution dari `runId` sebuah frame lifecycle.
+ *
+ * Untuk run biasa, `runId` MEMANG id execution — itulah `idempotencyKey` yang
+ * dikirim dispatch, dan seluruh korelasi bergantung padanya.
+ *
+ * Sesi ACP (D88) memberi bentuk lain. Direkam verbatim dari gateway 2026.8.2
+ * sementara sebuah harness berjalan:
+ *
+ *   "runId": "announce:v1:agent:claude-opus:acp:ee1ba0d6-…:D88-FRAME-PROBE#1",
+ *   "sessionKey": "agent:sem-acp-owner:acp-rpc",
+ *   "data": { "phase": "end", "stopReason": "stop", "aborted": false }
+ *
+ * Id execution ada di ujung, di belakang kunci sesi anak. Tanpa dipotong,
+ * pencarian execution meleset dan run yang SUKSES terbaca sebagai kegagalan
+ * runtime — terukur pada TASK-3E222980: harness menulis berkasnya dengan benar,
+ * controller mencatat "run ended: unknown" lalu men-dispatch ulang. Retry itu
+ * bukan sekadar berisik; ia menjalankan pekerjaan Claude untuk kedua kalinya.
+ *
+ * Pemotongan sengaja hanya pada awalan `announce:v1:` dan hanya sampai titik
+ * dua TERAKHIR: id execution tidak pernah memuat titik dua, sedangkan kunci
+ * sesi selalu memuatnya.
+ */
+export function executionIdFromRunId(runId) {
+  const raw = String(runId ?? "");
+  if (!raw.startsWith("announce:v1:")) return runId ?? null;
+  const tail = raw.slice(raw.lastIndexOf(":") + 1);
+  return tail || null;
+}
+
 export function classifyRunEnd({ aborted, stopReason } = {}) {
   if (aborted) return { execution: ExecutionStatus.CANCELLED, task: Status.CANCELLED, reason: "aborted" };
   // Observed terminal reasons: "stop" is the clean one. Anything else — length
@@ -404,7 +434,7 @@ export function createSessionEventSink({
    * same silent wall — the TASK-E28D15F3/TASK-BFA56024 incident (D47).
    */
   async function applyLateError(payload) {
-    const runId = payload?.runId ?? null;
+    const runId = executionIdFromRunId(payload?.runId) ?? null;
     const message = payload?.error?.message ?? JSON.stringify(payload?.error ?? {});
     const execution = runId ? await repos.executions.get(runId) : null;
     if (!execution) {
@@ -787,7 +817,7 @@ export function createSessionEventSink({
    * `stop` arriving after a premature `length` must not find the row frozen.
    */
   async function onLifecycleEnd(payload) {
-    const runId = payload?.runId;
+    const runId = executionIdFromRunId(payload?.runId);
     const data = payload?.data ?? {};
     const verdict = classifyRunEnd(data);
     const immediate =
@@ -862,7 +892,8 @@ export function createSessionEventSink({
       // A `start` frame is the first sign of life a dispatched run can give;
       // it counts as activity exactly like a message (D71).
       if (payload?.data?.phase === "start") {
-        if (payload?.runId) await repos.executions.touch(payload.runId, payload.data?.startedAt ?? now());
+        const startedRunId = executionIdFromRunId(payload?.runId);
+        if (startedRunId) await repos.executions.touch(startedRunId, payload.data?.startedAt ?? now());
         return;
       }
       if (payload?.data?.phase !== "end") return;

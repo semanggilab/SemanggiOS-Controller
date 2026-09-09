@@ -193,3 +193,35 @@ test("D88: Brain biasa tidak berubah — tetap lewat agent.run", async () => {
   assert.ok(!sent.some((f) => f.method === "acp.spawn"));
   await rt.close();
 });
+
+// --- D88: korelasi frame akhir untuk sesi ACP --------------------------------
+//
+// Direkam verbatim dari gateway 2026.8.2 saat sebuah harness berjalan:
+//
+//   runId     : "announce:v1:agent:claude-opus:acp:ee1ba0d6-…:D88-FRAME-PROBE#1"
+//   sessionKey: "agent:sem-acp-owner:acp-rpc"
+//   data      : { phase: "end", stopReason: "stop", aborted: false }
+//
+// Untuk run biasa `runId` MEMANG id execution. Untuk ACP ia terbungkus, dan
+// tanpa dibuka pencarian execution meleset: TASK-3E222980 menulis berkasnya
+// dengan benar, lalu dicatat "run ended: unknown" dan DIJALANKAN ULANG.
+import { executionIdFromRunId } from "../../src/runtime/session-events.mjs";
+
+test("D88: id execution dibuka dari runId announce milik sesi ACP", () => {
+  assert.equal(
+    executionIdFromRunId("announce:v1:agent:claude-opus:acp:ee1ba0d6-1864-4985-8bc7-1fd3df26428f:TASK-3E222980#1"),
+    "TASK-3E222980#1",
+  );
+});
+
+test("D88: runId biasa tidak disentuh", () => {
+  // Jalur ini menanggung SELURUH korelasi run non-ACP; memotongnya di sini
+  // akan memutus penyelesaian setiap task lain di sistem.
+  assert.equal(executionIdFromRunId("TASK-1234ABCD#2"), "TASK-1234ABCD#2");
+  assert.equal(executionIdFromRunId("d15-1787330757967"), "d15-1787330757967");
+});
+
+test("D88: runId kosong tetap kosong, bukan string aneh", () => {
+  assert.equal(executionIdFromRunId(null), null);
+  assert.equal(executionIdFromRunId("announce:v1:"), null);
+});

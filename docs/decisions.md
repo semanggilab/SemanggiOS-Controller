@@ -2757,3 +2757,48 @@ Dua permintaan kecil yang menyertainya, dan berguna terlepas dari fiturnya: `age
 **Sampai itu mendarat:** Brain `claude-*` akan terus `WAIT_RESOURCE` dengan alasan jujur (D85). Itu keadaan yang benar — bukan sesuatu yang harus "diperbaiki" dengan mengembalikan pencocokan longgar. Alternatif yang tersedia bila Claude dibutuhkan lebih cepat: provider `anthropic` langsung (plugin sudah enabled) sebagai Brain biasa — kehilangan sandbox POC-3 dan gerbang izin, tetapi berjalan di jalur yang sama dengan Brain lain dan sudah terbukti.
 
 **Tidak ada perubahan kode di D86.** Dua agen uji (`sdmk-kader-claude-opus-high`, `acp-repro`) dibuat lalu dihapus; roster kembali ke sembilan agen semula.
+
+## D87 — Jam reset dari teks penolakan 8.2: jendelanya sendiri yang menyelesaikan zonanya
+
+**Tugasnya:** riset spesifikasi API tiap provider (kecuali GLM yang sudah) untuk cara memperoleh waktu reset kuota — terstruktur di API atau diparse dari teks error seperti ZAI — lalu implementasikan logikanya.
+
+### Riset per provider (dokumentasi resmi, 2026-09-08/09)
+
+| Provider | Jam reset di spesifikasi | Bentuk |
+|---|---|---|
+| Anthropic | `retry-after` (detik) + `anthropic-ratelimit-*-reset` (RFC 3339 UTC) di header 429; spend-cap: "You will regain access on 2026-09-01 at 00:00 UTC" di body | Terstruktur di header |
+| Groq | `retry-after` (detik) + `x-ratelimit-reset-requests`/`-tokens` (durasi Go: `2m59.56s`, `7.66s`) | Terstruktur di header |
+| Google | `RESOURCE_EXHAUSTED` 429 + detail `google.rpc.RetryInfo.retryDelay` (`"37s"`); RPD reset tengah malam Pasifik; spend-limit per 10 menit | Terstruktur di detail body |
+| Cerebras | Token bucket (dual: uncached + total TPM) — isi ulang kontinu, TANPA jam reset; pesan 429 hanya menyebut bucket mana yang jebol | Tidak ada jam |
+| Mistral | RPS + token/menit/bulan per workspace-tier; halaman tier hanya menunjuk ke admin console | Tidak ada jam |
+
+**Temuan yang menentukan arsitektur: gateway 8.2 TIDAK meneruskan satupun dari bentuk terstruktur itu.** Penolakan tiba sebagai teks saja (terukur di event_log). Memparse header RFC 3339 / durasi Go berarti menulis kode yang tidak pernah berjalan — jadi semua itu dicatat di sini sebagai riset, dan implementasi menargetkan bentuk yang benar-benar terlihat di wire.
+
+### Dua bentuk teks yang terukur di cluster
+
+1. `⚠️ Usage limit reached for 5 hour. Your limit will reset at 2026-09-09 03:34:02` — zai (dan, sebelum D85, salah-rute ke claude-code). Dua sumber independen (seq 116639, 123115).
+2. `FailoverError: ⚠️ API rate limit reached. Please try again later.` — google/gemini-3.1-flash-lite. Tanpa jam, tanpa jendela.
+
+### Keputusan: jendela menyembuhkan ambiguitas zonanya sendiri
+
+Teks bentuk-1 membawa DUA fakta: durasi jendela ("for 5 hour") dan jam dinding reset TANPA zona. D84 menolak menebak dan menjangkarnya 7 hari (jendela panjang keluarga langganan); probe pemulihan membatasi kelewatannya ke kadensi 10 menit — tapi jam sebenarnya tetap 2–4.4 jam setelah sinyal pada kedua event terukur.
+
+Kunci disambiguasinya ada di teks itu sendiri: harness mencetak waktu lokal hostnya, dan host itu UTC+7 (delta T−7h−now = 4.37j dan 2.11j — keduanya di dalam jendela 5 jam; dibaca sebagai UTC delta-nya 9–11 jam, di luar jendela). Maka aturannya:
+
+```
+offset valid ⇔ 0 < (T − offset) − now ≤ windowMs + slack(30 mnt)
+```
+
+Kandidat offset dicoba urut kepercayaan: UTC (0), offset host pembaca, lalu zona umum (+7, +8, +9, +5.5, +1, −5, −8). Kandidat pertama yang lolos menang. **Tidak ada yang lolos → jam dibuang**, jendela tetap dipakai sebagai jangkar `now + windowMs` (lebih murah hati dari 7 hari; probe tetap membatasi) — jam yang tidak masuk akal untuk jendelanya adalah sinyal bahwa teks itu mungkin milik provider lain, pelajaran langsung dari salah-rute D85.
+
+Bentuk kedua yang diparse: jam eksplisit UTC dari POC-3 E8 (`"…session limit · resets 9:40am (UTC)"`) — tanpa tanggal, harinya hari ini (besok bila sudah lewat); zona eksplisit tidak butuh disambiguasi.
+
+Rantai prioritas `applyQuotaSignal` menjadi: resetsAt terstruktur → retryAfter → teks terparse (jam / jendela) → fallback keluarga D84. `window_kind` kini terisi dari teks (`5_hour`, `7_day`) bila provider tidak mengirim rateLimitType.
+
+### Batas yang diketahui
+
+- Offset dipilih dari kandidat tetap, bukan diukur dari harness — zona non-ganjil-jam (+5:30) dan zona setengah-jam lain di luar daftar akan gagal disambiguasi dan jatuh ke jangkar jendela. Itu kegagalan yang aman (arah selalu konservatif).
+- `CLOCK_SKEW_SLACK_MS` 30 menit: jendela 5 jam + slack berarti teks dengan delta hingga 5.5 jam diterima. Per basis data terukur delta nyata 2–4.4 jam — margin cukup.
+- Probe pemulihan tetap menjadi sumber kebenaran akhir ("bisa digunakan" diukur, bukan ditebak); D87 hanya membuat tebakan awalnya jujur.
+
+**Test:** 571 → 578. Parser: dua event historis verbatim (offset +7, epoch eksak), jam yang memang UTC, jam tak-terpecahkan (dibuang, jendela selamat), jam POC-3 (am/pm + rollover tengah hari), teks tanpa jam → null. Integrasi: `applyQuotaSignal` menjangkari epoch terparse (bukan 7 hari) + `window_kind` terisi + baris dilepaskan pass jendela pada epoch itu; fallback D84 untuk teks google FailoverError (60 dtk) dan teks tanpa jam zai (7 hari) — jalur D84 sebelumnya tanpa tes langsung.

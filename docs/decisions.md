@@ -2868,3 +2868,61 @@ yang dijalankan sebagai root membuat `openclaw.json` milik root, dan gateway
 (b) `--update-failure-action rollback` bawaan memvonis gagal sebelum start
 kedua terjadi, padahal OpenClaw memang meminta restart setelah konvergensi
 mengubah state. Selama deploy, pakai `continue`, lalu kembalikan ke `rollback`.
+
+## D89 — Controller memakai `acp.spawn`: harness berhenti menyamar jadi agen
+
+**Keputusan.** `dispatch()` bercabang lebih awal: kandidat berprovider
+`claude-code` pergi ke `dispatchAcp()`, dan tidak pernah menyentuh method
+`agent`. Alasannya bukan kerapian melainkan D86 — sebuah agen
+`runtime.type="acp"` yang dijalankan lewat `agent` tetap dieksekusi model
+embedded, diam-diam. Selama jalur itu masih terbuka, satu kesalahan konfigurasi
+cukup untuk mengulang D85.
+
+**Tidak ada jatuh-kembali, di tiga pintu.** Gateway tanpa `acp.spawn`, Brain
+tanpa `acpAgent`, `acp.spawn` yang menolak — ketiganya menggagalkan dispatch.
+Task terparkir lebih murah daripada run yang berbohong.
+
+**Yang TIDAK dikirim juga keputusan.** Tidak ada `thinking`, tidak ada model
+override: effort dipaku di dalam launcher acpx (`semanggi-acp-claude-opus`
+menyetel opus/high sebelum exec). Mengirimnya dari controller akan membuat dua
+sumber kebenaran yang bisa berselisih tanpa ada yang tahu mana yang menang.
+
+**Idempotency menembus ke harness.** `acp.spawn` hulu mencetak kunci acak per
+panggilan — benar untuk manusia di ruang obrolan, salah untuk penjadwal. Fork
+menerima `idempotencyKey`, dan controller mengirim `execution.id` (P4-11).
+Jangkauannya jujur: dedupe terjadi di dispatch anak, bukan di pembuatan sesi,
+jadi spawn yang diulang tetap mencetak cangkang sesi baru — yang dicegah adalah
+paruh yang mahal, yaitu run harness kedua.
+
+**Pagar baru: agen pipa.** D88 menambah `sem-acp-owner` plus satu entri agen per
+harness. Tak satu pun menyetel model sendiri, jadi gateway mengiklankan mereka
+dengan model ambient — diukur 2026-09-09, ketiganya melapor
+`google/gemini-3.1-flash-lite` di workspace sdmk-kader, sama persis dengan agen
+kerja yang sah. Tanpa `isPlumbingAgent`, Brain gemini biasa bisa mendarat di
+`claude-opus`, atau lebih buruk di `sem-acp-owner` yang sengaja tanpa sandbox.
+Pagarnya berlaku juga pada jalur override — justru di sanalah ia paling mudah
+lolos.
+
+**Bug korelasi yang hanya bisa dilihat, bukan ditebak.** Uji pertama
+(TASK-3E222980) menulis berkasnya dengan benar, gateway melapor
+`stopReason=stop`, dan controller mencatat "run ended: unknown" lalu
+men-dispatch ulang — menjalankan pekerjaan Claude dua kali. Sebabnya baru
+terlihat setelah frame mentahnya direkam:
+
+```
+runId     : "announce:v1:agent:claude-opus:acp:ee1ba0d6-…:D88-FRAME-PROBE#1"
+sessionKey: "agent:sem-acp-owner:acp-rpc"
+data      : { phase: "end", stopReason: "stop", aborted: false }
+```
+
+Seluruh korelasi controller bertumpu pada "runId ADALAH id execution" — benar
+untuk run biasa, salah untuk ACP. `executionIdFromRunId()` membuka bungkus itu.
+
+**Bukti terima (TASK-533F62A9).** Satu `dispatch.acp`, satu sesi harness, task
+COMPLETE tanpa retry, dan `docs/d88-acp-smoke.md` berisi satu baris yang ditulis
+harness: `claude-opus-4-8`. Tiga hal itu bersama-sama; satu saja tidak cukup —
+D85 mengajarkan bahwa "COMPLETE" bisa berarti berjalan di tempat lain.
+
+**Test:** 587 → 595. Satu tes gagal di container (`connect frame carries no
+root-level nonce`) dan sudah gagal sebelum perubahan ini: adapter mencetak
+device identity ketika `identityPath` tidak ada.

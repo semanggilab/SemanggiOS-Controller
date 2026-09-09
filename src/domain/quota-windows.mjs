@@ -10,6 +10,11 @@
 // itu di Brain membuat kebijakan retry bisa memutuskan SEBELUM sinyal pertama
 // tiba, dan operator bisa melihatnya di halaman yang sama dengan modelnya.
 
+// D88: leaf module core.mjs (tanpa import) dipakai untuk aritmetika jam
+// dinding tetap — aman dari siklus: driver mengimpor modul ini, modul ini
+// hanya mengimpor core, bukan driver.
+import { ANTHROPIC_WEEKLY_RESET, nextFixedResetMs } from "./quota-drivers/core.mjs";
+
 /** Jendela pendek dan panjang per provider, dalam milidetik. */
 export const QUOTA_WINDOWS_BY_PROVIDER = Object.freeze({
   // Gemini / Groq / Cerebras: RPM (per menit) + kuota harian (D59 — groq dan
@@ -226,6 +231,27 @@ export function quotaAnchorFallbackMs(provider) {
   // memakai jendela PANJANG, dengan probe pemulihan membatasi
   // konservatismenya.
   return isRetryableWindow(windows.shortMs) ? windows.shortMs : windows.longMs;
+}
+
+/**
+ * D88: reset mingguan keluarga dengan jam dinding tetap (langganan Anthropic —
+ * Senin 02:00 WIB, terukur operator 2026-09-09). Envelope rolling 7 hari
+ * selalu overshoot reset tetap (now+7d vs Senin terdekat ≤ 7d), dan untuk
+ * sinyal tanpa jam "Senin berikutnya" adalah batas ATAS yang jujur untuk KEDUA
+ * jendela keluarga itu: tembok 5 jam dan mingguan sama-sama jebol paling
+ * lambat pada jam itu. Descriptor hidup di core.mjs (satu tabel kebenaran
+ * bersama driver + migrasi); pemetaan provider→descriptor di sini supaya
+ * jangkar fallback tidak perlu mengimpor registry driver penuh.
+ */
+export const WEEKLY_FIXED_RESETS = Object.freeze({
+  "claude-code": ANTHROPIC_WEEKLY_RESET,
+});
+
+/** Epoch reset mingguan tetap BERIKUTNYA untuk provider itu, atau null. */
+export function nextWeeklyFixedResetMs(provider, nowMs = Date.now()) {
+  const fixed = WEEKLY_FIXED_RESETS[String(provider ?? "")];
+  if (!fixed) return null;
+  return nextFixedResetMs(fixed, Number(nowMs));
 }
 
 const WINDOW_LABELS = new Map([

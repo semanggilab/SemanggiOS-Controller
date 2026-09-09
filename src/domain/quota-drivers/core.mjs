@@ -12,6 +12,14 @@
 /** Token buckets refill continuously; without a ledger we pace one short window. */
 export const TOKEN_BUCKET_PACE_CAP_MS = 60_000;
 
+/**
+ * D88: jangkar mingguan langganan Anthropic, diukur operator (2026-09-09):
+ * limit mingguan reset Senin 02:00 WIB (Asia/Jakarta, tanpa DST). Descriptor
+ * tunggal ini dipakai driver claude-code (defaults → brains), jangkar fallback
+ * quota-windows, dan migrasi backfill — tiga pintu, satu tabel kebenaran.
+ */
+export const ANTHROPIC_WEEKLY_RESET = Object.freeze({ atHourLocal: 2, timeZone: "Asia/Jakarta", day: 1 });
+
 /** Kinds a window descriptor may carry (POC-6 §3.7 taxonomy). */
 export const SHORT_WINDOW_KINDS = Object.freeze(["rolling", "fixed-time", "token-bucket", "credits"]);
 export const LONG_WINDOW_KINDS = Object.freeze([...SHORT_WINDOW_KINDS, "credits-anniversary"]);

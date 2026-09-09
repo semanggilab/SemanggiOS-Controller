@@ -100,8 +100,13 @@ test("cerebras defaults pace a token bucket; zai prices credits on an anniversar
   assert.equal(z.longMs, 7 * DAY);
 
   assert.equal(claudeCodeDriver.defaults().quotaTier, "pro");
-  // The 5h anchor hour was never measured, so no fixedReset is claimed.
-  assert.equal(claudeCodeDriver.defaults().fixedReset, null);
+  // D88: jangkar mingguan diukur operator (2026-09-09) — Senin 02:00 WIB.
+  // Tes lama mematri fixedReset null ("belum diukur") — pengukuran datang,
+  // klaimnya diganti, bukan dilangkahi diam-diam.
+  assert.deepEqual(
+    claudeCodeDriver.defaults().fixedReset,
+    { atHourLocal: 2, timeZone: "Asia/Jakarta", day: 1 },
+  );
 
   assert.equal(mistralDriver.defaults().quotaTier, "free");
   // Null-valued, not null itself: brains.create() reads rates.rpm etc. off
@@ -353,6 +358,61 @@ test("D64 drops brains.category from a database that still has it", async () => 
     } finally {
       await store.close();
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- D88: jangkar mingguan Anthropic (Senin 02:00 WIB) ------------------------
+
+test("claude-code long window prices the next Monday 02:00 Asia/Jakarta (D88)", () => {
+  // Rabu 2026-09-09 12:00Z → Senin berikutnya 02:00 WIB = 2026-09-13T19:00Z.
+  const wednesday = Date.parse("2026-09-09T12:00:00Z");
+  const weekly = { kind: "fixed-time", ms: 7 * DAY, fixedReset: claudeCodeDriver.defaults().fixedReset };
+  assert.equal(claudeCodeDriver.nextReset(weekly, { nowMs: wednesday }), Date.parse("2026-09-13T19:00:00Z"));
+
+  // Tepat sebelum reset (Senin 01:30 WIB): masih Senin ini.
+  assert.equal(
+    claudeCodeDriver.nextReset(weekly, { nowMs: Date.parse("2026-09-13T18:30:00Z") }),
+    Date.parse("2026-09-13T19:00:00Z"),
+  );
+
+  // Tepat setelah reset (Senin 02:30 WIB): Senin BERIKUTNYA — jam dinding
+  // tetap, bukan envelope rolling dari now.
+  assert.equal(
+    claudeCodeDriver.nextReset(weekly, { nowMs: Date.parse("2026-09-13T19:30:00Z") }),
+    Date.parse("2026-09-20T19:00:00Z"),
+  );
+});
+
+test("D88 backfill: NULL descriptors get Monday-2am-WIB, hand-tuned rows stay (migration)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "d88-"));
+  const file = join(dir, "controller.db");
+  try {
+    // Boot pertama membuat skema penuh + backfill boot; sisipkan dua baris
+    // lalu boot LAGI — #migrate() berjalan tiap openStore, dan backfill
+    // harus idempoten terhadap baris yang sudah terisi.
+    let store = openStore({ location: file });
+    await store.run(
+      `INSERT INTO brains (id, name, provider, model, quota_reset_short_ms, quota_reset_long_ms, created_at, updated_at)
+       VALUES ('BRN-OLD', 'cc-old', 'claude-code', 'claude-code', ?, ?, 1, 1)`,
+      [5 * 3_600_000, 7 * DAY],
+    );
+    await store.run(
+      `INSERT INTO brains (id, name, provider, model, quota_reset_short_ms, quota_reset_long_ms, quota_fixed_reset, created_at, updated_at)
+       VALUES ('BRN-TUNED', 'cc-tuned', 'claude-code', 'claude-code', ?, ?, ?, 1, 1)`,
+      [5 * 3_600_000, 7 * DAY, JSON.stringify({ atHourLocal: 5, timeZone: "UTC" })],
+    );
+    await store.close();
+
+    store = openStore({ location: file });
+    const rows = await store.all(`SELECT id, quota_fixed_reset FROM brains ORDER BY id`);
+    await store.close();
+
+    const old = rows.find((r) => r.id === "BRN-OLD");
+    assert.deepEqual(JSON.parse(old.quota_fixed_reset), { atHourLocal: 2, timeZone: "Asia/Jakarta", day: 1 });
+    const tuned = rows.find((r) => r.id === "BRN-TUNED");
+    assert.deepEqual(JSON.parse(tuned.quota_fixed_reset), { atHourLocal: 5, timeZone: "UTC" });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

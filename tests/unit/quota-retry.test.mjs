@@ -510,3 +510,54 @@ test("applyQuotaSignal keeps the D84 family fallbacks for text without a usable 
   row = await h.repos.resources.get("zai", "glm-4.7");
   assert.equal(row.next_available_at, h.now() + 7 * 24 * 3_600_000);
 });
+
+// --- D88: jangkar mingguan tetap Anthropic (Senin 02:00 WIB) ------------------
+
+test("weekly-scale refusal text anchors the next Monday 02:00 WIB, not now+7d (D88)", async () => {
+  const clock = new Clock(Date.parse("2026-09-09T12:00:00Z")); // Rabu
+  const h = await buildHarness({ clock });
+  await seedBasics(h);
+  await h.repos.resources.upsert({ provider: "claude-code", model: "claude-code" });
+  // Teks mingguan tanpa jam yang bisa diselesaikan (offset tidak lolos):
+  // jendela ≥ 6 hari pada keluarga ber-reset-tetap → jam Senin berikutnya.
+  await h.repos.resources.applyQuotaSignal("claude-code", "claude-code", {
+    status: 429,
+    message: "⚠️ Usage limit reached for 7 day. Your limit will reset at 2026-10-01 00:00:00",
+  });
+  const row = await h.repos.resources.get("claude-code", "claude-code");
+  assert.equal(row.availability, "QUOTA_EXHAUSTED");
+  assert.equal(row.next_available_at, Date.parse("2026-09-13T19:00:00Z"), "Senin 02:00 WIB");
+  assert.equal(row.window_kind, "7_day");
+  // Dilepaskan pass jendela pada jam Senin itu — bukan 7 hari dari sinyal.
+  clock.advance(Date.parse("2026-09-13T19:00:00Z") - clock.now() + 1);
+  await h.scheduler.notify();
+  assert.equal((await h.repos.resources.get("claude-code", "claude-code")).availability, "AVAILABLE");
+});
+
+test("clockless claude-code signal parks at the next Monday, tighter than the 7-day envelope (D88)", async () => {
+  const clock = new Clock(Date.parse("2026-09-09T12:00:00Z"));
+  const h = await buildHarness({ clock });
+  await seedBasics(h);
+  await h.repos.resources.upsert({ provider: "claude-code", model: "claude-code" });
+  await h.repos.resources.applyQuotaSignal("claude-code", "claude-code", {
+    status: 429,
+    message: "quota exceeded",
+  });
+  const row = await h.repos.resources.get("claude-code", "claude-code");
+  // D84 would say now+7d (2026-09-16T12:00Z); the fixed reset is Monday
+  // 2026-09-13T19:00Z — strictly earlier, and the honest ceiling for BOTH
+  // the 5h and the weekly wall of this family.
+  assert.equal(row.next_available_at, Date.parse("2026-09-13T19:00:00Z"));
+});
+
+test("zai keeps the rolling 7-day envelope — its weekly cycle is an anniversary, not a wall clock (D88)", async () => {
+  const h = await buildHarness();
+  await seedBasics(h);
+  await h.repos.resources.applyQuotaSignal("zai", "glm-4.7", {
+    status: 429,
+    message: "⚠️ Usage limit reached for 7 day. Your limit will reset at 2026-10-01 00:00:00",
+  });
+  const row = await h.repos.resources.get("zai", "glm-4.7");
+  // Teks mingguan pada keluarga TANPA reset tetap: jendela teks itu sendiri.
+  assert.equal(row.next_available_at, h.now() + 7 * 24 * 3_600_000);
+});

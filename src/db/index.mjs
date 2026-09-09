@@ -189,6 +189,18 @@ class SqliteStore {
       this.#db.exec(`ALTER TABLE brains DROP COLUMN category`);
     }
 
+    // D88: jangkar mingguan claude-code diukur operator (2026-09-09) — reset
+    // Senin 02:00 WIB. Backfill hanya baris yang masih memegang default lama
+    // (descriptor NULL); suntingan tangan operator (descriptor terisi) tidak
+    // disentuh, aturan yang sama dengan backfill D63. Idempoten: baris yang
+    // sudah terisi tidak pernah lolos WHERE lagi.
+    if (brainCols3.length === 0 || brainCols3.includes("quota_tier")) {
+      const d88 = quotaDriverFor("claude-code").defaults();
+      this.#db
+        .prepare(`UPDATE brains SET quota_fixed_reset = ? WHERE provider = 'claude-code' AND quota_fixed_reset IS NULL`)
+        .run(d88.fixedReset ? JSON.stringify(d88.fixedReset) : null);
+    }
+
     // D52: penghitung terpisah untuk penolakan transient (rate limit jendela
     // panjang, UNAVAILABLE) di jalur late-error — batas dan backoff-nya
     // berbeda dari quota_retries.

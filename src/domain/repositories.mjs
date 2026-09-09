@@ -9,7 +9,12 @@ import {
   isExecutionTerminal,
 } from "./state-machine.mjs";
 import { PROFILES } from "./brains.mjs";
-import { isQuotaErrorMessage, parseUsageLimitReset, quotaAnchorFallbackMs } from "./quota-windows.mjs";
+import {
+  isQuotaErrorMessage,
+  nextWeeklyFixedResetMs,
+  parseUsageLimitReset,
+  quotaAnchorFallbackMs,
+} from "./quota-windows.mjs";
 import { nullLogger } from "./logger.mjs";
 
 /**
@@ -1219,6 +1224,13 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       // D84, dan jam yang gagal disambiguasi mundur ke rantai D84 di bawah.
       // Prioritas tetap: resetsAt terstruktur > retryAfter > teks > keluarga.
       const parsed = parseUsageLimitReset(message, now());
+      // D88: teks berskala mingguan pada keluarga dengan reset mingguan tetap
+      // (Anthropic — Senin 02:00 WIB, terukur operator) → jam Senin
+      // berikutnya, bukan now+7 hari: envelope rolling selalu melewati reset
+      // tetap. Teks TANPA jam pada keluarga itu jatuh ke jam yang sama — kedua
+      // jendelanya (5 jam / mingguan) jebol paling lambat di sana.
+      const weeklyAt = nextWeeklyFixedResetMs(provider, now());
+      const weeklyText = parsed != null && (parsed.windowMs ?? 0) >= 6 * 24 * 3_600_000;
       // D84: the final `?? now() + quotaAnchorFallbackMs(provider)` is the
       // wedge fix. OpenClaw 2026.8.2 refusals arrive as text with no
       // resetsAt/retryAfter ("Usage limit reached for 5 hour. Your limit
@@ -1238,9 +1250,11 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           ? now() + retryAfterSeconds * 1000
           : parsed?.resetMs
             ? parsed.resetMs
-            : parsed?.windowMs
-              ? now() + parsed.windowMs
-              : now() + quotaAnchorFallbackMs(provider);
+            : weeklyText && weeklyAt != null
+              ? weeklyAt
+              : parsed?.windowMs
+                ? now() + parsed.windowMs
+                : weeklyAt ?? (now() + quotaAnchorFallbackMs(provider));
       return resources.setAvailability(provider, model, "QUOTA_EXHAUSTED", {
         nextAvailableAt: at,
         windowKind: rateLimitType ?? parsed?.windowKind ?? null,
@@ -1607,5 +1621,5 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
     },
   };
 
-  return { projects, workers, tasks, executions, resources, leases, approvals, messages };
+  return { store, projects, workers, tasks, executions, resources, leases, approvals, messages };
 }

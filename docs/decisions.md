@@ -2802,3 +2802,69 @@ Rantai prioritas `applyQuotaSignal` menjadi: resetsAt terstruktur → retryAfter
 - Probe pemulihan tetap menjadi sumber kebenaran akhir ("bisa digunakan" diukur, bukan ditebak); D87 hanya membuat tebakan awalnya jujur.
 
 **Test:** 571 → 578. Parser: dua event historis verbatim (offset +7, epoch eksak), jam yang memang UTC, jam tak-terpecahkan (dibuang, jendela selamat), jam POC-3 (am/pm + rollover tengah hari), teks tanpa jam → null. Integrasi: `applyQuotaSignal` menjangkari epoch terparse (bukan 7 hari) + `window_kind` terisi + baris dilepaskan pass jendela pada epoch itu; fallback D84 untuk teks google FailoverError (60 dtk) dan teks tanpa jam zai (7 hari) — jalur D84 sebelumnya tanpa tes langsung.
+
+## D88 — ACP dari RPC: fork OpenClaw, method `acp.spawn`
+
+**Konteks.** D86 menutup semua jalur: `agent`/`sessions.create` menolak
+`runtime`, `sessions.spawn`/`acp.spawn` tidak dikenal, HTTP gateway hanya
+Control UI, `admin-http-rpc` memakai tabel method yang sama. Operator memilih
+"OpenClaw mengekspos ACP di RPC" dan mengelola fork sendiri.
+
+**Keputusan.** `/root/openclaw-fork`, branch `semanggi` di atas tag hulu
+`2026.8.2`, tiga commit, ~160 baris. Naik versi lewat rebase seperti
+`agentos-fork`. Prosedur lengkap: `semanggi-agent-platform/docs/upgrade-openclaw-fork.md`.
+
+**Tiga tempat, bukan satu.** Method baru menuntut (1) handler, (2) satu baris
+di `CORE_GATEWAY_HANDLER_MODULES`, dan (3) satu baris di
+`CORE_GATEWAY_METHOD_SPECS`. Terukur: build pertama lulus, ter-bundle,
+ter-deploy — dan tetap dijawab `unknown method` karena (3) belum ditulis.
+Tabel spec itulah yang kanonik untuk listing, otorisasi, ketersediaan startup,
+dan rate limit. `operator.admin` + `controlPlaneWrite`; sengaja bukan
+`startup: true`.
+
+**Tiga gerbang berikutnya, dan kenapa semuanya benar.** Setelah method hidup,
+spawn ditolak tiga kali berturut-turut, dan tidak satu pun penolakan itu bug:
+
+1. *"session agent resolution has no explicit owner"* — sesi ACP mewarisi
+   workspace, tool policy, dan kuota pemiliknya. Pemanggil RPC tidak punya
+   sesi induk untuk mewarisi, dan menebak berarti memberi harness kewenangan
+   yang tidak pernah diberikan siapa pun. Jawabannya: parameter `ownerAgentId`.
+2. *"refusing non-canonical session key write main"* — tanpa kunci sesi
+   pemanggil, semuanya jatuh ke alias `main`. Jawabannya: `agent:<owner>:acp-rpc`.
+3. *"Sandboxed sessions cannot spawn ACP"* — `sandbox.mode: "all"` global
+   membuat setiap sesi ter-sandbox, dan ACP berjalan di host. Jawabannya BUKAN
+   melemahkan kebijakan, melainkan satu agen pemilik `sem-acp-owner` dengan
+   `sandbox.mode: "off"` yang tidak pernah menjalankan turn-nya sendiri.
+
+**Agen harness jadi entri agen, bukan sekadar id acpx.** Kunci sesi anak
+dicetak `agent:<target>:acp:<uuid>`, jadi target harus agen OpenClaw yang sah.
+`claude-opus` dan `claude-sonnet` kini entri dengan `runtime.type=acp` —
+jawaban atas pertanyaan operator "apakah cukup membuat brain claude-opus dan
+claude-sonnet": cukup, tetapi sebagai entri agen, bukan hanya Brain.
+
+**Bukti terima.** Bukan balasan `accepted`-nya — D85 mengajarkan bahwa
+"berhasil" bisa berarti berjalan di tempat lain. Yang dihitung adalah
+transkrip harness sendiri:
+
+```
+.claude-home/.claude/projects/…/04fbdfbf-….jsonl
+  user      | Reply with exactly one word: ok
+  assistant | claude-opus-4-8 | ok
+```
+
+`claude-opus-4-8` — model Claude, di dalam harness, dimulai dari satu panggilan
+RPC. `.claude-home` lahir pada menit yang sama.
+
+**Jebakan pembacaan.** `sessions.describe` untuk sesi anak itu melaporkan
+`model: gemini-3.1-flash-lite`. Itu bukan D85 terulang: itu turn *pengumuman
+penyelesaian* milik agen pemilik, yang tidak punya model sendiri sehingga
+memakai default ambient. Model tugasnya ada di transkrip harness, bukan di
+ringkasan sesi.
+
+**Ongkos yang tercatat.** Gateway turun beberapa kali selama iterasi ini.
+Dua sebab yang akan terulang kalau tidak ditulis: (a) `openclaw config patch`
+yang dijalankan sebagai root membuat `openclaw.json` milik root, dan gateway
+(uid 1000) menolak start dengan EACCES — selalu `chown 1000` setelahnya;
+(b) `--update-failure-action rollback` bawaan memvonis gagal sebelum start
+kedua terjadi, padahal OpenClaw memang meminta restart setelah konvergensi
+mengubah state. Selama deploy, pakai `continue`, lalu kembalikan ke `rollback`.

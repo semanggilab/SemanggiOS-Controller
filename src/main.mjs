@@ -16,6 +16,7 @@ import { createSlackSurface } from "./interface/slack.mjs";
 import { createSlackApp } from "./interface/slack-app.mjs";
 import { WakeReason } from "./scheduler/scheduler.mjs";
 import { createLogger } from "./domain/logger.mjs";
+import { createSharedState } from "./runtime/shared-state.mjs";
 
 function readSecret(path, label) {
   if (!path) throw new Error(`${label} path is not configured`);
@@ -39,6 +40,35 @@ async function main() {
   const resources = process.env.SEMANGGI_RESOURCES_CONFIG
     ? readJson(process.env.SEMANGGI_RESOURCES_CONFIG, "resource catalogue").resources ?? []
     : [];
+  const databaseDriver = process.env.DATABASE_DRIVER ?? "sqlite";
+  let databaseUri = process.env.DATABASE_URI ?? process.env.SEMANGGI_DB ??
+    "/opt/semanggi/volumes/shared/service/semanggios/controller/controller.db";
+  if (databaseDriver === "postgres" && process.env.DATABASE_PASSWORD_FILE) {
+    const parsed = new URL(databaseUri);
+    parsed.password = readSecret(process.env.DATABASE_PASSWORD_FILE, "postgres password");
+    databaseUri = parsed.toString();
+  }
+  const stateDriver = process.env.STATE_DRIVER ?? (databaseDriver === "postgres" ? "redis" : "memory");
+  // Password Redis, sama polanya dengan Postgres di atas: rahasia datang dari
+  // berkas secret, bukan dari URI di stack.
+  //
+  // Stack SUDAH memasang REDIS_PASSWORD_FILE sejak awal; yang hilang justru
+  // baris ini, dan ketiadaannya tidak terlihat selama redis mengizinkan koneksi
+  // tanpa auth. Saat redis-prod mulai menuntut AUTH (2026-09-09 07:53 UTC,
+  // setelah service-nya dijadwalkan ulang), controller kehilangan lock bersama
+  // di tengah pass scheduler dan mati berulang — kegagalan yang jauh dari
+  // sebabnya. Menyertakan password membuat kontraknya sama di kedua sisi.
+  let redisUri = process.env.REDIS_URI ?? process.env.REDIS_URL ?? null;
+  if (stateDriver === "redis" && redisUri && process.env.REDIS_PASSWORD_FILE) {
+    const parsed = new URL(redisUri);
+    parsed.password = readSecret(process.env.REDIS_PASSWORD_FILE, "redis password");
+    redisUri = parsed.toString();
+  }
+  const sharedState = await createSharedState({
+    driver: stateDriver,
+    uri: redisUri,
+    prefix: process.env.REDIS_PREFIX ?? "semanggi",
+  });
 
   // Dispatch goes over the Gateway WebSocket. The AgentOS HTTP write path is
   // closed to us: it refuses writes from any client whose socket peer is not
@@ -55,9 +85,6 @@ async function main() {
     token: readSecret(process.env.SEMANGGI_GATEWAY_TOKEN_FILE, "openclaw_gateway_token"),
     version: process.env.SEMANGGI_VERSION ?? "0.1.0",
     onEvent: (name, payload) => void sessionEvents?.handle(name, payload),
-    // Pemilik sesi ACP (D88). Ganti hanya bila agen pemilik di gateway diganti;
-    // agen itu harus `sandbox.mode: "off"` karena ACP berjalan di host.
-    ...(process.env.SEMANGGI_ACP_OWNER_AGENT ? { acpOwnerAgentId: process.env.SEMANGGI_ACP_OWNER_AGENT } : {}),
     log: log.child({ component: "gateway" }),
   });
 
@@ -81,7 +108,10 @@ async function main() {
   const controller = await createController({
     log,
     resources,
-    storeLocation: process.env.SEMANGGI_DB ?? "/opt/semanggi/volumes/shared/service/semanggios/controller/controller.db",
+    storeLocation: databaseUri,
+    databaseDriver,
+    databaseUri,
+    sharedState,
     routing,
     runtime,
     config: {
@@ -212,6 +242,9 @@ async function main() {
   resubscribeTimer.unref?.();
 
   controller.scheduler.start();
+  const singleton = (name, ttlMs, fn) => controller.sharedState
+    ? controller.sharedState.withLock(`job:${name}`, ttlMs, fn)
+    : fn();
 
   // D72: reconciliation runs on a plain timer. The pass is self-gating — one
   // describe per task whose latest execution is unfinalized and carries a
@@ -224,7 +257,8 @@ async function main() {
   const reconcileTimer = setInterval(() => {
     void (async () => {
       try {
-        const out = await reconciler.reconcileOnce();
+        const out = await singleton("reconcile", 60_000, () => reconciler.reconcileOnce());
+        if (!out) return;
         if (out.settled.length > 0 || out.stragglers.length > 0 || out.recovered.length > 0) {
           await controller.scheduler.notify(WakeReason.TASK_FINISHED);
         }
@@ -243,13 +277,15 @@ async function main() {
   const uploadTtlMs = Number(process.env.SEMANGGI_UPLOAD_TTL_MS ?? 24 * 60 * 60 * 1000);
   const uploadSweep = async () => {
     try {
-      for (const project of await controller.repos.projects.list()) {
-        if (!project.workspace_path) continue;
-        const removed = await cleanUploads(project.workspace_path, uploadTtlMs);
-        if (removed.length > 0) {
-          log.info("uploads.swept", { project: project.id, removed: removed.length, paths: removed.slice(0, 5) });
+      await singleton("upload-sweep", 15 * 60_000, async () => {
+        for (const project of await controller.repos.projects.list()) {
+          if (!project.workspace_path) continue;
+          const removed = await cleanUploads(project.workspace_path, uploadTtlMs);
+          if (removed.length > 0) {
+            log.info("uploads.swept", { project: project.id, removed: removed.length, paths: removed.slice(0, 5) });
+          }
         }
-      }
+      });
     } catch (err) {
       console.error(`upload sweep failed: ${err.message}`);
     }
@@ -271,8 +307,8 @@ async function main() {
   let sandboxKeeperTimer = null;
   if (controller.sandboxProvision && sandboxKeeperMs > 0 && process.env.SEMANGGI_SANDBOX_KEEPER !== "0") {
     sandboxKeeperTimer = setInterval(() => {
-      void controller.sandboxProvision
-        .reconcileAll({ actor: "keeper" })
+      void singleton("sandbox-keeper", Math.max(sandboxKeeperMs * 3, 180_000), () =>
+        controller.sandboxProvision.reconcileAll({ actor: "keeper" }))
         .then((out) => {
           if (out.created > 0 || out.killed > 0) {
             log.info("sandbox-keeper.reconciled", { created: out.created, killed: out.killed, results: out.results });
@@ -293,9 +329,9 @@ async function main() {
   let quotaProbeTimer = null;
   if (controller.quotaRecovery && quotaProbeMs > 0 && process.env.SEMANGGI_QUOTA_PROBE !== "0") {
     quotaProbeTimer = setInterval(() => {
-      void controller.quotaRecovery
-        .run()
+      void singleton("quota-probe", Math.max(quotaProbeMs * 2, 180_000), () => controller.quotaRecovery.run())
         .then((out) => {
+          if (!out) return;
           if (out.recovered.length > 0) {
             log.info("quota-probe.recovered", { models: out.recovered });
             return controller.scheduler.notify(WakeReason.QUOTA_RESET);
@@ -306,20 +342,45 @@ async function main() {
     quotaProbeTimer.unref?.();
   }
 
-  const shutdown = () => {
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     clearInterval(reconcileTimer);
+    clearInterval(resubscribeTimer);
+    clearInterval(uploadTimer);
     if (sandboxKeeperTimer) clearInterval(sandboxKeeperTimer);
     if (quotaProbeTimer) clearInterval(quotaProbeTimer);
     controller.scheduler.stop();
-    void runtime.close?.();
-    void agentos?.close?.();
-    server.close(() => process.exit(0));
+    await Promise.allSettled([runtime.close?.(), agentos?.close?.()]);
+    await new Promise((resolve) => server.close(resolve));
+    await Promise.allSettled([controller.store.close?.(), controller.sharedState?.close?.()]);
+    process.exit(0);
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => void shutdown());
+  process.on("SIGINT", () => void shutdown());
 }
 
-main().catch((err) => {
-  console.error(`startup failed: ${err.message}`);
-  process.exit(1);
-});
+// Race terukur (2026-09-09): task swarm menembak main() di milidetik
+// pertama container, sebelum datapath overlay (DNS/VXLAN) siap — koneksi
+// pertama ke pgproxy/redis-prod/openclaw-gateway bisa "Connection closed"
+// dan membunuh proses, crash-loop 0/2 padahal exec manual selalu selamat.
+// Boot kini dicoba ulang; kegagalan konektivitas adalah kondisi start,
+// bukan bug aplikasi.
+const BOOT_ATTEMPTS = Number(process.env.SEMANGGI_BOOT_ATTEMPTS ?? 8);
+const BOOT_RETRY_MS = Number(process.env.SEMANGGI_BOOT_RETRY_MS ?? 3_000);
+(async () => {
+  for (let attempt = 1; attempt <= BOOT_ATTEMPTS; attempt++) {
+    try {
+      await main();
+      return;
+    } catch (err) {
+      console.error(`startup failed (attempt ${attempt}/${BOOT_ATTEMPTS}): ${err.message}`);
+      if (attempt === BOOT_ATTEMPTS) {
+        console.error(err);
+        process.exit(1);
+      }
+      await new Promise((resolve) => setTimeout(resolve, BOOT_RETRY_MS));
+    }
+  }
+})();

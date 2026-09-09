@@ -2926,3 +2926,25 @@ D85 mengajarkan bahwa "COMPLETE" bisa berarti berjalan di tempat lain.
 **Test:** 587 → 595. Satu tes gagal di container (`connect frame carries no
 root-level nonce`) dan sudah gagal sebelum perubahan ini: adapter mencetak
 device identity ketika `identityPath` tidak ada.
+
+## D90 — Jangkar mingguan Anthropic: Senin 02:00 WIB, jam dinding tetap
+
+*(Commit kodenya `a5aaaa6` menyandang label "D89" — dua kali balapan penomoran dengan sesi paralel yang mengambil D88 lalu D89 untuk jalur ACP-`acp.spawn`; nomor final keputusan ini D90.)*
+
+**Fakta dari operator (2026-09-09):** langganan Anthropic (keluarga `claude-code`) punya limit mingguan DI SAMPING jendela 5 jam, dan reset mingguannya jatuh pada **jam dinding tetap: Senin 02:00 WIB** (Asia/Jakarta, tanpa DST).
+
+Driver claude-code memang menyiapkan slot ini sejak D63 — komentarnya berbunyi *"the fix is one descriptor"* saat jangkarnya diukur. Pengukuran datang dari operator; descriptor itoulah yang ditambahkan.
+
+**Satu tabel kebenaran, tiga pintu:**
+
+1. **Descriptor tunggal** `ANTHROPIC_WEEKLY_RESET = {atHourLocal: 2, timeZone: "Asia/Jakarta", day: 1}` hidup di `quota-drivers/core.mjs` (leaf, tanpa import — dipakai driver dan quota-windows tanpa siklus import).
+2. **Driver defaults → brains**: brains baru lahir dengan `longType: "fixed-time"` + descriptor; jalur ETA parkir `WAIT_QUOTA` (admission, `nextReset`) otomatis mem harga Senin-02:00-WIB berikutnya — `nextFixedResetMs` yang sadar-DST + day-walk mingguan sudah ada sejak D63 (dibangun untuk RPD tengah malam Pasifik).
+3. **Migrasi backfill** (db/index.mjs, tiap boot, idempoten): baris brains claude-code yang masih memegang descriptor NULL diisi; **suntingan tangan operator (descriptor terisi) tidak disentuh** — aturan yang sama dengan backfill D63.
+
+**Jangkar resource** (`applyQuotaSignal`): teks penolakan berskala mingguan (jendela ≥ 6 hari) pada keluarga claude-code → jangkar = **Senin-02:00-WIB berikutnya**, bukan envelope rolling `now+7d` yang selalu melewati reset tetap (sinyal Rabu → rolling berkata Senin+7d, reset tetap berkata Senin ini). Teks TANPA jam pada keluarga itu jatuh ke jam Senin yang sama — batas atas yang jujur untuk KEDUA jendelanya: tembok 5 jam dan mingguan sama-sama jebol paling lambat pada jam itu (dan lebih ketat dari 7-hari D84).
+
+**zai sengaja TIDAK berubah.** Siklus mingguan GLM coding plan adalah credits-anniversary (tanggal langganan, terukur D63), bukan jam dinding — mingguan-tetap Anthropic tidak digeneralisasi ke keluarga yang siklusnya berbeda.
+
+**Batas:** jangkar 5-jam claude-code tetap TIDAK ber-descriptor — blok 5 jam bergerak per-user, bukan jam dinding global; jalur hidup yang mem harganya adalah parser teks D87 (jam dinding terparse), bukan `nextReset` (5 jam bukan jendela retry-in-place, jalan itu tidak pernah ditempuh).
+
+**Test:** 578 → 592 (termasuk 9 tes D88/D89-acp.spawn sesi paralel). Milik D90: driver long-window (Rabu → Senin ini; tepat sebelum reset → Senin ini; tepat sesudah → Senin BERIKUTNYA), migrasi backfill (NULL diisi, tuned selamat, idempoten dua boot), jangkar teks mingguan + clockless claude-code → epoch Senin + release pass jendela, zai rolling tetap `now+7d`.

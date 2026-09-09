@@ -55,6 +55,9 @@ async function main() {
     token: readSecret(process.env.SEMANGGI_GATEWAY_TOKEN_FILE, "openclaw_gateway_token"),
     version: process.env.SEMANGGI_VERSION ?? "0.1.0",
     onEvent: (name, payload) => void sessionEvents?.handle(name, payload),
+    // Pemilik sesi ACP (D88). Ganti hanya bila agen pemilik di gateway diganti;
+    // agen itu harus `sandbox.mode: "off"` karena ACP berjalan di host.
+    ...(process.env.SEMANGGI_ACP_OWNER_AGENT ? { acpOwnerAgentId: process.env.SEMANGGI_ACP_OWNER_AGENT } : {}),
     log: log.child({ component: "gateway" }),
   });
 

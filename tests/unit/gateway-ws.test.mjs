@@ -508,12 +508,23 @@ test("a worker's own agent wins when it already satisfies the routing decision",
 //
 // Asumsi "orchestrator agent yang menggerakkan harness" tidak pernah terbukti:
 // nol container `openclaw.acp=1` dan nol `.claude-home` di seluruh workspace.
-test("D85: claude-code dirutekan ke agen ACP yang dipaku acpAgent", async () => {
+// D88 MENGGANTI JALURNYA, BUKAN PELAJARANNYA.
+//
+// D85 memperbaiki "agen mana yang menerima run harness". D88 menjawab
+// pertanyaan yang lebih dalam: run harness tidak boleh lewat `agent` sama
+// sekali. Diukur pada 2026.8.2 — sebuah agen `runtime.type="acp"` yang
+// dijalankan lewat `agent` tetap dieksekusi model embedded. Jadi kontraknya
+// kini: frame `acp.spawn`, dan tidak pernah `agent`.
+const ACP_HELLO = ["agent.run", "connect", "agents.list", "acp.spawn"];
+
+test("D85/D88: claude-code dikirim ke harness yang dipaku acpAgent, lewat acp.spawn", async () => {
   const { FakeWS, sent } = fakeSocketFactory({
-    agents: [
-      { id: "orchestrator", workspace: "/nfs/w/executions/TASK-1", model: { primary: "zai/glm-4.7" } },
-      { id: "claude-opus", workspace: "/nfs/w/executions/TASK-1", model: { primary: "anthropic/claude-opus" } },
-    ],
+    methods: ACP_HELLO,
+    agents: [{ id: "orchestrator", workspace: "/nfs/w/executions/TASK-1", model: { primary: "zai/glm-4.7" } }],
+    onRequest: (frame) =>
+      frame.method === "acp.spawn"
+        ? { ok: true, payload: { status: "accepted", childSessionKey: "agent:claude-opus:acp:u1", runId: "r1" } }
+        : undefined,
   });
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
   await rt.dispatch({
@@ -523,13 +534,20 @@ test("D85: claude-code dirutekan ke agen ACP yang dipaku acpAgent", async () => 
     worker: { id: "W1", agent_ref: "orchestrator" },
     candidate: { provider: "claude-code", model: "claude-code", mode: "acp", acpAgent: "claude-opus" },
   });
-  assert.equal(sent.find((f) => f.method === rt.dispatchMethod).params.agentId, "claude-opus");
+  const frame = sent.find((f) => f.method === "acp.spawn");
+  assert.equal(frame.params.agentId, "claude-opus");
+  assert.ok(!sent.some((f) => f.method === "agent" || f.method === "agent.run"));
   await rt.close();
 });
 
-test("D85: claude-code tanpa agen ACP hidup MENOLAK dispatch, bukan jatuh ke agen lain", async () => {
-  const { FakeWS } = fakeSocketFactory({
+test("D85/D88: harness yang ditolak gateway MENOLAK dispatch, bukan jatuh ke agen lain", async () => {
+  const { FakeWS, sent } = fakeSocketFactory({
+    methods: ACP_HELLO,
     agents: [{ id: "orchestrator", workspace: "/nfs/w/executions/TASK-1", model: { primary: "zai/glm-4.7" } }],
+    onRequest: (frame) =>
+      frame.method === "acp.spawn"
+        ? { ok: false, error: { code: "INVALID_REQUEST", message: 'Unknown agent id "claude-opus" (dispatch_failed)' } }
+        : undefined,
   });
   const rt = createGatewayRuntime({ token: "t" }, { WebSocketImpl: FakeWS });
   await assert.rejects(
@@ -540,12 +558,15 @@ test("D85: claude-code tanpa agen ACP hidup MENOLAK dispatch, bukan jatuh ke age
         candidate: { provider: "claude-code", model: "claude-code", mode: "acp", acpAgent: "claude-opus" },
       }),
     (err) => {
-      // Pesannya MUST menyebut agen ACP yang dicari — bukan model
+      // Pesannya MUST menyebut harness yang dicari — bukan model
       // claude-code/claude-code yang tidak akan pernah ada.
       assert.match(err.message, /claude-opus/);
       return true;
     },
   );
+  // Inti D85 yang tetap berlaku: lebih baik task terparkir daripada satu run
+  // yang berjalan di tempat yang salah.
+  assert.ok(!sent.some((f) => f.method === "agent" || f.method === "agent.run"));
   await rt.close();
 });
 

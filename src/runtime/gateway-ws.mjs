@@ -94,6 +94,23 @@ export function effortIsGuaranteed(candidate) {
   return (candidate?.effortMode ?? "guaranteed") === "guaranteed";
 }
 
+/**
+ * Apakah kandidat ini dijalankan oleh harness ACP, bukan oleh model embedded.
+ *
+ * Satu-satunya penanda adalah provider `claude-code` — nama provider semu yang
+ * dipakai Brain harness. Modelnya (`claude-code/claude-code`) tidak pernah ada
+ * di katalog gateway mana pun; yang menentukan model sesungguhnya adalah
+ * launcher acpx di balik `acpAgent`.
+ */
+export function isHarnessCandidate(candidate) {
+  return candidate?.provider === "claude-code";
+}
+
+/** Nama agen ACP yang dipaku sebuah Brain harness, ternormalisasi. */
+export function acpAgentOf(candidate) {
+  return String(candidate?.acpAgent ?? "").trim().toLowerCase() || null;
+}
+
 export function sessionKeyFor(agentId, task, execution) {
   const ref = execution?.session_ref;
   const lineage = ref ? `s${ref}` : `r${execution?.revision_no ?? 1}`;
@@ -125,6 +142,16 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
     // Set false to dispatch straight to worker.agent_ref without checking that
     // the routed model will really be the model that runs. Only for tests.
     resolveAgentByModel = true,
+    // Pemilik sesi ACP yang lahir dari RPC (D88).
+    //
+    // `acp.spawn` menuntut seorang pemilik: sesi harness mewarisi workspace,
+    // tool policy, dan kuota pemiliknya, dan gateway menolak menebak. Pemanggil
+    // RPC tidak punya sesi induk untuk mewarisi, jadi controller menyebutkannya.
+    //
+    // Agen ini TIDAK pernah menjalankan turn-nya sendiri; ia hanya memayungi.
+    // Karena ACP berjalan di host, ia harus `sandbox.mode: "off"` — sesi yang
+    // ter-sandbox dilarang men-spawn ACP, dan itu kebijakan hulu yang benar.
+    acpOwnerAgentId = "sem-acp-owner",
     // Called for every `type:"event"` frame. This is how the controller learns a
     // run finished: the gateway pushes session events, and nothing else on this
     // version reports completion after the fact (D15).
@@ -400,6 +427,147 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
     });
   }
 
+  /**
+   * Dispatch sebuah Brain harness lewat `acp.spawn` (D88).
+   *
+   * KENAPA TERPISAH DARI `dispatch`
+   *
+   * Bukan sekadar nama method yang berbeda. Jalur `agent` memilih AGEN lalu
+   * berharap agen itu menjalankan model yang benar; jalur ini menyebut
+   * HARNESS-nya langsung dan gateway yang menyalakan prosesnya. Tidak ada
+   * resolusi agen, tidak ada model override, tidak ada `thinking` — effort
+   * sudah dipaku di dalam launcher acpx (`semanggi-acp-claude-opus`
+   * menyetel opus/high sebelum exec), jadi mengirimnya dari sini hanya akan
+   * menciptakan dua sumber kebenaran yang bisa berselisih.
+   *
+   * TIDAK ADA JATUH-KEMBALI KE `agent`
+   *
+   * Kalau `acp.spawn` menolak, dispatch ini gagal. Menjatuhkannya ke `agent`
+   * akan mengembalikan persis bug D85/D86: run yang tampak berhasil,
+   * berjalan di model lain, di luar sandbox, tanpa gerbang izin. Sebuah task
+   * yang terparkir jauh lebih murah daripada satu run yang berbohong.
+   */
+  async function dispatchAcp({ task, execution, candidate, worker, workspacePath, instruction }) {
+    await connect();
+    const acpAgent = acpAgentOf(candidate);
+    // Brain harness tanpa acpAgent tidak bisa dirutekan ke mana pun. Ini
+    // kesalahan konfigurasi, bukan kegagalan runtime, jadi pesannya menyebut
+    // apa yang harus diisi operator.
+    if (!acpAgent) {
+      throw new GatewayContractError(
+        `Brain "${candidate?.brain?.name ?? candidate?.brain?.id ?? "?"}" dirutekan sebagai harness ` +
+          "tetapi tidak memaku acpAgent; isi kolom ACP agent pada Brain tersebut.",
+      );
+    }
+    // Gateway yang belum membawa fork Semanggi akan menjawab
+    // "unknown method: acp.spawn" pada frame pertama. Memeriksanya lebih dulu
+    // mengubah kegagalan itu menjadi kalimat yang menyebut sebabnya.
+    if (!hello?.features?.methods?.includes("acp.spawn")) {
+      throw new GatewayContractError(
+        "gateway ini tidak mengekspos acp.spawn; ACP hanya bisa dijalankan oleh image dari " +
+          "fork openclaw branch `semanggi` (lihat docs/upgrade-openclaw-fork.md). " +
+          "Tanpa itu, Brain harness TIDAK boleh didispatch — jalur `agent` akan diam-diam " +
+          "menjalankannya di model embedded (D86).",
+      );
+    }
+    if (!workspacePath) {
+      throw new GatewayContractError("harness dispatch membutuhkan workspace project");
+    }
+
+    const params = {
+      task: withPreamble(instruction, {
+        task,
+        brain: candidate?.brain ?? candidate ?? null,
+        role: worker?.role ?? null,
+        workspacePath,
+      }),
+      // Harness, bukan agen OpenClaw. Gateway memetakannya ke launcher acpx.
+      agentId: acpAgent,
+      // Pemilik sesi. Tanpa ini gateway menolak: sesi ACP mewarisi workspace,
+      // tool policy, dan kuota pemiliknya, dan menebak berarti memberi
+      // harness kewenangan yang tidak pernah diberikan siapa pun.
+      ownerAgentId: acpOwnerAgentId,
+      // Berbeda dari jalur `agent`, di mana workspace adalah properti agen dan
+      // `cwd` ditolak mentah (D14): sesi ACP justru menerima cwd, dan itulah
+      // yang menentukan direktori kerja harness.
+      cwd: workspacePath,
+      label: task.id,
+      // Satu execution = satu percobaan (P4-11). Kunci ini yang membuat
+      // pengiriman ulang setelah balasan hilang tidak melahirkan run harness
+      // kedua — dan sebuah run harness kedua berarti kuota Claude kedua serta
+      // efek samping kedua di workspace.
+      idempotencyKey: execution.id,
+      // CONTINUE menyambung percakapan harness yang sama; revisi baru tidak.
+      ...(execution.session_ref ? { resumeSessionId: execution.session_ref } : {}),
+    };
+
+    let payload;
+    try {
+      payload = await request("acp.spawn", params, {
+        onSent: (requestId) => trackDispatchedRun(requestId, execution.id),
+      });
+    } catch (err) {
+      const errText = gatewayErrorText(err.gatewayError ?? err.message);
+      // Kuota Claude dibaca dengan driver provider yang sama seperti jalur
+      // lain. Yang TIDAK boleh terjadi lagi adalah D85: penolakan dicatat
+      // pada resource yang salah. Karena itu provider/model yang dilaporkan
+      // di sini adalah milik kandidat harness, bukan milik agen mana pun.
+      const verdict = quotaDriverFor(candidate.provider).classifyError({
+        status: err.status ?? null,
+        text: errText,
+      });
+      if (verdict?.kind === "quota") {
+        err.status = 429;
+        err.quota = {
+          status: 429,
+          resetsAt: verdict.resetsAt ?? null,
+          rateLimitType: verdict.rateLimitType ?? null,
+          message: errText.slice(0, 200),
+          retryAfterSeconds: null,
+          provider: candidate.provider,
+          model: candidate.model,
+        };
+      } else if (verdict?.kind === "fatal") {
+        err.fatalQuota = {
+          reason: verdict.reason ?? "provider fatal",
+          structural: Boolean(verdict.structural),
+          message: errText.slice(0, 200),
+          provider: candidate.provider,
+          model: candidate.model,
+        };
+      }
+      throw err;
+    }
+
+    // `accepted` adalah satu-satunya hasil yang berarti sesi harness benar-
+    // benar dimulai; status lain dikembalikan gateway sebagai error, tetapi
+    // sebuah payload tanpa kunci sesi tetap tidak bisa diikuti — dan run yang
+    // tidak bisa diikuti tidak boleh dicatat seolah berjalan.
+    const childSessionKey = payload?.childSessionKey ?? null;
+    if (!childSessionKey) {
+      throw new GatewayContractError(
+        `acp.spawn tidak mengembalikan childSessionKey (status=${payload?.status ?? "?"})`,
+      );
+    }
+    log.info("dispatch.acp", {
+      task: task.id,
+      exec: execution.id,
+      acpAgent,
+      owner: acpOwnerAgentId,
+      sessionKey: childSessionKey,
+      resumed: Boolean(execution.session_ref),
+      workspace: workspacePath,
+    });
+    return {
+      runtimeRef: payload?.runId ?? execution.id,
+      // Kunci sesi anak inilah percakapan harness; CONTINUE berikutnya
+      // menyambung ke sini lewat resumeSessionId.
+      sessionRef: execution.session_ref ?? childSessionKey,
+      sessionKey: childSessionKey,
+      raw: payload,
+    };
+  }
+
   const api = {
     connect,
     request,
@@ -614,8 +782,20 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
       }
     },
 
+
     async dispatch({ task, execution, candidate, worker, workspacePath, instruction }) {
       if (!worker?.agent_ref) throw new GatewayContractError("worker has no agent_ref to dispatch to");
+      // Brain harness punya jalur sendiri, dan itu BUKAN `agent` (D88).
+      //
+      // Diukur pada 2026.8.2: sebuah agen dengan `runtime.type="acp"` yang
+      // dijalankan lewat `agent` tetap dieksekusi oleh model embedded — kontrak
+      // ACP-nya diterima lalu diabaikan, tanpa satu baris log. Itulah cara
+      // TASK-5A24B39E menghabiskan kuota provider lain sambil melewati sandbox,
+      // `.claude-home`, dan gerbang izin. Jadi harness tidak boleh lewat sini
+      // sama sekali; ia lewat `acp.spawn` milik fork.
+      if (isHarnessCandidate(candidate)) {
+        return await dispatchAcp({ task, execution, candidate, worker, workspacePath, instruction });
+      }
       // Connect first: the method name is negotiated during the handshake, and
       // reading it before then sends a frame with method:null.
       await connect();
@@ -1086,6 +1266,6 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
     },
   };
 
-  if (resolveAgentByModel) registry = createAgentRegistry({ runtime: api });
+  if (resolveAgentByModel) registry = createAgentRegistry({ runtime: api, acpOwnerAgentId });
   return api;
 }

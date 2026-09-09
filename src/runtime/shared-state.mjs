@@ -35,6 +35,7 @@ class LocalSharedState {
 class RedisSharedState {
   #redis;
   #prefix;
+  #uri;
 
   constructor(uri, { prefix = "semanggi" } = {}) {
     // Bun 1.2.22: opsi {password} pada RedisClient gagal — koneksi ditutup

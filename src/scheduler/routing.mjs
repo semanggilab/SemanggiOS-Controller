@@ -1,4 +1,5 @@
 // Model routing policy — POC-4 §5.3.
+import { isHarnessProvider } from "../domain/harness.mjs";
 //
 // The binding rule: quality decides the *candidate set*, availability decides
 // *dispatch or wait*. Availability is never allowed to widen the candidate set,
@@ -156,9 +157,9 @@ export class RoutingPolicy {
  * can quietly send it down the ordinary model path.
  */
 export function assertDispatchPathAllowed(candidate) {
-  if (candidate.provider === "claude-code" && !["acp", "batch"].includes(candidate.mode)) {
+  if (isHarnessProvider(candidate.provider) && !["acp", "batch"].includes(candidate.mode)) {
     throw new Error(
-      `claude-code may only dispatch via the ACP or batch path (POC-3), got mode="${candidate.mode}"`,
+      `${candidate.provider} may only dispatch via the ACP or batch path, got mode="${candidate.mode}"`,
     );
   }
   return candidate;

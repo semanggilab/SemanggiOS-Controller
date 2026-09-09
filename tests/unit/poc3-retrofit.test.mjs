@@ -279,7 +279,10 @@ test("the loopback forwarder gives a localhost origin onto the upstream", async 
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ sawOrigin: req.headers.origin, path: req.url }));
   });
-  upstream.listen(0, "127.0.0.1");
+  const upstreamPort = typeof Bun === "undefined"
+    ? 0
+    : 20_000 + crypto.getRandomValues(new Uint16Array(1))[0] % 30_000;
+  upstream.listen(upstreamPort, "127.0.0.1");
   await once(upstream, "listening");
 
   const fwd = await startLoopbackForwarder({

@@ -1,4 +1,5 @@
 // Resolving a routed model to a concrete OpenClaw agent.
+import { isHarnessBrain } from "../domain/harness.mjs";
 //
 // WHY THIS EXISTS
 //
@@ -100,7 +101,7 @@ export function modelKey(provider, model) {
  * pada model dan bukan pada "agen mana pun di workspace ini".
  */
 function isHarnessRouted(candidate) {
-  return candidate?.provider === "claude-code";
+  return isHarnessBrain(candidate);
 }
 
 /** Nama agen ACP yang dipaku sebuah kandidat harness, ternormalisasi. */
@@ -108,57 +109,14 @@ function acpAgentOf(candidate) {
   return String(candidate?.acpAgent ?? "").trim().toLowerCase() || null;
 }
 
-export function createAgentRegistry({
-  runtime,
-  ttlMs = 30_000,
-  now = () => Date.now(),
-  // Agen yang ADA hanya untuk pipa ACP, dan tidak boleh pernah menerima run
-  // biasa. Lihat `isPlumbingAgent`.
-  acpOwnerAgentId = null,
-} = {}) {
+export function createAgentRegistry({ runtime, ttlMs = 30_000, now = () => Date.now() } = {}) {
   if (!runtime) throw new Error("agent registry needs a gateway runtime");
 
   let cache = null;
   let cachedAt = 0;
-  let acpIds = null;
-
-  /**
-   * Agen pipa ACP: pemilik sesi (`acpOwnerAgentId`) dan entri agen untuk tiap
-   * harness (`claude-opus`, `claude-sonnet`, ...).
-   *
-   * KENAPA HARUS DIKECUALIKAN — D88
-   *
-   * Ketiganya tidak menyetel model sendiri, jadi gateway mengiklankan mereka
-   * dengan model ambient default. Diukur 2026-09-09: `claude-opus`,
-   * `claude-sonnet`, dan `sem-acp-owner` semuanya melapor
-   * `google/gemini-3.1-flash-lite` di workspace sdmk-kader — persis sama
-   * dengan agen kerja gemini yang sah di sana.
-   *
-   * Tanpa pagar ini, sebuah Brain gemini biasa bisa dicocokkan ke
-   * `claude-opus` dan berjalan di sana: model yang benar, agen yang salah,
-   * memakai session store milik harness. Dan `sem-acp-owner` justru yang
-   * paling berbahaya — ia sengaja `sandbox.mode: "off"`, jadi run yang
-   * mendarat di sana kehilangan sandbox tanpa ada yang memutuskannya.
-   *
-   * Mereka hanya boleh dicapai lewat jalurnya sendiri: `acp.spawn`.
-   */
-  function isPlumbingAgent(id) {
-    const norm = String(id ?? "").trim().toLowerCase();
-    if (!norm) return false;
-    if (acpOwnerAgentId && norm === String(acpOwnerAgentId).trim().toLowerCase()) return true;
-    return Array.isArray(acpIds) && acpIds.includes(norm);
-  }
 
   async function list({ refresh = false } = {}) {
     if (!refresh && cache && now() - cachedAt < ttlMs) return cache;
-    // Daftar harness ACP dibaca sekali dan dipakai sebagai pengecualian. Kalau
-    // gateway tidak bisa menjawabnya, `acpIds` tetap null dan pagar menyempit
-    // ke pemilik sesi saja — memburuk secara terbatas, bukan diam-diam
-    // membuka semuanya.
-    if (acpIds === null && typeof runtime.listAcpAgents === "function") {
-      const ids = await runtime.listAcpAgents().catch(() => null);
-      acpIds = Array.isArray(ids) ? ids.map((id) => String(id).trim().toLowerCase()) : [];
-    }
     const payload = await runtime.request("agents.list", {});
     const agents = Array.isArray(payload?.agents) ? payload.agents : [];
     cache = agents.map((a) => ({
@@ -211,9 +169,6 @@ export function createAgentRegistry({
         if (!wantAcpAgent) return false;
         return String(a.id ?? "").toLowerCase() === wantAcpAgent;
       }
-      // Berlaku juga pada jalur override: justru di sanalah agen pipa paling
-      // mudah lolos, karena override sengaja berhenti memeriksa model.
-      if (isPlumbingAgent(a.id)) return false;
       if (wantModel && a.model !== wantModel) return false;
       // Only checked when the agent tells us what it supports AND we are not
       // overriding the model: with an override the advertised levels belong to

@@ -23,9 +23,10 @@
 // extends a live future anchor — a sliding envelope would postpone release
 // forever, one probe at a time.
 import { nullLogger } from "./logger.mjs";
+import { isHarnessProvider } from "./harness.mjs";
 import { isQuotaErrorMessage } from "./quota-windows.mjs";
 
-export function createQuotaRecovery({ repos, runtime, config = {}, now = () => Date.now(), log = nullLogger }) {
+export function createQuotaRecovery({ repos, runtime, sharedState = null, config = {}, now = () => Date.now(), log = nullLogger }) {
   // A row releasing within this horizon is the window pass's business —
   // probing it buys at most a few minutes and spends a real completion.
   const horizonMs = config.quotaProbeHorizonMs ?? 10 * 60_000;
@@ -58,11 +59,13 @@ export function createQuotaRecovery({ repos, runtime, config = {}, now = () => D
     for (const r of rows) {
       // ACP harness: no live agent ever reports model "claude-code/…" and
       // probing an orchestrator proves the orchestrator, not the harness.
-      if (r.provider === "claude-code") continue;
+      if (isHarnessProvider(r.provider)) continue;
       const key = `${r.provider}/${r.model}`;
-      const failures = consecutiveFailures.get(key) ?? 0;
+      const shared = await sharedState?.getJson(`quota-probe:${key}`);
+      const failures = shared?.consecutiveFailures ?? consecutiveFailures.get(key) ?? 0;
       const effectiveCooldown = Math.min(cooldownMs * 2 ** failures, maxCooldownMs);
-      if (now() - (lastProbeAt.get(key) ?? 0) < effectiveCooldown) continue;
+      const previousProbeAt = shared?.lastProbeAt ?? lastProbeAt.get(key) ?? 0;
+      if (now() - previousProbeAt < effectiveCooldown) continue;
       if (r.next_available_at != null && r.next_available_at <= now() + horizonMs) continue;
       // A model with dispatches in flight measures itself: a wall it hits
       // re-anchors via the late-error path, a success flips nothing (it was
@@ -72,6 +75,7 @@ export function createQuotaRecovery({ repos, runtime, config = {}, now = () => D
       if (!agent) continue;
 
       lastProbeAt.set(key, now());
+      await sharedState?.setJson(`quota-probe:${key}`, { lastProbeAt: now(), consecutiveFailures: failures }, { ttlMs: maxCooldownMs * 2 });
       out.probed.push(key);
       const result = await runtime.testAgent({ agentId: agent.id, thinking: null, timeoutMs }).catch((err) => ({
         ok: false,
@@ -79,6 +83,7 @@ export function createQuotaRecovery({ repos, runtime, config = {}, now = () => D
       }));
       if (result.ok) {
         consecutiveFailures.set(key, 0);
+        await sharedState?.setJson(`quota-probe:${key}`, { lastProbeAt: now(), consecutiveFailures: 0 }, { ttlMs: maxCooldownMs * 2 });
         await repos.resources.setAvailability(r.provider, r.model, "AVAILABLE", { source: "recovery-probe" });
         log.info("quota.recovery-probe", {
           provider: r.provider,
@@ -93,6 +98,9 @@ export function createQuotaRecovery({ repos, runtime, config = {}, now = () => D
       const text = String(result.error ?? "");
       const stillExhausted = isQuotaErrorMessage(text);
       consecutiveFailures.set(key, stillExhausted ? failures + 1 : 0);
+      await sharedState?.setJson(`quota-probe:${key}`, {
+        lastProbeAt: now(), consecutiveFailures: stillExhausted ? failures + 1 : 0,
+      }, { ttlMs: maxCooldownMs * 2 });
       if (stillExhausted && (r.next_available_at == null || r.next_available_at <= now())) {
         // Clockless or expired anchor only — never extend a live one. The
         // hardened applyQuotaSignal prices the short window from the hit.

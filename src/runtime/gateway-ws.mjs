@@ -22,6 +22,7 @@
 // `features.methods` and refuses to continue if `agent.run` is missing. A
 // version skew therefore fails loudly at startup instead of quietly at dispatch.
 import { randomUUID } from "node:crypto";
+import { isHarnessBrain } from "../domain/harness.mjs";
 import { buildDeviceBlock, loadOrCreateDeviceIdentity } from "./device-identity.mjs";
 import { createAgentRegistry } from "./agent-registry.mjs";
 import { nullLogger } from "../domain/logger.mjs";
@@ -103,7 +104,7 @@ export function effortIsGuaranteed(candidate) {
  * launcher acpx di balik `acpAgent`.
  */
 export function isHarnessCandidate(candidate) {
-  return candidate?.provider === "claude-code";
+  return isHarnessBrain(candidate);
 }
 
 /** Nama agen ACP yang dipaku sebuah Brain harness, ternormalisasi. */

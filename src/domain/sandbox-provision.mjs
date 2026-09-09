@@ -24,6 +24,7 @@
 //      di atas parkir yang sudah benar, bukan penggantinya.
 import { shortId } from "./repositories.mjs";
 import { Status } from "./state-machine.mjs";
+import { isHarnessProvider } from "./harness.mjs";
 
 const slug = (s) => String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 
@@ -52,7 +53,7 @@ export function probeWorkspaceFor(live, provider) {
 // menemukan dedupe ini di overview). claude-code selalu kosong: agen harness
 // ACP dipaku routing, tidak pernah diciptakan per model.
 export function agentsForModel({ provider, model }, liveAgents) {
-  if (provider === "claude-code") return [];
+  if (isHarnessProvider(provider)) return [];
   const target = `${provider}/${model}`.toLowerCase();
   return liveAgents.filter((a) => String(a?.model?.primary ?? "").toLowerCase() === target);
 }
@@ -153,7 +154,7 @@ export function createSandboxProvision({ brains, runtime, repos, events, log, no
       (b) => b.provider === candidate.provider && b.model === candidate.model,
     );
     if (!brain) return { created: false, why: "no-brain" };
-    if (brain.provider === "claude-code") return { created: false, why: "claude-code" };
+    if (isHarnessProvider(brain.provider)) return { created: false, why: "acp-harness" };
     const cap = await capFor(brain);
     if (cap == null) return { created: false, why: "no-resource-entry" };
     const live = await liveAgents();
@@ -187,7 +188,7 @@ export function createSandboxProvision({ brains, runtime, repos, events, log, no
   async function reconcileModel(provider, model, { actor = "keeper", reason = "keeper pass" } = {}) {
     if (typeof runtime?.listAgents !== "function") return { provider, model, skipped: "no-runtime" };
     const enabled = (await brains.list({ enabledOnly: true })).filter(
-      (b) => b.provider === provider && b.model === model && b.provider !== "claude-code",
+      (b) => b.provider === provider && b.model === model && !isHarnessProvider(b.provider),
     );
     const floor = enabled.reduce((m, b) => Math.max(m, b.minSandboxes ?? 0), 0);
     const governor = enabled.find((b) => (b.minSandboxes ?? 0) === floor) ?? null;
@@ -287,7 +288,7 @@ export function createSandboxProvision({ brains, runtime, repos, events, log, no
     const out = { results: [], created: 0, killed: 0 };
     const models = new Map();
     for (const b of await brains.list()) {
-      if (b.provider === "claude-code") continue;
+      if (isHarnessProvider(b.provider)) continue;
       models.set(`${b.provider}/${b.model}`.toLowerCase(), { provider: b.provider, model: b.model });
     }
     const live = await liveAgents();

@@ -37,6 +37,24 @@
       }
     },
     {
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "creditClass": "subscription",
+      "concurrencyLimit": 2
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "creditClass": "subscription",
+      "concurrencyLimit": 2
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-6-astra",
+      "creditClass": "subscription",
+      "concurrencyLimit": 1
+    },
+    {
       "provider": "zai",
       "model": "glm-5.1",
       "creditClass": "metered",

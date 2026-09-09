@@ -8,16 +8,19 @@ import { createAdmission } from "./scheduler/admission.mjs";
 import { createScheduler } from "./scheduler/scheduler.mjs";
 import { nullLogger } from "./domain/logger.mjs";
 import { createOperators } from "./domain/operators.mjs";
-import { createBrains, brainsFromRoutingConfig } from "./domain/brains.mjs";
+import { createBrains, brainsFromRoutingConfig, Level } from "./domain/brains.mjs";
 import { createSandboxProvision } from "./domain/sandbox-provision.mjs";
 import { createQuotaRecovery } from "./domain/quota-recovery.mjs";
-import { createBrainMap } from "./domain/brain-map.mjs";
+import { createBrainMap, DEFAULT_BRAIN_MAP } from "./domain/brain-map.mjs";
 import { createThinkingLevels } from "./domain/thinking-levels.mjs";
 import { createGatewayModelsCache } from "./domain/gateway-models.mjs";
 import { shortId } from "./domain/repositories.mjs";
 
 export async function createController({
   storeLocation = ":memory:",
+  databaseDriver = "sqlite",
+  databaseUri = null,
+  sharedState = null,
   routing = {},
   // Resource catalogue (POC-4 §4). Seeding is idempotent and never clobbers a
   // live availability signal: a 429 recorded at runtime is more current than a
@@ -29,7 +32,7 @@ export async function createController({
   now = () => Date.now(),
   log = nullLogger,
 } = {}) {
-  const store = openStore({ location: storeLocation });
+  const store = await openStore({ driver: databaseDriver, uri: databaseUri, location: storeLocation });
   const events = createEventLog(store, { now });
   const repos = createRepositories(store, events, { now, log: log.child({ component: "repo" }) });
   const operators = createOperators(store, { now });
@@ -60,6 +63,72 @@ export async function createController({
       }
     }
     log.info("brain.seeded", { count: (await brains.list()).length, source: "routing config" });
+  }
+
+  // Versioned, explicit Brain policy rollout. Existing installations do not
+  // reseed from files, so a normal restart preserves operator edits. A new
+  // policy version is different: it is a deliberate deployment migration and
+  // is applied exactly once, with an append-only event as its durable marker.
+  const brainPolicyVersion = String(routing.brainPolicyVersion ?? "").trim();
+  if (brainPolicyVersion) {
+    const applied = await store.get(
+      `SELECT seq FROM event_log WHERE kind = ? AND subject_type = ? AND subject_id = ? LIMIT 1`,
+      ["brain.policy-applied", "config", brainPolicyVersion],
+    );
+    if (!applied) {
+      for (const seed of brainsFromRoutingConfig(routing)) {
+        const existing = await brains.get(seed.name);
+        if (!existing) {
+          await brains.create(seed);
+          continue;
+        }
+        if (existing.provider !== seed.provider || existing.model !== seed.model) {
+          throw new Error(
+            `Brain policy ${brainPolicyVersion}: ${seed.name} already points to ` +
+              `${existing.provider}/${existing.model}, expected ${seed.provider}/${seed.model}`,
+          );
+        }
+        await brains.update(existing.id, {
+          thinking: seed.thinking,
+          effortMode: seed.effortMode,
+          effortEvidence: seed.effortEvidence,
+          mode: seed.mode,
+          acpAgent: seed.acpAgent,
+          level: seed.level,
+          enabled: true,
+        });
+      }
+
+      const mapPolicy = routing.brainMapPolicy ?? {};
+      let cells = 0;
+      for (const [template, roles] of Object.entries(DEFAULT_BRAIN_MAP)) {
+        for (const role of Object.keys(roles)) {
+          for (const level of [Level.LOW, Level.NORMAL, Level.CRITICAL]) {
+            const names = mapPolicy[level]?.[role] ?? mapPolicy[level]?.default;
+            if (!Array.isArray(names) || names.length === 0) continue;
+            const ids = [];
+            for (const name of names) {
+              const brain = await brains.get(name);
+              if (!brain) throw new Error(`Brain policy ${brainPolicyVersion}: unknown mapped Brain ${name}`);
+              ids.push(brain.id);
+            }
+            await brainMap.set(
+              { template, role, level, brainIds: ids, actor: `policy:${brainPolicyVersion}` },
+              { brains },
+            );
+            cells += 1;
+          }
+        }
+      }
+      await events.append({
+        kind: "brain.policy-applied",
+        subjectType: "config",
+        subjectId: brainPolicyVersion,
+        actor: "deployment",
+        payload: { cells },
+      });
+      log.info("brain.policy-applied", { version: brainPolicyVersion, cells });
+    }
   }
 
   // Katalog thinking levels: diseed HANYA saat tabelnya kosong (D66). Selama
@@ -99,6 +168,7 @@ export async function createController({
   const quotaRecovery = createQuotaRecovery({
     repos,
     runtime,
+    sharedState,
     config,
     now,
     log: log.child({ component: "quota-recovery" }),
@@ -114,7 +184,7 @@ export async function createController({
     // D75: the watchdog's dead-run verdict writes an audit event, same as the
     // sink and reconciler paths — one budget, one trail.
     events,
-    config: { log: log.child({ component: "scheduler" }), gatewayHooks, ...config },
+    config: { log: log.child({ component: "scheduler" }), gatewayHooks, sharedState, ...config },
     now,
   });
 
@@ -122,5 +192,5 @@ export async function createController({
   // (D67) harus tahu baris mana yang akan di-seed ulang pada boot berikutnya —
   // menghapus baris yang masih ada di seed adalah penghapusan yang tidak
   // pernah terjadi.
-  return { store, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, sandboxProvision, quotaRecovery, config, now, log, runtime, seedResources: resources };
+  return { store, sharedState, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, sandboxProvision, quotaRecovery, config, now, log, runtime, seedResources: resources };
 }

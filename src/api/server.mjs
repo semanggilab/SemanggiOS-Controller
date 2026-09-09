@@ -30,6 +30,7 @@ import { classify, Intent, Action } from "../interface/intent.mjs";
 import { markRegistered, parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
 import { probeWorkspaceFor, busyAgentsByRef as sharedBusyAgentsByRef } from "../domain/sandbox-provision.mjs";
 import { isPreambleWrapped } from "../runtime/instruction.mjs";
+import { isHarnessProvider } from "../domain/harness.mjs";
 import { createPrepareTask } from "../domain/prepare.mjs";
 import { QUOTA_RETRY_LIMIT, describeWindow, isRetryableWindow } from "../domain/quota-windows.mjs";
 import { probeThinkingLevels } from "../domain/thinking-probe.mjs";
@@ -321,6 +322,14 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   // guard, so a second click of Refresh Levels while one is in flight can't
   // start a duplicate sweep of the same model.
   const thinkingProbes = new Map();
+  const probeStateKey = (key) => `thinking-probe:${key}`;
+  const getProbe = async (key) => controller.sharedState
+    ? controller.sharedState.getJson(probeStateKey(key))
+    : thinkingProbes.get(key);
+  const setProbe = async (key, value) => {
+    thinkingProbes.set(key, value);
+    await controller.sharedState?.setJson(probeStateKey(key), value, { ttlMs: 24 * 60 * 60 * 1000 });
+  };
   const route = (method, pattern, handler, { auth = true, slack = false } = {}) => {
     const names = [];
     const regex = new RegExp(
@@ -1681,7 +1690,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     try {
       const brain = await controller.brains.create(body);
       log.info("brain.created", { brain: brain.name, level: brain.level, by: actor.name });
-      if (brain.provider !== "claude-code" && (brain.minSandboxes ?? 0) > 0) {
+      if (!isHarnessProvider(brain.provider) && (brain.minSandboxes ?? 0) > 0) {
         await reconcileFloorNow(brain, actor.name, "brain created with a floor");
       }
       return { brain };
@@ -1726,7 +1735,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       });
       // D81: lantai model ini bisa ikut turun (atau hilang) — sisa armada
       // sem-auto-nya menyusut sekarang, bukan menunggu keeper.
-      if (brain.provider !== "claude-code") {
+      if (!isHarnessProvider(brain.provider)) {
         await reconcileFloorNow(brain, actor.name, "brain deleted");
       }
       return { brain, clearedMappings };
@@ -2563,7 +2572,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     if (!controller.runtime?.probeLevel) throw badRequest("this runtime does not support thinking-level probing");
 
     const statusKey = `${provider}/${model}`.toLowerCase();
-    const existing = thinkingProbes.get(statusKey);
+    const existing = await getProbe(statusKey);
     if (existing?.running) {
       return { ok: true, started: false, reason: "already-running", provider, model, status: presentProbeStatus(existing) };
     }
@@ -2582,13 +2591,13 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
           `agent bound to this model — pin one via Brain Map + the provisioner, or create one in AgentOS first.`,
         samples: [],
       };
-      thinkingProbes.set(statusKey, status);
+      await setProbe(statusKey, status);
       return { ok: false, started: false, reason: "no-agent", provider, model, status: presentProbeStatus(status) };
     }
     const agentId = match.id ?? match.agentId;
 
     const status = { running: true, startedAt: now(), finishedAt: null, error: null, reason: null, message: null, samples: [] };
-    thinkingProbes.set(statusKey, status);
+    await setProbe(statusKey, status);
     log.info("thinking-levels.probe-started", { provider, model, agentId, by: actor.name });
 
     // Fire-and-forget: the HTTP response below does not wait on this. Every
@@ -2602,6 +2611,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
           now,
           onLevelDone: async (_sample, samplesSoFar, partial) => {
             status.samples = samplesSoFar;
+            await setProbe(statusKey, status);
             // Persisted incrementally so a probe interrupted partway (a
             // process restart, an operator giving up on a hung level)
             // still leaves behind whatever it measured, rather than an
@@ -2621,6 +2631,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         status.samples = result.samples;
         status.running = false;
         status.finishedAt = now();
+        await setProbe(statusKey, status);
         log.info("thinking-levels.probe-finished", {
           provider, model, agentId, levels: result.levels, effortMode: result.effortMode,
         });
@@ -2628,6 +2639,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         status.running = false;
         status.finishedAt = now();
         status.error = String(err.message).slice(0, 300);
+        await setProbe(statusKey, status);
         log.error("thinking-levels.probe-failed", { provider, model, agentId, error: status.error });
       }
     })();
@@ -2639,7 +2651,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     const provider = query.get("provider");
     const model = query.get("model");
     if (!provider || !model) throw badRequest("provider and model are required");
-    const status = thinkingProbes.get(`${provider}/${model}`.toLowerCase());
+    const status = await getProbe(`${provider}/${model}`.toLowerCase());
     if (!status) return { found: false, running: false };
     return { found: true, ...presentProbeStatus(status) };
   });
@@ -2670,7 +2682,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   // list is agent-centric because one agent owns one sandbox workspace, and
   // this is the same discriminator the connection test already trusts.
   function agentsForBrain({ provider, model, acpAgent }, liveAgents) {
-    if (provider === "claude-code") {
+    if (isHarnessProvider(provider)) {
       if (!acpAgent) return [];
       const needle = String(acpAgent).toLowerCase();
       return liveAgents.filter((a) => String(a?.id ?? "").toLowerCase() === needle);
@@ -2680,7 +2692,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   }
 
   function resolveTestAgent(liveAgents, { provider, model, acpAgent }) {
-    if (provider === "claude-code") {
+    if (isHarnessProvider(provider)) {
       if (!acpAgent) {
         return {
           match: null,
@@ -2748,7 +2760,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     // provisioned right here, then tested. claude-code never does: it is
     // routed to a named ACP harness agent (`acpAgent`), never to anything
     // creatable by model.
-    if (!match && provider !== "claude-code") {
+    if (!match && !isHarnessProvider(provider)) {
       const probe = await ensureProbeAgent(live, { provider, model });
       if (!probe.ok) {
         return {
@@ -2785,7 +2797,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     // path tasks actually take. `listAcpAgents` is optional (null when the
     // gateway cannot answer): a runtime without it falls through to the
     // live-only message unchanged.
-    if (!match && provider === "claude-code" && acpAgent) {
+    if (!match && isHarnessProvider(provider) && acpAgent) {
       const acpIds = await controller.runtime?.listAcpAgents?.().catch(() => null);
       if (acpIds !== null && acpIds !== undefined) {
         const needle = String(acpAgent).toLowerCase();
@@ -2956,7 +2968,7 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     if (actor?.role !== "admin") throw forbidden("only an admin may create a sandbox");
     const brain = await controller.brains.get(id);
     if (!brain) throw notFound(`unknown brain ${id}`);
-    if (brain.provider === "claude-code") {
+    if (isHarnessProvider(brain.provider)) {
       throw badRequest(
         "claude-code agents are ACP harness agents pinned by routing (acpAgent) — they are not provisioned by model",
       );
@@ -3310,5 +3322,19 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     }
   }
 
-  return { handle, createServer: () => createServer(handle) };
+  return {
+    handle,
+    createServer: () => {
+      const server = createServer(handle);
+      // Bun's node:http compatibility layer currently rejects port 0, which
+      // Node uses to request an ephemeral test port. Preserve that contract so
+      // the same HTTP tests exercise the Bun runtime without fixed-port races.
+      if (typeof Bun !== "undefined") {
+        const listen = server.listen.bind(server);
+        server.listen = (port, ...args) =>
+          listen(port === 0 ? 20_000 + crypto.getRandomValues(new Uint16Array(1))[0] % 30_000 : port, ...args);
+      }
+      return server;
+    },
+  };
 }

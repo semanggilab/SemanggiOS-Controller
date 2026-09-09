@@ -49,17 +49,8 @@ async function main() {
     databaseUri = parsed.toString();
   }
   const stateDriver = process.env.STATE_DRIVER ?? (databaseDriver === "postgres" ? "redis" : "memory");
-  // Password Redis, sama polanya dengan Postgres di atas: rahasia datang dari
-  // berkas secret, bukan dari URI di stack.
-  //
-  // Stack SUDAH memasang REDIS_PASSWORD_FILE sejak awal; yang hilang justru
-  // baris ini, dan ketiadaannya tidak terlihat selama redis mengizinkan koneksi
-  // tanpa auth. Saat redis-prod mulai menuntut AUTH (2026-09-09 07:53 UTC,
-  // setelah service-nya dijadwalkan ulang), controller kehilangan lock bersama
-  // di tengah pass scheduler dan mati berulang — kegagalan yang jauh dari
-  // sebabnya. Menyertakan password membuat kontraknya sama di kedua sisi.
   let redisUri = process.env.REDIS_URI ?? process.env.REDIS_URL ?? null;
-  if (stateDriver === "redis" && redisUri && process.env.REDIS_PASSWORD_FILE) {
+  if (stateDriver === "redis" && process.env.REDIS_PASSWORD_FILE) {
     const parsed = new URL(redisUri);
     parsed.password = readSecret(process.env.REDIS_PASSWORD_FILE, "redis password");
     redisUri = parsed.toString();
@@ -361,26 +352,7 @@ async function main() {
   process.on("SIGINT", () => void shutdown());
 }
 
-// Race terukur (2026-09-09): task swarm menembak main() di milidetik
-// pertama container, sebelum datapath overlay (DNS/VXLAN) siap — koneksi
-// pertama ke pgproxy/redis-prod/openclaw-gateway bisa "Connection closed"
-// dan membunuh proses, crash-loop 0/2 padahal exec manual selalu selamat.
-// Boot kini dicoba ulang; kegagalan konektivitas adalah kondisi start,
-// bukan bug aplikasi.
-const BOOT_ATTEMPTS = Number(process.env.SEMANGGI_BOOT_ATTEMPTS ?? 8);
-const BOOT_RETRY_MS = Number(process.env.SEMANGGI_BOOT_RETRY_MS ?? 3_000);
-(async () => {
-  for (let attempt = 1; attempt <= BOOT_ATTEMPTS; attempt++) {
-    try {
-      await main();
-      return;
-    } catch (err) {
-      console.error(`startup failed (attempt ${attempt}/${BOOT_ATTEMPTS}): ${err.message}`);
-      if (attempt === BOOT_ATTEMPTS) {
-        console.error(err);
-        process.exit(1);
-      }
-      await new Promise((resolve) => setTimeout(resolve, BOOT_RETRY_MS));
-    }
-  }
-})();
+main().catch((err) => {
+  console.error(`startup failed: ${err.message}`);
+  process.exit(1);
+});

@@ -41,6 +41,8 @@ export function createScheduler({ admission, repos, events = null, config = {}, 
   // verification available" and the watchdog falls back to parking on
   // silence alone (the resumable BLOCKED of D20).
   const hooks = config.gatewayHooks ?? {};
+  const sharedState = config.sharedState ?? null;
+  const schedulerLockTtlMs = config.schedulerLockTtlMs ?? Math.max(watchdogMs * 3, 90_000);
   let running = false;
   let pendingReasons = new Set();
   let timer = null;
@@ -259,7 +261,7 @@ export function createScheduler({ admission, repos, events = null, config = {}, 
     return reclaimed;
   }
 
-  async function pass(reasons) {
+  async function passUnlocked(reasons) {
     const quotaReleased = await releaseExpiredQuota();
     // Renew before reclaiming: a live run must never lose its workspace to the
     // very pass that was supposed to protect it.
@@ -277,7 +279,19 @@ export function createScheduler({ admission, repos, events = null, config = {}, 
     };
     history.push(record);
     if (history.length > 100) history.shift();
+    await sharedState?.setJson("scheduler:history", history, { ttlMs: 24 * 60 * 60 * 1000 });
     return record;
+  }
+
+  async function pass(reasons) {
+    const run = () => passUnlocked(reasons);
+    const databaseGuard = () =>
+      typeof repos.store?.advisoryLock === "function"
+        ? repos.store.advisoryLock("semanggi:scheduler", run)
+        : run();
+    return sharedState
+      ? sharedState.withLock("scheduler", schedulerLockTtlMs, databaseGuard)
+      : databaseGuard();
   }
 
   async function drain() {

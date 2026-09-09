@@ -15,7 +15,7 @@ Phases 1–3 of the POC-4 implementation order (§12.2) are complete and covered
 | 3 | Admission pipeline, fairness, lease, quota — against a fake AgentOS | done |
 | 4+ | Real AgentOS dispatcher, Slack, intent router, stack integration | **not started** — blocked on §11 verification and on POC-3 closing |
 
-`npm test` — 55 tests, no network, no cluster, no dependencies.
+`bun run test` runs the controller suite without a cluster or installed packages.
 
 ## What is deliberately not implemented yet
 
@@ -31,7 +31,7 @@ Two more areas wait on POC-3 rather than on this repo:
 ```text
 src/
   db/schema.sql          data model; append-only and immutability enforced by triggers
-  db/index.mjs           storage adapter (async interface, SQLite driver)
+  db/index.mjs           Bun SQL adapter (PostgreSQL + reversible SQLite)
   domain/state-machine.mjs
   domain/events.mjs      EventLog + secret redaction
   domain/repositories.mjs the only code that writes tables
@@ -41,7 +41,8 @@ src/
   scheduler/scheduler.mjs event-driven re-evaluation
   runtime/agentos.mjs     dispatch adapter (contract unverified — see above)
   runtime/fake-agentos.mjs test double
-  api/server.mjs          /api/work/* over node:http
+  runtime/shared-state.mjs Redis-backed cross-replica coordination
+  api/server.mjs          /api/work/* over Bun's node:http compatibility API
   api/openapi.json        API schema (deliverable per §7.1)
 config/routing.example.json
 tests/unit/                55 tests
@@ -52,13 +53,39 @@ docs/poc4-evidence.md      what was verified and how
 ## Running
 
 ```sh
-npm test
+bun run test
 
 CONTROLLER_TOKEN_FILE=/run/secrets/semanggi_controller_token \
 SEMANGGI_ROUTING_CONFIG=/config/routing.json \
-SEMANGGI_DB=/opt/semanggi/volumes/shared/service/semanggios/controller/controller.db \
+DATABASE_DRIVER=postgres \
+DATABASE_URI=postgres://semanggi@pgproxy:5432/semanggios \
+DATABASE_PASSWORD_FILE=/run/secrets/semanggi_postgres_password \
+STATE_DRIVER=redis \
+REDIS_URI=redis://redis:6379/0 \
 AGENTOS_URL=http://agentos:3000 \
-npm start
+bun run start
+```
+
+Cutover data dilakukan saat seluruh replica controller berhenti:
+
+```sh
+SQLITE_URI=/opt/semanggi/volumes/shared/service/semanggios/controller/controller.db \
+DATABASE_URI=postgres://semanggi@pgproxy:5432/semanggios \
+DATABASE_PASSWORD_FILE=/run/secrets/semanggi_postgres_password \
+bun run migrate:postgres
+```
+
+Migrator menolak target yang sudah berisi data, menyalin dalam satu transaksi,
+memperbaiki sequence `event_log`, dan membandingkan jumlah baris seluruh tabel
+sebelum menyatakan berhasil.
+
+Rollback database tanpa perubahan kode:
+
+```sh
+DATABASE_DRIVER=sqlite \
+DATABASE_URI=/opt/semanggi/volumes/shared/service/semanggios/controller/controller.db \
+STATE_DRIVER=memory \
+bun run start
 ```
 
 Startup fails loudly on missing configuration. A controller that boots without a routing policy would report healthy while scheduling nothing.
@@ -69,4 +96,4 @@ Startup fails loudly on missing configuration. A controller that boots without a
 - **No silent downgrade.** Quality decides the candidate models; availability decides only whether to dispatch now or wait. `fallback: none` means wait.
 - **History is immutable.** A revision creates a new execution. Finalized executions and the EventLog are protected by database triggers, not by convention.
 - **Fairness survives restart.** Weighted-fair counters are derived from the execution table, not from process memory.
-- **One dispatcher.** Replica count is exactly 1, scheduling passes never overlap, and a task with a live execution is never dispatched twice.
+- **One logical dispatcher, many HTTP replicas.** Redis serializes scheduler passes across replicas; PostgreSQL advisory locks are the durable second guard.

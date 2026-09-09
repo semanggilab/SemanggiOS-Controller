@@ -1,10 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # Semanggi Work Controller (POC-4 §9).
 #
-# No package manager step: the controller has zero runtime dependencies by
-# design (node:sqlite, node:http and the built-in WebSocket client are all in
-# the standard library), so there is nothing to install and no lockfile to drift.
-FROM node:24-bookworm-slim
+# Bun supplies the PostgreSQL, SQLite, Redis, HTTP, and WebSocket clients used
+# by the controller; no package-manager install step is required.
+FROM oven/bun:1.2.22-debian
 
 # Non-root from the start. The controller creates no containers and holds no
 # Docker socket; uid 1000 matches the NFS ownership the other services use.
@@ -30,5 +29,5 @@ EXPOSE 8080
 # Health is unauthenticated by design (see api/server.mjs): the Swarm probe runs
 # before any secret is available to it and the payload carries no state.
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 --start-period=20s \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/work/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["node", "src/main.mjs"]
+  CMD bun -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/work/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+CMD ["bun", "run", "src/main.mjs"]

@@ -28,6 +28,32 @@
     "     sebagai titik pisah kalau pemetaan plugin diperbaiki di versi berikutnya —",
     "     tetapi jangan berharap ia lebih murah dari glm-5.2-high hari ini."
   ],
+  "brainPolicyVersion": "poc8-2026-09-09-1",
+  "brainMapPolicy": {
+    "low": {
+      "default": ["codex-terra-medium"]
+    },
+    "normal": {
+      "default": ["codex-terra-medium", "codex-sol-low"],
+      "builder": ["claude-sonnet-medium", "codex-terra-medium"],
+      "analyst": ["codex-terra-high", "codex-terra-medium"],
+      "architect": ["codex-terra-high", "codex-terra-medium"],
+      "reviewer": ["codex-terra-high", "codex-terra-medium"],
+      "researcher": ["codex-terra-high", "codex-terra-medium"],
+      "strategist": ["codex-terra-high", "codex-terra-medium"],
+      "writer": ["codex-terra-medium", "codex-sol-low"]
+    },
+    "critical": {
+      "default": ["codex-sol-medium", "claude-sonnet-high"],
+      "builder": ["claude-sonnet-high", "claude-opus-medium", "codex-sol-medium"],
+      "analyst": ["claude-opus-high", "codex-astra-low"],
+      "architect": ["claude-opus-high", "codex-astra-low"],
+      "reviewer": ["claude-opus-high", "codex-sol-medium"],
+      "researcher": ["claude-opus-high", "codex-astra-low"],
+      "strategist": ["claude-opus-high", "codex-astra-low"],
+      "writer": ["claude-opus-high", "codex-astra-low"]
+    }
+  },
   "catalog": {
     "glm-5.2-max": {
       "provider": "zai",
@@ -104,25 +130,66 @@
       "provider": "claude-code",
       "model": "claude-code",
       "mode": "acp",
-      "acpAgent": "claude-opus",
+      "acpAgent": "claude-opus-high",
       "effortMode": "preference",
       "effortEvidence": "effort dipaku di semanggi-acp-claude-opus (--effort high), bukan lewat `thinking`"
     },
-    "claude-sonnet": {
+    "claude-opus-medium": {
       "provider": "claude-code",
       "model": "claude-code",
       "mode": "acp",
-      "acpAgent": "claude-sonnet",
+      "acpAgent": "claude-opus-medium",
       "effortMode": "preference",
-      "effortEvidence": "effort mengikuti default Claude Code; wrapper tidak menyetelnya"
+      "effortEvidence": "model opus dan effort medium dipaku oleh launcher ACP"
+    },
+    "claude-sonnet-high": {
+      "provider": "claude-code",
+      "model": "claude-code",
+      "mode": "acp",
+      "acpAgent": "claude-sonnet-high",
+      "effortMode": "preference",
+      "effortEvidence": "model sonnet dan effort high dipaku oleh launcher ACP"
+    },
+    "claude-sonnet-medium": {
+      "provider": "claude-code",
+      "model": "claude-code",
+      "mode": "acp",
+      "acpAgent": "claude-sonnet-medium",
+      "effortMode": "preference",
+      "effortEvidence": "model sonnet dan effort medium dipaku oleh launcher ACP"
+    },
+    "codex-terra-medium": {
+      "provider": "codex", "model": "gpt-5.6-terra", "mode": "acp",
+      "acpAgent": "codex-terra-medium", "thinking": "medium",
+      "effortMode": "guaranteed", "effortEvidence": "model dan effort dipaku oleh launcher ACP"
+    },
+    "codex-terra-high": {
+      "provider": "codex", "model": "gpt-5.6-terra", "mode": "acp",
+      "acpAgent": "codex-terra-high", "thinking": "high",
+      "effortMode": "guaranteed", "effortEvidence": "model dan effort dipaku oleh launcher ACP"
+    },
+    "codex-sol-low": {
+      "provider": "codex", "model": "gpt-5.6-sol", "mode": "acp",
+      "acpAgent": "codex-sol-low", "thinking": "low",
+      "effortMode": "guaranteed", "effortEvidence": "model dan effort dipaku oleh launcher ACP"
+    },
+    "codex-sol-medium": {
+      "provider": "codex", "model": "gpt-5.6-sol", "mode": "acp",
+      "acpAgent": "codex-sol-medium", "thinking": "medium",
+      "effortMode": "guaranteed", "effortEvidence": "model dan effort dipaku oleh launcher ACP"
+    },
+    "codex-astra-low": {
+      "provider": "codex", "model": "gpt-6-astra", "mode": "acp",
+      "acpAgent": "codex-astra-low", "thinking": "low",
+      "effortMode": "guaranteed", "effortEvidence": "model dan effort dipaku oleh launcher ACP"
     },
     "claude-code-batch": {
       "provider": "claude-code",
       "model": "claude-code",
       "mode": "batch",
-      "acpAgent": "claude-sonnet",
+      "acpAgent": "claude-sonnet-medium",
       "effortMode": "preference",
-      "effortEvidence": "sama seperti claude-sonnet"
+      "effortEvidence": "sama seperti claude-sonnet-medium"
     },
     "_groq_note": "Sengaja TANPA level thinking. Diukur: gateway memvalidasi `thinking` terhadap zai/glm-4.7 — model default — bukan terhadap model agen, sehingga setiap level bertingkat pada groq ditolak: 'Thinking level \"medium\" is not supported for zai/glm-4.7'. Agennya sendiri mengiklankan off/minimal/low/medium/high, jadi iklan itu tidak bisa dipercaya untuk provider ini. Lihat D21."
   },
@@ -145,13 +212,16 @@
     "coding": {
       "critical": {
         "preferred": [
-          "claude-opus-high"
+          "claude-sonnet-high",
+          "claude-opus-medium",
+          "codex-sol-medium"
         ],
         "fallback": "none"
       },
       "normal": {
         "preferred": [
-          "claude-sonnet",
+          "claude-sonnet-medium",
+          "codex-terra-medium",
           "glm-5.2-high"
         ]
       }
@@ -176,13 +246,15 @@
     "devops": {
       "critical": {
         "preferred": [
-          "claude-sonnet"
+          "claude-sonnet-high",
+          "codex-sol-medium"
         ],
         "fallback": "none"
       },
       "normal": {
         "preferred": [
-          "claude-sonnet",
+          "claude-sonnet-medium",
+          "codex-terra-medium",
           "glm-5.2-high"
         ]
       }
@@ -190,6 +262,8 @@
     "analysis": {
       "critical": {
         "preferred": [
+          "claude-opus-high",
+          "codex-astra-low",
           "glm-5.2-max",
           "gemini-flash-high"
         ],
@@ -204,8 +278,16 @@
       }
     },
     "review": {
+      "critical": {
+        "preferred": [
+          "claude-opus-high",
+          "codex-sol-medium"
+        ],
+        "fallback": "none"
+      },
       "normal": {
         "preferred": [
+          "codex-terra-high",
           "claude-code-batch",
           "qwen-high",
           "glm-5.3-on"

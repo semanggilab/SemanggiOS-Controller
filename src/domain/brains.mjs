@@ -19,6 +19,7 @@
 // pun saat dispatch. Pooler memilih agen yang sudah membawa Brain yang tepat;
 // ia tidak pernah mengonfigurasi ulang agen (D35).
 import { quotaDriverFor } from "./quota-drivers/index.mjs";
+import { isHarnessProvider } from "./harness.mjs";
 /** Level yang menghubungkan profil project dengan kandidat Brain. */
 export const Level = Object.freeze({ LOW: "low", NORMAL: "normal", CRITICAL: "critical" });
 
@@ -425,8 +426,8 @@ export function createBrains(store, { now, shortId }) {
       if (patch.acpAgent !== undefined) {
         const agent = patch.acpAgent === null ? null : String(patch.acpAgent).trim();
         if (agent) {
-          if (before.provider !== "claude-code") {
-            throw new Error(`acpAgent only applies to claude-code brains, not provider "${before.provider}"`);
+          if (!isHarnessProvider(before.provider)) {
+            throw new Error(`acpAgent only applies to ACP harness brains, not provider "${before.provider}"`);
           }
           put("acp_agent", agent);
         } else {

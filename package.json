@@ -5,11 +5,12 @@
   "type": "module",
   "description": "Semanggi Work Controller — admission control plane over AgentOS/OpenClaw (POC-4).",
   "engines": {
-    "node": ">=22.5.0"
+    "bun": ">=1.2.0"
   },
   "scripts": {
-    "test": "node --test \"tests/unit/*.test.mjs\"",
-    "start": "node src/main.mjs"
+    "test": "for f in tests/unit/*.test.mjs; do bun test \"$f\" || exit 1; done",
+    "migrate:postgres": "bun run scripts/migrate-sqlite-to-postgres.mjs",
+    "start": "bun run src/main.mjs"
   },
   "dependencies": {}
 }

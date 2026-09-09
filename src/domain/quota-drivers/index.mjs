@@ -18,6 +18,7 @@ import { cerebrasDriver } from "./cerebras.mjs";
 import { zaiDriver } from "./zai.mjs";
 import { claudeCodeDriver } from "./claude-code.mjs";
 import { mistralDriver } from "./mistral.mjs";
+import { codexDriver } from "./codex.mjs";
 
 const DRIVERS = Object.freeze({
   google: googleDriver,
@@ -26,6 +27,7 @@ const DRIVERS = Object.freeze({
   zai: zaiDriver,
   "claude-code": claudeCodeDriver,
   mistral: mistralDriver,
+  codex: codexDriver,
 });
 
 const BY_KEY = new Map();
@@ -53,4 +55,4 @@ export function quotaDriverCatalog() {
   }));
 }
 
-export { genericDriver, googleDriver, groqDriver, cerebrasDriver, zaiDriver, claudeCodeDriver, mistralDriver };
+export { genericDriver, googleDriver, groqDriver, cerebrasDriver, zaiDriver, claudeCodeDriver, mistralDriver, codexDriver };

@@ -696,8 +696,8 @@ test("update acpAgent on a non-claude brain is rejected", async () => {
   });
   await assert.rejects(
     () => h.brains.update(b.id, { acpAgent: "claude-opus" }),
-    /claude-code/,
-    "acpAgent di luar claude-code adalah konfigurasi yang tidak akan pernah dipakai",
+    /ACP harness/,
+    "acpAgent di luar provider harness adalah konfigurasi yang tidak akan pernah dipakai",
   );
 });
 

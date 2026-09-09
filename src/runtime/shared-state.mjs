@@ -41,13 +41,14 @@ class RedisSharedState {
     // server (ERR_REDIS_CONNECTION_CLOSED) pada handshake; password yang
     // di-embed di userinfo URI bekerja (terukur: PING +PONG vs FAIL).
     const password = this.#readPassword();
-    this.#redis = new RedisClient(this.#withPassword(uri, password), {
+    this.#redis = new RedisClient(this.#uri, {
       connectionTimeout: Number(process.env.REDIS_CONNECT_TIMEOUT_MS ?? 5_000),
       idleTimeout: Number(process.env.REDIS_IDLE_TIMEOUT_MS ?? 30_000),
       enableOfflineQueue: false,
       autoReconnect: true,
     });
     this.#prefix = prefix;
+    this.#uri = this.#withPassword(uri, password);
   }
 
   #withPassword(uri, password) {
@@ -91,7 +92,22 @@ class RedisSharedState {
   async withLock(key, ttlMs, fn) {
     const redisKey = this.key(`lock:${key}`);
     const token = crypto.randomUUID();
-    const acquired = await this.#redis.send("SET", [redisKey, token, "NX", "PX", String(ttlMs)]);
+    let acquired;
+    try {
+      acquired = await this.#redis.send("SET", [redisKey, token, "NX", "PX", String(ttlMs)]);
+    } catch (e) {
+      // Blip koneksi sesaat setelah boot (terukur: connect()+PING sukses,
+      // SET pertama ratusan ms kemudian ERR_REDIS_CONNECTION_CLOSED) tidak
+      // boleh membunuh pass scheduler — reconnect sekali, coba lagi sekali.
+      console.error(JSON.stringify({
+        at: new Date().toISOString(), svc: "controller", sev: "warn",
+        evt: "shared-state.lock-blip", key, code: e.code ?? null,
+        message: e.message ?? String(e),
+      }));
+      try { this.#redis.close(); } catch {}
+      await this.#reconnect();
+      acquired = await this.#redis.send("SET", [redisKey, token, "NX", "PX", String(ttlMs)]);
+    }
     if (acquired !== "OK") return null;
     const renewEvery = Math.max(1_000, Math.floor(ttlMs / 3));
     const renew = setInterval(() => {
@@ -110,6 +126,17 @@ class RedisSharedState {
         "1", redisKey, token,
       ]).catch(() => {});
     }
+  }
+
+  async #reconnect() {
+    this.#redis = new RedisClient(this.#uri, {
+      connectionTimeout: Number(process.env.REDIS_CONNECT_TIMEOUT_MS ?? 5_000),
+      idleTimeout: Number(process.env.REDIS_IDLE_TIMEOUT_MS ?? 30_000),
+      enableOfflineQueue: false,
+      autoReconnect: true,
+    });
+    await this.#redis.connect();
+    await this.#redis.send("PING", []);
   }
 
   close() {

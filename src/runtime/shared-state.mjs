@@ -37,15 +37,24 @@ class RedisSharedState {
   #prefix;
 
   constructor(uri, { prefix = "semanggi" } = {}) {
+    // Bun 1.2.22: opsi {password} pada RedisClient gagal — koneksi ditutup
+    // server (ERR_REDIS_CONNECTION_CLOSED) pada handshake; password yang
+    // di-embed di userinfo URI bekerja (terukur: PING +PONG vs FAIL).
     const password = this.#readPassword();
-    this.#redis = new RedisClient(uri, {
-      password,
+    this.#redis = new RedisClient(this.#withPassword(uri, password), {
       connectionTimeout: Number(process.env.REDIS_CONNECT_TIMEOUT_MS ?? 5_000),
       idleTimeout: Number(process.env.REDIS_IDLE_TIMEOUT_MS ?? 30_000),
       enableOfflineQueue: false,
       autoReconnect: true,
     });
     this.#prefix = prefix;
+  }
+
+  #withPassword(uri, password) {
+    if (!password) return uri;
+    const url = new URL(uri);
+    url.password = encodeURIComponent(password);
+    return url.toString();
   }
 
   #readPassword() {

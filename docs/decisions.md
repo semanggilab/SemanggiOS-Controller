@@ -3446,6 +3446,32 @@ tengah (netbird); jalur yang stabil adalah intra-cluster
 kub01-01 → root@10.10.0.12. Registry internal (§6.2) tetap penutup
 struktural.
 
+**Temuan boot gateway: journal deletion menahan restart (dan mengincar
+workspace project bersama).** Rollout image baru membuat gateway crash-loop
+`agent database is unavailable while agent
+sem-chat-sdmk-kader-gemini-flash-high is deleted` — proses LAMA tetap hidup
+karena cek hanya jalan di boot, artinya gateway sudah lama tidak bisa
+di-restart tanpa ini (landmine laten dari kill D98 + eksperimen lama).
+Kebenaran datanya: tabel `agent_deletion_journal` di
+`state/state/openclaw.sqlite` (bukan di DB per-agen) memegang 13 baris
+`cleanup_completed=0` sisa agen mati (sem-auto-\*, acp-repro, sem-chat-e1-\*,
+visibility-probe, gemini-flash-high, sdmk-kader-claude-opus-high).
+`openclaw doctor --fix` menabrak dinding yang sama (maintenance deferred,
+lease) dan tidak menawarkan pembersihan journal. Pemulihan: backup
+`openclaw.sqlite.before-deletion-journal-fix-20260912` → hapus baris journal
+(berkas agen dibiarkan sebagai orphan iners, bukan rm buta) → gateway
+boot 1/1 sehat di poc8-20260911.1, `acp.allowedAgents` = 13, Test Connection
+4 brain baru hijau (probe claude jujur menyebut lingkup: harness agent
+terkonfigurasi, dispatch probe dijalankan orchestrator). **Bahaya struktural
+yang belum ditutup:** baris journal milik agen chat pool mencatat
+`workspace_dir` = `workspaces/sdmk-kader` — workspace PROJECT yang dipakai
+bersama (D95) — sebagai target pembersihan `agents.delete`. Selama
+controller masih membunuh agen chat lewat `agents.delete`, journal bisa
+melahirkan baris yang, bila cleanup-nya suatu saat selesai, menghapus
+workspace project hidup. Journal kini kosong, tapi akarnya (workspace_dir
+agen pool = workspace project) masih ada — calon keputusan: kill chat pool
+tidak memakai `agents.delete`, atau fork memagari cleanup workspace bersama.
+
 **Bukti.** Controller: `chat-completion.mjs` verdict + tes, `applyLateError`
 hook + 2 tes (in-flight → FAILED; final tak ditimpa), `ensureProbeAgent`
 relokasi + tes; commit `df6d681` + `cb9bd8a`, suite cluster 649 lulus

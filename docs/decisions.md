@@ -3494,3 +3494,42 @@ relokasi + tes; commit `df6d681` + `cb9bd8a`, suite cluster 649 lulus
 terauthentikasi 200, bundle memuat "Copy draft"/"Rename…". Live: dua sesi
 uji di atas di Postgres produksi.
 
+
+## D101 — Kontrak int8-string driver pg: aritmetika pada hasil agregat WAJIB men-coerce Number()
+
+Insiden live 2026-09-11: sesi chat `CHS-43DDD754` menolak setiap kirim
+dengan `value "11111111111111111111" is out of range for type bigint`.
+Log Postgres (pg1) membuktikan bind parameter $3 = seq pada INSERT
+chat_messages. Akar: driver Postgres mengembalikan kolom int8 (bigint)
+sebagai STRING JS (penjagaan presisi >2^53), sehingga
+`(max ?? 0) + 1` pada `MAX(seq)` MENGKONKATENASI: 1 → "11" → "111" → …
+tumbuh satu digit "1" per pesan sampai lewat batas bigint di pesan ke-20.
+Data live memperlihatkan pola persis itu di 4 sesi (43 baris; terbesar
+`1111111111111111111`). Suite sqlite tidak pernah melihat kelas bug ini —
+sqlite mengembalikan number; inilah juga alasan regresi ditulis dengan
+store palsu yang MENERTIPKAN perilaku string int8 pg
+(`tests/unit/pg-int8-seq.test.mjs`), bukan sqlite asli.
+
+Keputusan:
+
+1. **Setiap aritmetika/equality pada hasil agregat SQL (MAX, COUNT) WAJIB
+   `Number()` lebih dulu.** Diperbaiki: `chat_messages.seq`,
+   `executions.revision_no` (0 baris live — bug laten tertangkap sebelum
+   meledak), dan lima situs `COUNT(*)`. Termasuk bug nyata laten:
+   `execCount.n === 0` (pemilih hard/soft delete task) — `"0" === 0`
+   false di pg, sehingga task tanpa eksekusi selalu jalan jalur soft.
+2. **Perbaikan data lewat SQL tangan di luar event_log DIPERBOLEHKAN untuk
+   koreksi ini** — chat_messages bukan event_log (trigger append-only tidak
+   menyentuhnya), renumber `ROW_NUMBER() 1..N` mempertahankan urutan
+   (seq sampah monotonik), dan idempotencyKey chat dikunci CHM-id, bukan
+   seq. 35 baris direnumber di 4 sesi.
+3. **Error 500 route controller tidak meninggalkan log** — catch di
+   `api/server.mjs` hanya menulis respon. Investigasi insiden DB kelas ini
+   mulai dari log POSTGRES (statement + bind param tercantum penuh), bukan
+   log controller; kegagalan tanpa jejak adalah pelajaran tersendiri untuk
+   ditambal di sesi berikutnya (log 500 minimal: path + message).
+
+Verifikasi: kirim 3 pesan ke sesi baru → seq 1..6 di Postgres; kirim ulang
+ke CHS-43DDD754 (yang dulu ditolak) → 200, seq 20. Commit `3f3b8d3`;
+deploy via sync-controller-src.sh (restart service), suite bun 649 lulus
+(2 merah gateway-ws nonce = pra-ada, bukan area ini).

@@ -90,7 +90,7 @@ test("katalog nyata menandai setiap entri ber-effort", async () => {
 
   // Yang terukur tidak berlaku harus tetap preference — regresi di sini berarti
   // label mahal menumpang pada run yang tidak melakukan apa-apa.
-  for (const n of ["gemini-flash-high", "gemini-flash-medium", "qwen-high", "qwen-medium"]) {
+  for (const n of ["gemini-flash-high", "gemini-flash-medium", "qwen-medium"]) {
     assert.equal(routing.catalog[n].effortMode, "preference", `${n} terukur tidak menerapkan effort`);
   }
   for (const n of ["glm-5.2-max", "glm-5.2-high", "glm-5.2-low"]) {

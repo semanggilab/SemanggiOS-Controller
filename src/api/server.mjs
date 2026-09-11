@@ -2733,11 +2733,20 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       return { ok: false, error: "this runtime has no probe-agent provisioning (agents.create)" };
     }
     const full = `${provider}/${model}`;
-    const probeName = `sem-workspaces-probe-${slug(provider)}-${slug(full)}`.slice(0, 63);
-    const workspace = probeWorkspaceFor(live, provider);
+    let probeName = `sem-workspaces-probe-${slug(full)}`.slice(0, 63);
+    let workspace = probeWorkspaceFor(live, provider);
     try {
       log.info("brain.test-provisioning", { probeName, workspace, full });
-      const created = await controller.runtime.createProbeAgent({ name: probeName, workspace, model: full });
+      let created;
+      try {
+        created = await controller.runtime.createProbeAgent({ name: probeName, workspace, model: full });
+      } catch (err) {
+        if (!/deletion cleanup is still pending/i.test(String(err.gatewayError?.message ?? err.message))) throw err;
+        probeName = `${probeName.slice(0, 52)}-r${crypto.randomUUID().slice(0, 8)}`;
+        workspace = `${probeWorkspaceFor(live, provider)}-${probeName}`;
+        log.warn("brain.test-provision-rename", { probeName, workspace, full });
+        created = await controller.runtime.createProbeAgent({ name: probeName, workspace, model: full });
+      }
       log.info("brain.test-provisioned", { agentId: created.id, probeName, workspace });
       return { ok: true, agentId: created.id, probeName, workspace };
     } catch (err) {
@@ -2774,8 +2783,14 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
         };
       }
       provisioned = true;
-      live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
-      ({ match } = resolveTestAgent(live, { provider, model, acpAgent }));
+      // agents.create may answer before the new registry entry is dispatchable.
+      // Wait briefly for agents.list instead of immediately calling agent.run
+      // with an id the gateway still reports as unknown.
+      for (let attempt = 0; attempt < 12 && !match; attempt += 1) {
+        live = (await controller.runtime?.listAgents?.().catch(() => [])) ?? [];
+        ({ match } = resolveTestAgent(live, { provider, model, acpAgent }));
+        if (!match) await new Promise((resolve) => setTimeout(resolve, 250));
+      }
       if (!match) {
         // Created, but agents.list has not advertised it yet. Test the id the
         // gateway handed back rather than denying the agent we just made: a
@@ -2843,7 +2858,15 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     if (!controller.runtime?.testAgent) {
       throw badRequest("this runtime does not support connection testing");
     }
-    const result = await controller.runtime.testAgent({ agentId, thinking: effectiveThinking });
+    // AgentOS' HTTP proxy times out before the runtime's historical 120s
+    // default. Keep this synchronous button below that wall so failures are
+    // returned as JSON rather than an HTML/plain-text 504 page.
+    let result;
+    try {
+      result = await controller.runtime.testAgent({ agentId, thinking: effectiveThinking, timeoutMs: 12_000 });
+    } catch (error) {
+      result = { ok: false, status: "error", error: String(error?.message ?? error).slice(0, 500) };
+    }
     return { ok: result.ok, agentId, thinking: effectiveThinking, provisioned, ...(acpNote ? { message: acpNote } : {}), ...result };
   }
 

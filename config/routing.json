@@ -111,19 +111,12 @@
       "effortMode": "preference",
       "effortEvidence": "sama seperti gemini-flash-high"
     },
-    "qwen-high": {
-      "provider": "groq",
-      "model": "qwen/qwen3.6-27b",
-      "mode": "interactive",
-      "effortMode": "preference",
-      "effortEvidence": "minimal/medium/high DITERIMA RPC lalu run menggantung sampai watchdog; hanya off/low yang selesai"
-    },
     "qwen-medium": {
       "provider": "groq",
       "model": "qwen/qwen3.6-27b",
       "mode": "interactive",
       "effortMode": "preference",
-      "effortEvidence": "sama seperti qwen-high"
+      "effortEvidence": "minimal/medium/high diterima RPC tetapi tidak terbukti mengubah perilaku; hanya off/low yang selesai"
     },
     "_acp_note": "provider claude-code + mode acp/batch adalah satu-satunya jalur harness (assertDispatchPathAllowed). acpAgent menyebut agen acpx, dan itulah yang memaku model harness.",
     "claude-opus-high": {
@@ -272,7 +265,7 @@
       "normal": {
         "preferred": [
           "gemini-flash-high",
-          "qwen-high",
+          "codex-terra-high",
           "glm-5.2-high"
         ]
       }
@@ -289,7 +282,7 @@
         "preferred": [
           "codex-terra-high",
           "claude-code-batch",
-          "qwen-high",
+          "codex-terra-high",
           "glm-5.3-on"
         ]
       }

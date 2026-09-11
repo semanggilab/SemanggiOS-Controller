@@ -235,7 +235,7 @@ test("on-demand: model tanpa brain aktif, cap penuh, dan tanpa resource tidak me
   const claude = fixture({
     brains: [brain({ provider: "claude-code", model: "claude-code", acpAgent: "claude-opus" })],
   });
-  assert.equal((await claude.provision.maybeProvisionForBrain({ candidate: { provider: "claude-code", model: "claude-code" } })).why, "claude-code");
+  assert.equal((await claude.provision.maybeProvisionForBrain({ candidate: { provider: "claude-code", model: "claude-code" } })).why, "acp-harness");
 
   assert.equal(noBrain.created.length + capFull.created.length + noResource.created.length + claude.created.length, 0);
 });

@@ -3039,7 +3039,13 @@ Konteks: run terjadi setelah insiden token gateway 10–11 Sep diperbaiki oleh
 sesi paralel (kronologi di spec POC-10 §12.1) — spike ini sekaligus bukti
 jalur auth controller→gateway sehat kembali.
 
-## D92 — Kolom Context window kosong lagi: bigint Postgres tiba sebagai string
+## D93 — Kolom Context window kosong lagi: bigint Postgres tiba sebagai string
+
+**Catatan penomoran.** Entri ini lahir hampir bersamaan dengan D92 di atas
+(commit 333efff vs 80676a3) — balapan penomoran ketiga, pola D90. Nomor final
+entri ini D93; commit 333efff tetap menyandang label "D92" di pesannya.
+Pengalihan nomor dilakukan bersamaan dengan penggeseran entri Dockerfile
+(b4d225d, "D93") ke D94.
 
 **Gejala.** Setelah D91 memulihkan auth gateway dan API mengembalikan angka
 lengkap, kolom Context window dan Max output di Model Map TETAP menampilkan
@@ -3074,9 +3080,9 @@ di-commit tetapi BELUM disinkronkan ke NFS: pohon kerja repo ini sedang memuat
 pekerjaan sesi lain yang belum selesai, dan `sync-controller-src.sh` menyalin
 seluruh pohon, bukan hanya commit.
 
-## D93 — Dua Dockerfile AgentOS, dan image yang "berhasil" tanpa UI Semanggi
+## D94 — Dua Dockerfile AgentOS, dan image yang "berhasil" tanpa UI Semanggi
 
-**Kejadian.** Perbaikan D92 sisi UI dibangun dengan
+**Kejadian.** Perbaikan D93 sisi UI dibangun dengan
 `images/agentos/Dockerfile`, lalu dideploy. Image-nya build bersih dan
 service-nya sehat — tetapi seluruh UI Semanggi TIDAK ada di dalamnya. Produksi
 berjalan ~30 menit tanpa halaman Semanggi sebelum dikembalikan ke
@@ -3102,7 +3108,7 @@ menjanjikan sintaks, bukan isi. Sejak sekarang, sebelum deploy image UI:
 docker run --rm --entrypoint sh <image> -c 'grep -rl "Thinking levels" /agentos/.next | wc -l'
 ```
 
-Nol berarti jangan deploy. Pemeriksaan yang sama menemukan perbaikan D92 di
+Nol berarti jangan deploy. Pemeriksaan yang sama menemukan perbaikan D93 di
 bundel klien sebelum deploy kedua, dan deploy kedua itu benar.
 
 **Yang belum diputuskan operator.** Mana dari dua Dockerfile itu yang kanonik.

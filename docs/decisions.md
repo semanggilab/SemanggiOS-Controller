@@ -2948,3 +2948,43 @@ Driver claude-code memang menyiapkan slot ini sejak D63 — komentarnya berbunyi
 **Batas:** jangkar 5-jam claude-code tetap TIDAK ber-descriptor — blok 5 jam bergerak per-user, bukan jam dinding global; jalur hidup yang mem harganya adalah parser teks D87 (jam dinding terparse), bukan `nextReset` (5 jam bukan jendela retry-in-place, jalan itu tidak pernah ditempuh).
 
 **Test:** 578 → 592 (termasuk 9 tes D88/D89-acp.spawn sesi paralel). Milik D90: driver long-window (Rabu → Senin ini; tepat sebelum reset → Senin ini; tepat sesudah → Senin BERIKUTNYA), migrasi backfill (NULL diisi, tuned selamat, idempoten dua boot), jangkar teks mingguan + clockless claude-code → epoch Senin + release pass jendela, zai rolling tetap `now+7d`.
+
+## D91 — Kolom Context window kosong: token gateway punya dua sumber kebenaran
+
+**Gejala.** Kolom Context window di Model Map kosong untuk SEMUA model,
+padahal openclaw.json masih memuat angkanya lengkap.
+
+**Sebab.** `gateway.auth.token` muncul di openclaw.json pada 10 September (48
+karakter). Sebelum itu ia tidak pernah ada: `bootstrap-openclaw-config.mjs`
+sengaja menulis `auth: { mode: "token" }` TANPA nilai, karena tokennya datang
+dari Swarm secret lewat `OPENCLAW_GATEWAY_TOKEN`. Begitu secret dirotasi
+(secret di container bertanggal 10 Sep 03:02, 96 karakter), token di file
+menang dan setiap klien yang memakai secret ditolak
+`AUTH_TOKEN_MISMATCH`, lalu `too many failed authentication attempts`.
+
+**Kenapa gejalanya kolom kosong, bukan alarm.** `modelLimits()` membaca
+`config.get` lewat RPC. RPC ditolak, limit kembali kosong, dan kolom yang
+dirancang untuk menampilkan "tidak diketahui" sebagai sel kosong menampilkan
+persis itu. Kegagalan auth menyamar jadi data yang tidak ada — dan pada saat
+yang sama dispatch dan session-events juga mati, yang jauh lebih mahal
+daripada kolom kosong.
+
+**Perbaikan.** `gateway.auth.token` dihapus dari config, bukan diisi ulang
+dengan nilai secret. Mengisi ulang hanya menunda pengulangan sampai rotasi
+berikutnya; menghapusnya mengembalikan kontrak semula — secret adalah
+satu-satunya sumber kebenaran, dan file config tidak menyimpan salinan yang
+bisa basi.
+
+**Yang benar-benar hilang: satu, bukan semua.** Angka tidak pernah terhapus.
+Hanya `groq/qwen/qwen3-32b` yang ditinggal katalog: model groq yang hidup kini
+`qwen/qwen3.6-27b`, sehingga 131072 menempel pada id yang sudah tidak ada.
+Dipindahkan ke id yang hidup.
+
+**Catatan yang menahan kepanikan.** Kolom kosong TIDAK berarti model kembali
+terpotong. `contextWindow` dibaca gateway dari file-nya sendiri saat menjalankan
+run; kolom di Model Map hanyalah cermin. Selama file utuh — dan ia utuh —
+perilaku runtime tidak berubah sedetik pun.
+
+**Sisa yang memang belum punya nilai:** tiga model `codex/*` (baru, dari
+pekerjaan POC-8) dan `claude-code/claude-code` (harness; jendelanya diatur
+Claude Code sendiri, bukan oleh openclaw.json).

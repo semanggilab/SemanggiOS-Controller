@@ -22,6 +22,8 @@ async function fixture({
   live = [],
   brain = { id: "BRN-1", name: "GLM 4.7 Chat", provider: "zai", model: "glm-4.7", enabled: true },
   createImpl = null,
+  listImpl = null,
+  visibleOpts = {},
 } = {}) {
   const store = await openStore({ driver: "sqlite", location: ":memory:" });
   const events = createEventLog(store);
@@ -42,7 +44,7 @@ async function fixture({
   }
   const created = [];
   const runtime = {
-    listAgents: async () => live.slice(),
+    listAgents: listImpl ?? (async () => live.slice()),
     createProbeAgent: createImpl ?? (async ({ name, workspace, model }) => {
       const agent = { id: name, name, workspace, model: { primary: model } };
       created.push(agent);
@@ -50,7 +52,7 @@ async function fixture({
       return { id: name, name };
     }),
   };
-  const chat = createChatSandbox({ repos, runtime, events, log: quietLog });
+  const chat = createChatSandbox({ repos, runtime, events, log: quietLog, ...visibleOpts });
   return { chat, repos, runtime, created, live, events, brain, project };
 }
 
@@ -91,6 +93,57 @@ test("pasca-kill: baris yatang dibuang dan pesan berikutnya memprovisikan ulang"
   assert.equal(f.created.length, 2);
   const row = await f.repos.chatSandboxes.get(f.project.id, f.brain.id);
   assert.equal(row.agent_id, f.created[1].id, "baris menunjuk agen yang hidup sekarang");
+});
+
+// --- jendela visibilitas create→list (terukur 2–5 dtk di gateway) -----------
+
+test("visibilitas: create dijawab sebelum agen muncul di list → provision MENUNGGU, bukan gagal", async () => {
+  const name = "sem-chat-alpha-repo-glm-4-7-chat";
+  let listCalls = 0;
+  const f = await fixture({
+    // createProbeAgent sukses SEGERA tetapi TIDAK memasukkan agen ke live —
+    // meniru gateway sungguhan (CHS-E6A3263B): registry hanya mendaftarkan
+    // agen beberapa detik kemudian, dan agent.run membaca registry itu.
+    createImpl: async ({ name: n }) => ({ id: n, name: n }),
+    listImpl: async () => {
+      listCalls += 1;
+      return listCalls >= 3 ? [{ id: name, name }] : [];
+    },
+    visibleOpts: { visibleWaitMs: 2_000, visiblePollMs: 5 },
+  });
+  const out = await f.chat.resolveChatSandbox({ project: f.project, brain: f.brain });
+  assert.equal(out.ok, true, "polling sampai terlihat, lalu sukses");
+  assert.equal(out.reused, false);
+  assert.ok(listCalls >= 3, `melewati setidaknya satu putaran kosong (calls=${listCalls})`);
+  assert.ok((await f.events.list({ kind: "chat.sandbox-provisioned" })).length === 1);
+});
+
+test("visibilitas: lewat batas waktu → gagal jujur, baris TETAP ditulis, pesan berikutnya reuse", async () => {
+  const name = "sem-chat-alpha-repo-glm-4-7-chat";
+  let visible = false;
+  const f = await fixture({
+    createImpl: async ({ name: n }) => ({ id: n, name: n }),
+    listImpl: async () => (visible ? [{ id: name, name }] : []),
+    visibleOpts: { visibleWaitMs: 30, visiblePollMs: 5 },
+  });
+  const first = await f.chat.resolveChatSandbox({ project: f.project, brain: f.brain });
+  assert.equal(first.ok, false);
+  assert.equal(first.why, "agent-not-yet-visible");
+  assert.match(first.error, /send the message again in a moment/);
+  assert.ok((await f.events.list({ kind: "chat.sandbox-not-visible" })).length === 1);
+
+  // Baris DB tetap ada: agen itu nyata di gateway, hanya belum terdaftar.
+  const row = await f.repos.chatSandboxes.get(f.project.id, f.brain.id);
+  assert.equal(row.agent_id, name);
+
+  // Agen akhirnya muncul → pesan berikutnya menemukan jalur reuse, tanpa
+  // provisioning ganda dan tanpa event provisioned palsu yang kedua.
+  visible = true;
+  const second = await f.chat.resolveChatSandbox({ project: f.project, brain: f.brain });
+  assert.equal(second.ok, true);
+  assert.equal(second.reused, true, "tidak ada agen kedua yang diciptakan");
+  assert.equal(second.agentId, name);
+  assert.ok((await f.events.list({ kind: "chat.sandbox-provisioned" })).length === 0, "event provisioned hanya untuk jalur create");
 });
 
 // --- batas: kolom sendiri, independen dari task (§10.3) -----------------------

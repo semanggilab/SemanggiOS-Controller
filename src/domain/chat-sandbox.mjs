@@ -27,7 +27,22 @@ const slug = (s) => String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, 
 
 export const CHAT_AGENT_PREFIX = "sem-chat-";
 
-export function createChatSandbox({ repos, runtime, events, log, now = () => Date.now() }) {
+export function createChatSandbox({
+  repos,
+  runtime,
+  events,
+  log,
+  now = () => Date.now(),
+  // Terukur 2026-09-11 (CHS-E6A3263B): agents.create dijawab ~1 dtk SEBELUM
+  // agen muncul di agents.list (2–5 dtk), dan `agent.run` membaca registry
+  // yang sama — dispatch seketika setelah create ditolak "Unknown agent id".
+  // Jalur task tidak pernah menabrak jendela ini karena D80 sengaja parkir
+  // 3 dtk lalu dispatch berikutnya yang memakai agennya; chat tidak punya
+  // state machine untuk diparkirkan, jadi tunggu visibilitas DI SINI.
+  // Diinjeksi kecil supaya tes tidak perlu tidur 8 detik sungguhan.
+  visibleWaitMs = 8_000,
+  visiblePollMs = 500,
+} = {}) {
   const liveAgents = async () => (await runtime?.listAgents?.().catch(() => [])) ?? [];
 
   async function capFor(provider, model) {
@@ -105,6 +120,43 @@ export function createChatSandbox({ repos, runtime, events, log, now = () => Dat
       provider: brain.provider,
       model: brain.model,
     });
+
+    // Baris DB ditulis lebih dulu (agen itu ADA di gateway, hanya belum
+    // terdaftar) — lalu tunggu ia muncul di agents.list. Lewat batas waktu:
+    // pesan ini gagal jujur dengan alasan yang bisa ditindaklanjuti ("coba
+    // sesaat lagi"), dan pesan BERIKUTNYA menemukan baris + agen hidup di
+    // jalur reuse — tidak ada provisioning ganda, tidak ada cap bocor.
+    const visible = async () =>
+      (await liveAgents()).some(
+        (a) => String(a?.id ?? "") === row.agent_id || String(a?.name ?? "") === row.agent_id,
+      );
+    const deadline = now() + visibleWaitMs;
+    while (!(await visible())) {
+      if (now() >= deadline) {
+        await events.append({
+          kind: "chat.sandbox-not-visible",
+          subjectType: "chat_sandbox",
+          subjectId: `${project.id}:${brain.id}`,
+          actor,
+          payload: { agentId: row.agent_id, waitedMs: visibleWaitMs },
+        });
+        log.warn("chat.sandbox-not-visible", {
+          project: project.id,
+          brain: brain.name,
+          agentId: row.agent_id,
+          waitedMs: visibleWaitMs,
+          hint: "gateway lists agents seconds after create; next message reuses the row",
+        });
+        return {
+          ok: false,
+          why: "agent-not-yet-visible",
+          error: `gateway has not listed ${row.agent_id} yet — send the message again in a moment`,
+          agentId: row.agent_id,
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, visiblePollMs));
+    }
+
     await events.append({
       kind: "chat.sandbox-provisioned",
       subjectType: "chat_sandbox",

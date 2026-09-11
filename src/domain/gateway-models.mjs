@@ -105,8 +105,20 @@ function present(row) {
     name: row.name,
     reasoning: Boolean(row.reasoning),
     available: Boolean(row.available),
-    contextWindow: row.context_window ?? null,
-    maxTokens: row.max_tokens ?? null,
+    // Dinormalkan SAAT DIBACA, bukan hanya saat ditulis (D92).
+    //
+    // Nilainya sudah lolos positiveOrNull sebelum disimpan, jadi penulisan
+    // aman. Yang tidak aman adalah pembacaan: driver Postgres mengembalikan
+    // bigint sebagai STRING, sementara SQLite mengembalikannya sebagai angka.
+    // Kontrak API ini menjanjikan angka, dan pembacanya memperlakukan yang
+    // bukan angka sebagai "tidak diketahui" — terukur: setelah pindah ke
+    // Postgres, kolom Context window di Model Map menampilkan "—" untuk SETIAP
+    // model meski nilainya utuh di config maupun di tabel.
+    //
+    // Kegagalan seperti ini tidak berbunyi. Ia tampak seperti data yang memang
+    // belum diisi.
+    contextWindow: positiveOrNull(row.context_window),
+    maxTokens: positiveOrNull(row.max_tokens),
     updatedAt: row.updated_at,
   };
 }

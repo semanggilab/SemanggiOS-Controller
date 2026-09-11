@@ -3038,3 +3038,38 @@ yang sudah terbukti. Gerbang T0 LULUS → T1 (migrasi `chat_sessions` dst.).
 Konteks: run terjadi setelah insiden token gateway 10–11 Sep diperbaiki oleh
 sesi paralel (kronologi di spec POC-10 §12.1) — spike ini sekaligus bukti
 jalur auth controller→gateway sehat kembali.
+
+## D92 — Kolom Context window kosong lagi: bigint Postgres tiba sebagai string
+
+**Gejala.** Setelah D91 memulihkan auth gateway dan API mengembalikan angka
+lengkap, kolom Context window dan Max output di Model Map TETAP menampilkan
+"—" untuk setiap model.
+
+**Sebab.** `GET /api/work/model-map` memang mengirim nilainya — tetapi sebagai
+string: `"contextWindow": "200000"`. Driver Postgres mengembalikan bigint
+sebagai string; SQLite mengembalikannya sebagai angka. `positiveOrNull` dipakai
+saat MENULIS, jadi penyimpanan selalu benar; pembacaan (`present()`) meneruskan
+apa adanya. Di UI, `formatTokens` menolak lewat `Number.isFinite("200000")`
+yang bernilai false.
+
+**Kenapa ini mahal.** Kegagalannya tidak berbunyi. Sel kosong di kolom yang
+memang boleh kosong terbaca sebagai "belum diisi", bukan sebagai "salah tipe" —
+dan pertanyaan pertama yang muncul justru yang paling menakutkan: apakah model
+kembali terpotong? (Tidak: gateway membaca contextWindow dari file-nya sendiri;
+kolom ini hanya cermin.)
+
+**Perbaikan, dua lapis.** Hulu: `present()` menormalkan saat membaca, sehingga
+kontrak API — "angka" — benar-benar dipenuhi siapa pun pemanggilnya. Hilir:
+`formatTokens` menerima angka berbentuk string. Lapis kedua bukan duplikasi;
+nilainya menyeberangi batas layanan, dan di sanalah salah baca paling mahal.
+
+**Tes yang benar-benar menangkapnya.** Percobaan pertama lulus di kedua arah —
+tidak berguna — karena harness memakai SQLite dan `replaceAll` sudah menormalkan
+saat menulis, sehingga string tidak pernah bertahan sampai dibaca. Tes yang
+dipakai memasang store tiruan yang berperilaku seperti Postgres, dan diverifikasi
+GAGAL ketika perbaikannya dilepas.
+
+**Catatan penyebaran.** Sisi UI sudah dibangun dan dideploy. Sisi controller
+di-commit tetapi BELUM disinkronkan ke NFS: pohon kerja repo ini sedang memuat
+pekerjaan sesi lain yang belum selesai, dan `sync-controller-src.sh` menyalin
+seluruh pohon, bukan hanya commit.

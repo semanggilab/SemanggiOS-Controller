@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createApi } from "../../src/api/server.mjs";
 import { buildHarness } from "../helpers/harness.mjs";
+import { createGatewayModelsCache } from "../../src/domain/gateway-models.mjs";
 
 const TOKEN = "controller-token-for-tests";
 
@@ -107,4 +108,42 @@ test("GET /api/work/gateway/models never throws even with an empty cache", async
   } finally {
     await api.close();
   }
+});
+
+// D92 — batas per model MUST keluar sebagai angka, bukan string.
+//
+// Driver Postgres mengembalikan bigint sebagai string; SQLite mengembalikannya
+// sebagai angka. Kontrak API ini menjanjikan angka, dan pembacanya (kolom
+// Context window di Model Map) memperlakukan yang bukan angka sebagai "tidak
+// diketahui". Terukur setelah pindah ke Postgres: SETIAP model menampilkan "—"
+// meski nilainya utuh di config maupun di tabel — kegagalan yang tampak persis
+// seperti data yang belum diisi.
+test("D92: contextWindow dan maxTokens keluar sebagai number meski store mengembalikan string", async () => {
+  // Store tiruan yang berperilaku seperti driver Postgres: bigint kembali
+  // sebagai STRING. Harness biasa memakai SQLite, yang mengembalikan angka —
+  // karena itu bug ini tidak pernah muncul di tes sampai store-nya berganti.
+  const store = {
+    async all() {
+      return [
+        {
+          provider: "zai",
+          model: "glm-5.2",
+          name: "glm-5.2",
+          reasoning: 1,
+          available: 1,
+          context_window: "200000",
+          max_tokens: "8192",
+          updated_at: 1,
+        },
+      ];
+    },
+  };
+  const [row] = await createGatewayModelsCache(store).list();
+  // Kolom Context window memperlakukan yang bukan angka sebagai "tidak
+  // diketahui", jadi sebuah string melewati batas ini akan tampak persis
+  // seperti nilai yang belum pernah diisi.
+  assert.equal(typeof row.contextWindow, "number", `contextWindow: ${JSON.stringify(row.contextWindow)}`);
+  assert.equal(row.contextWindow, 200000);
+  assert.equal(typeof row.maxTokens, "number");
+  assert.equal(row.maxTokens, 8192);
 });

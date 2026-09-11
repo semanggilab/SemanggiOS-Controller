@@ -956,12 +956,19 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
      * an out-of-order event never drags the clock back — and silent on final
      * rows: the immutability trigger would turn a late frame into an error,
      * and the row's story is already closed anyway.
+     *
+     * CASE, bukan MAX(a, b): MAX dua-argumen adalah skalar SQLite dan TIDAK
+     * ada di Postgres ("function max(bigint, bigint) does not exist" —
+     * terukur di log controller saat lifecycle start run chat menyentuh
+     * jalur ini, 2026-09-11). Bentuk CASE berperilaku identik di keduanya.
      */
     touch: (id, at) =>
       store.run(
-        `UPDATE executions SET last_event_at = MAX(COALESCE(last_event_at, 0), ?)
+        `UPDATE executions SET last_event_at = CASE
+             WHEN last_event_at IS NULL OR last_event_at < ? THEN ?
+             ELSE last_event_at END
            WHERE id = ? AND finalized_at IS NULL`,
-        [at, id],
+        [at, at, id],
       ),
 
     listByTask: (taskId) =>

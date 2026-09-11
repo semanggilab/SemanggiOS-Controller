@@ -2988,3 +2988,53 @@ perilaku runtime tidak berubah sedetik pun.
 **Sisa yang memang belum punya nilai:** tiga model `codex/*` (baru, dari
 pekerjaan POC-8) dan `claude-code/claude-code` (harness; jendelanya diatur
 Claude Code sendiri, bukan oleh openclaw.json).
+
+## D92 — POC-10 E1: `agents.create` menerima workspace arbitrary
+
+Pertanyaan gerbang T0 (spec POC-10 §12.3): apakah `agents.create` menerima
+workspace absolut SEMBARANG (workspace project sungguhan), bukan hanya pola
+probe? Terukur dua kali penuh lewat `scripts/spike-poc10-e1.mjs` (runtime
+produksi `createGatewayRuntime`, identitas device controller, model gratis
+`google/gemini-3.1-flash-lite`): **YA.**
+
+Bukti berlapis, bukan `accepted` saja (pelajaran D85):
+
+- payload mentah `agents.create` meng-echo workspace
+  `…/openclaw/workspaces/sdmk-kader` apa adanya;
+- `agents.list` menyebut workspace PERSIS sama (kebenaran operabilitas D32);
+- SATU dispatch nyata berjalan: method `agent` (hasil negosiasi
+  `hello.features.methods`; `agent.run` tidak diiklankan gateway ini),
+  `runId == idempotencyKey` (D15), lifecycle `end {stopReason:"stop"}`,
+  model efektif `gemini-3.1-flash-lite` tanpa reroute, dan
+  `terminalReply.text = "E1-OK"` — agen di workspace asing benar-benar
+  menjalankan instruksi, bukan sekadar terdaftar;
+- nol agen `sem-chat-e1-*` tertinggal.
+
+Dua jangkar baru yang diperluas dari D81 — konsistensi eventual mutasi agen
+LEBIH LUAS dari "list tertinggal beberapa detik":
+
+1. Run pertama spike (vonis salah): create diterima → `agents.list` seketika
+   MASIH KOSONG → `agents.delete` menjawab `not found` → create ulang nama
+   sama menjawab `already exists` → beberapa detik kemudian list MENYEBUT
+   agen itu. Artinya: toko konfigurasi dan tampilan armada sinkron malas;
+   membaca sekali seketika setelah mutasi menghasilkan kesimpulan yang salah
+   di DUA arah. Semua pembacaan pasca-mutasi MUST dipoll (spike: 20 dtk,
+   interval 1,5 dtk; delete dengan retry 4×).
+2. Kunci nama pasca-delete reproduksi di jalur workspace arbitrary:
+   `INVALID_REQUEST "agent … deletion cleanup is still pending"` — pemulihan
+   `-r<short>` ala D81 berlaku juga untuk pool chat POC-10 (T2).
+
+Catatan kecil yang melekat: `agents.delete` menjawab `ok:true` dengan
+`purgeFailed:true` — berkas state `state/agents/<nama>/` ditolak trash
+("outside allowed roots"); binding hilang dan agen lenyap dari list, jadi ini
+informatif, bukan kegagalan. Dan `session.message` content bisa berupa blok
+terstruktur — ekstrak teksnya, jangan `String()` mentah (run pertama mencetak
+`[object Object]` padahal jawaban asli `<final>E1-OK</final>`).
+
+Konsekuensi untuk POC-10: provisioning T2 memvalidasi keberhasilan lewat POLL
+`agents.list`, bukan balisan create; tabrakan nama memakai variasi `-r<short>`
+yang sudah terbukti. Gerbang T0 LULUS → T1 (migrasi `chat_sessions` dst.).
+
+Konteks: run terjadi setelah insiden token gateway 10–11 Sep diperbaiki oleh
+sesi paralel (kronologi di spec POC-10 §12.1) — spike ini sekaligus bukti
+jalur auth controller→gateway sehat kembali.

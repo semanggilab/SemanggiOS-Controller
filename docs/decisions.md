@@ -3243,3 +3243,54 @@ pertahanan tanpa tes (jujur, bukan disembunyikan). Upload akar
 chat. Balapan penomoran keempat dan kelima (D92 kembar lalu D94 kembar)
 diselesaikan `ca26fad` + commit renumber D96; `acp-dispatch.test.mjs`
 (sesi paralel) masih merah saat commit ini — bukan milik POC-10.
+
+## D98 — POC-10 T5: penyelesaian giliran chat dari transkrip gateway, tiga jendela waktu yang diukur
+
+**Konteks.** T5 (UI + hidup di cluster) menabrak tiga perilaku gateway fork
+(poc8-20260909.2) yang tidak terlihat dari kontrak RPC — semuanya diukur live
+pada sesi uji CHS-E6A3263B (PRJ-A86973EC) sebelum diperbaiki.
+
+1. *Visibilitas create→list tertinggal 2–5 dtk.* `agents.create` dijawab ~1
+   dtk sebelum agen muncul di `agents.list` (probe terukur: tak terlihat di
+   t+1,1 dtk, terlihat di t+5,3 dtk), dan `agent.run` membaca registry yang
+   sama — dispatch seketika ditolak "Unknown agent id". Jalur task tidak
+   pernah menabraknya karena D80 parkir 3 dtk; chat tidak punya state machine
+   untuk diparkirkan. `chat-sandbox provision()` kini MENUNGGU visibilitas
+   (poll 500 ms, batas 8 dtk); lewat batas → baris tetap ditulis + gagal jujur
+   "agent-not-yet-visible" — pesan berikutnya menemukan jalur reuse.
+
+2. *Dispatch = async-accept, bukan jawaban.* Gateway fork mengiklankan metode
+   `agent` bare (bukan `agent.run`): frame res hanya
+   `{"status":"accepted"}`. deliver() T3 yang menyegel DONE dari
+   result.reply menghasilkan baris DONE berisi KOSONG — jawaban sebenarnya
+   tiba sebagai event dan hanya utuh di transkrip sesi. Giliran kini disegel
+   oleh poller `chat-completion` (2 dtk, lock singleton 30 dtk) dari
+   `chat.history`: pesan user kita dikenali idempotencyKey `<CHM-id>:user`
+   (terukur), balasan = asisten pertama SESUDAHNYA (sesi dipakai ulang lintas
+   giliran — posisi, bukan keberadaan); ekstraksi meratakan blok teks,
+   melepas `<final>` (kebiasaan task di memori agen, tidak diminta preamble)
+   dan komentar HTML. Timeout giliran 10 mnt → FAILED jujur; PENDING yatim
+   (controller mati antara append dan deliver) tersapu jalur yang sama.
+   Polling, bukan sessions.subscribe, atas pelajaran D72: bertahan melewati
+   restart dan putusnya socket. Gateway yang mengembalikan run sekaligus
+   (keluarga agent.run) tetap selesai di deliver() — dua bentuk, satu jalur.
+
+3. *Kunci sesi gateway milik SATU agen selamanya.* Pasca-kill, reprovisi
+   memakai variasi nama (D81), dan dispatch lanjutan dengan ref lama ditolak
+   "agent … does not match session key agent …". Agen baru tidak membawa
+   memori agen mati — deliver() mendeteksi ref basi (agentId di dalam ref ≠
+   agentId terselesaikan), menyabit kunci segar, dan mengganti ref; context
+   reset adalah efek jujur dari sandbox yang diganti, tercatat event
+   chat.sandbox-provisioned, tanpa baris sistem di transkrip (UI hanya
+   bercabang operator/brain).
+
+**Acceptance §11** dibuktikan live via proxy terauthentikasi + DB produksi
+(Postgres lewat pgproxy — controller.db sqlite adalah sisa basi, jangan
+dipakai sebagai bukti): tasks=0 executions=0 sepanjang seluruh skenario;
+sesi kedua (project,brain sama) tak menumbuhkan agen; kill → reprovisi
+variasi nama → pesan berikutnya DONE; switch tanpa confirmReset 409 + brain
+tetap, dengan confirmReset → transkrip utuh + balasan tanpa pengetahuan
+sejarah; dua lampiran dirujuk satu balasan. Dua baris FAILED + satu DONE
+kosong di CHS-E6A3263B dibiarkan sebagai sejarah jujur bug-bug di atas.
+Insiden proses: salinan tar macOS membawa xattr macl yang menjadikan berkas
+mode 600 → EACCES di container; chmod 644 setelah salin kini langkah wajib.

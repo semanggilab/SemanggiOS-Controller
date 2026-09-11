@@ -399,6 +399,46 @@ test("a late refusal for an unknown execution is ignored, not invented", async (
   assert.match(res.reason, /unknown execution/);
 });
 
+test("a late refusal for an in-flight CHAT turn fails the message, not just the log", async () => {
+  // Giliran chat tidak punya baris eksekusi — adapter memakai id CHM sebagai
+  // request id WS. Sebelum hook ini, penolakan pasca-accept (terukur
+  // 2026-09-11 di CHS-A06F5674: auth profile cerebras tak tersedia) hanya
+  // menghasilkan baris log, dan giliran menggantung RUNNING sampai timeout
+  // 600 dtk — transkrip gateway kosong karena run tidak pernah jalan.
+  const h = await buildHarness();
+  const { project } = await seedBasics(h);
+  const brain = await h.brains.create({ name: "cerebras-chat", provider: "cerebras", model: "qwen-3.8-27b" });
+  const session = await h.repos.chatSessions.create({ projectId: project.id, brainId: brain.id, actor: "operator-a" });
+  const msg = await h.repos.chatMessages.append({ sessionId: session.id, role: "brain", content: "", status: "PENDING" });
+  await h.repos.chatMessages.updateDelivery(msg.id, { status: "RUNNING" });
+
+  const sink = await sinkFor(h);
+  const res = await sink.applyLateError({
+    runId: msg.id,
+    error: { code: "UNAVAILABLE", message: "Prepared direct auth fallback cannot bypass unavailable profiles for cerebras/qwen-3.8-27b." },
+  });
+  assert.equal(res.handled, true);
+  const row = await h.repos.chatMessages.get(msg.id);
+  assert.equal(row.status, "FAILED");
+  assert.match(row.error, /cannot bypass unavailable profiles/);
+  // Baris final TIDAK boleh divonis ulang oleh late-error kedua.
+  const again = await sink.applyLateError({ runId: msg.id, error: { message: "second refusal" } });
+  assert.equal(again.handled, false);
+});
+
+test("a late refusal for a FINALIZED chat message does not overwrite its verdict", async () => {
+  const h = await buildHarness();
+  const { project } = await seedBasics(h);
+  const brain = await h.brains.create({ name: "glm-chat", provider: "zai", model: "glm-4.7" });
+  const session = await h.repos.chatSessions.create({ projectId: project.id, brainId: brain.id, actor: "operator-a" });
+  const msg = await h.repos.chatMessages.append({ sessionId: session.id, role: "brain", content: "sudah dijawab", status: "DONE" });
+
+  const sink = await sinkFor(h);
+  const res = await sink.applyLateError({ runId: msg.id, error: { message: "refused late" } });
+  assert.equal(res.handled, false);
+  assert.equal((await h.repos.chatMessages.get(msg.id)).content, "sudah dijawab");
+});
+
 test("a late refusal cannot condemn a finalized or already-running execution", async () => {
   // A refusal that arrives late must not race the truth: an execution that
   // already ended (or is provably running) has its own events deciding it.

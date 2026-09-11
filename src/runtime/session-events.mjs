@@ -408,6 +408,33 @@ export function createSessionEventSink({
     const message = payload?.error?.message ?? JSON.stringify(payload?.error ?? {});
     const execution = runId ? await repos.executions.get(runId) : null;
     if (!execution) {
+      // Giliran CHAT: adapter dispatch memakai id pesan chat (CHM-*) sebagai
+      // request id WS, jadi penolakan terlambat mendarat DI SINI tanpa baris
+      // eksekusi di belakangnya. Tanpa hook ini giliran menggantung sampai
+      // timeout 600 dtk — run yang tidak pernah jalan tidak menulis apa pun
+      // ke transkrip, jadi poller chat-completion tidak punya apa pun untuk
+      // dibaca (terukur 2026-09-11, CHS-A06F5674: "Prepared direct auth
+      // fallback cannot bypass unavailable profiles"). Hanya baris yang
+      // masih in-flight yang boleh divonis; DONE/FAILED punya vonisnya.
+      const chatRow = repos.chatMessages ? await repos.chatMessages.get(runId).catch(() => null) : null;
+      if (chatRow && (chatRow.status === "PENDING" || chatRow.status === "RUNNING")) {
+        await repos.chatMessages.updateDelivery(runId, {
+          status: "FAILED",
+          error: String(message).slice(0, 400),
+        });
+        if (repos.chatSessions?.touch) {
+          await repos.chatSessions.touch(chatRow.session_id).catch(() => {});
+        }
+        await events.append({
+          kind: "chat.message-failed",
+          subjectType: "chat_session",
+          subjectId: chatRow.session_id,
+          actor: "controller",
+          payload: { messageId: runId, reason: "gateway-late-error", error: String(message).slice(0, 300) },
+        });
+        log.warn?.("chat.late-refusal", { message: runId, session: chatRow.session_id });
+        return { handled: true, reason: "chat turn failed by late refusal" };
+      }
       // Same rule as applyEnd: not ours, so nothing to condemn.
       return { handled: false, reason: "unknown execution" };
     }

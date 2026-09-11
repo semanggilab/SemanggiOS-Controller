@@ -3073,3 +3073,38 @@ GAGAL ketika perbaikannya dilepas.
 di-commit tetapi BELUM disinkronkan ke NFS: pohon kerja repo ini sedang memuat
 pekerjaan sesi lain yang belum selesai, dan `sync-controller-src.sh` menyalin
 seluruh pohon, bukan hanya commit.
+
+## D93 — Dua Dockerfile AgentOS, dan image yang "berhasil" tanpa UI Semanggi
+
+**Kejadian.** Perbaikan D92 sisi UI dibangun dengan
+`images/agentos/Dockerfile`, lalu dideploy. Image-nya build bersih dan
+service-nya sehat — tetapi seluruh UI Semanggi TIDAK ada di dalamnya. Produksi
+berjalan ~30 menit tanpa halaman Semanggi sebelum dikembalikan ke
+`kubuslab/semanggi-agentos:latest`.
+
+**Sebab.** Ada dua Dockerfile di direktori itu:
+
+- `Dockerfile` — meng-clone AgentOS HULU pada `AGENTOS_REF`. Tidak tahu-menahu
+  soal fork.
+- `Dockerfile.before-poc5-20260908052606` — `COPY --from=agentos-src . /src`,
+  yang membangun dari `/root/agentos-fork`.
+
+Yang aktif adalah yang pertama (tertanggal Agustus, pemiliknya uid 501:staff
+bersama berkas `._*` khas macOS — direktori ini tampaknya salinan yang
+tersinkron dari mesin operator). `--build-context agentos-src=...` yang saya
+kirimkan diabaikan diam-diam, karena Dockerfile itu memang tidak memakainya.
+
+**Pelajaran yang mahal.** Saya memverifikasi bahwa image BERHASIL DIBANGUN,
+bukan bahwa image MEMUAT yang seharusnya. Sebuah build yang sukses hanya
+menjanjikan sintaks, bukan isi. Sejak sekarang, sebelum deploy image UI:
+
+```
+docker run --rm --entrypoint sh <image> -c 'grep -rl "Thinking levels" /agentos/.next | wc -l'
+```
+
+Nol berarti jangan deploy. Pemeriksaan yang sama menemukan perbaikan D92 di
+bundel klien sebelum deploy kedua, dan deploy kedua itu benar.
+
+**Yang belum diputuskan operator.** Mana dari dua Dockerfile itu yang kanonik.
+Selama keduanya hidup berdampingan dengan nama yang tidak menyebut bedanya,
+build berikutnya akan mengulang kesalahan yang sama.

@@ -58,6 +58,11 @@ const RANK = Object.freeze({ [Level.LOW]: 0, [Level.NORMAL]: 1, [Level.CRITICAL]
  * kandidat pertama level (katalog routing). Menonaktifkan sebuah Brain
  * menonaktifkan default-nya juga — default tidak boleh menghidupkan kembali
  * sesuatu yang operator matikan.
+ *
+ * Baris `chat` (POC-10 §10.1/§7.4) mengikuti prioritas operator untuk chat
+ * room: gratis dulu — gemini-flash-high di low/normal — naik ke glm-5-2-max
+ * hanya di critical. Operator bebas memaku ulang sel chat lewat halaman yang
+ * sama; nilai ini hanya titik awal yang tidak menyulitkan dompet.
  */
 export const DEFAULT_BRAIN_MAP = Object.freeze({
   software: Object.freeze({
@@ -67,6 +72,7 @@ export const DEFAULT_BRAIN_MAP = Object.freeze({
     reviewer: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
     tester: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "qwen-high" }),
     learner: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
+    chat: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-2-max" }),
   }),
   frontend: Object.freeze({
     analyst: Object.freeze({ [Level.LOW]: "glm-5-2-max", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
@@ -76,6 +82,7 @@ export const DEFAULT_BRAIN_MAP = Object.freeze({
     tester: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "qwen-high" }),
     learner: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
     browser: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-1-on" }),
+    chat: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-2-max" }),
   }),
   backend: Object.freeze({
     analyst: Object.freeze({ [Level.LOW]: "glm-5-2-max", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
@@ -84,18 +91,21 @@ export const DEFAULT_BRAIN_MAP = Object.freeze({
     reviewer: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
     tester: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "qwen-high" }),
     learner: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
+    chat: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-2-max" }),
   }),
   research: Object.freeze({
     researcher: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-2-max" }),
     writer: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "qwen-high" }),
     reviewer: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "qwen-high", [Level.CRITICAL]: "qwen-high" }),
     analyst: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "qwen-high", [Level.CRITICAL]: "qwen-high" }),
+    chat: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-2-max" }),
   }),
   content: Object.freeze({
     strategist: Object.freeze({ [Level.LOW]: "glm-5-2-max", [Level.NORMAL]: "glm-5-2-max", [Level.CRITICAL]: "glm-5-2-max" }),
     writer: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-2-max" }),
     reviewer: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "qwen-high", [Level.CRITICAL]: "qwen-high" }),
     analyst: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "qwen-high", [Level.CRITICAL]: "qwen-high" }),
+    chat: Object.freeze({ [Level.LOW]: "gemini-flash-high", [Level.NORMAL]: "gemini-flash-high", [Level.CRITICAL]: "glm-5-2-max" }),
   }),
 });
 

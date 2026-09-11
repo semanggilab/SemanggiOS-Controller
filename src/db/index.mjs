@@ -211,6 +211,19 @@ class SqliteStore {
       this.#db.exec(`ALTER TABLE tasks ADD COLUMN resource_retries INTEGER NOT NULL DEFAULT 0`);
     }
 
+    // POC-10 §10.3: batas agen chat per (provider, model), kolomnya sendiri
+    // supaya kuota chat dan kuota task bisa disetel independen. Tanpa backfill:
+    // DEFAULT 1 adalah kebijakan baru yang benar untuk baris lama — operator
+    // belum pernah menyatakan batas chat apa pun, dan 1 adalah nilai paling
+    // konservatif yang tidak membuka armada diam-diam.
+    const resourceCols = cols("resources");
+    if (resourceCols.length > 0 && !resourceCols.includes("chat_concurrency_limit")) {
+      this.#db.exec(`ALTER TABLE resources ADD COLUMN chat_concurrency_limit INTEGER NOT NULL DEFAULT 1`);
+    }
+    // Tiga tabel chat (sessions/messages/sandboxes) dibuat oleh SCHEMA di atas
+    // (CREATE TABLE IF NOT EXISTS) — tabel baru tidak butuh ALTER; catatan ini
+    // hanya penanda bahwa mereka memang bagian migrasi POC-10 yang sama.
+
     // D54: penanda hapus-lunak. Nullable: baris lama tidak pernah dihapus,
     // jadi NULL berarti "hidup" tanpa perlu backfill.
     if (taskCols.length > 0 && !taskCols.includes("deleted_at")) {
@@ -450,6 +463,12 @@ class PostgresStore {
   async init() {
     await this.#sql.unsafe(postgresSchema()).simple();
     await this.#sql.unsafe("CREATE INDEX IF NOT EXISTS idx_executions_session_key ON executions(session_key)");
+    // POC-10 §10.3 (padanan migrasi SqliteStore): basis data warisan tidak
+    // di-ALTER oleh CREATE TABLE IF NOT EXISTS, jadi kolom batas chat
+    // ditambahkan eksplisit di sini — idempoten lewat IF NOT EXISTS.
+    await this.#sql.unsafe(
+      "ALTER TABLE resources ADD COLUMN IF NOT EXISTS chat_concurrency_limit BIGINT NOT NULL DEFAULT 1",
+    );
     await this.#sql.unsafe(`
       CREATE OR REPLACE FUNCTION semanggi_reject_event_mutation() RETURNS trigger AS $$
       BEGIN RAISE EXCEPTION 'event_log is append-only'; END; $$ LANGUAGE plpgsql;

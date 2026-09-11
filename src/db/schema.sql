@@ -153,6 +153,12 @@ CREATE TABLE IF NOT EXISTS resources (
   provider          TEXT NOT NULL,
   model             TEXT NOT NULL,
   concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK (concurrency_limit >= 0),
+  -- POC-10 §10.3: batas agen `sem-chat-*` per (provider, model), TERPISAH dari
+  -- concurrency_limit task di atas. Kuota chat dan kuota task harus bisa
+  -- disetel independen — chat yang ramai tidak boleh diam-diam memakan slot
+  -- task produksi, dan sebaliknya. Default 1, lantai idle 0 (murni on-demand,
+  -- tidak ada pre-warm untuk chat).
+  chat_concurrency_limit INTEGER NOT NULL DEFAULT 1 CHECK (chat_concurrency_limit >= 0),
   quota_policy      TEXT NOT NULL DEFAULT '{}',
   availability      TEXT NOT NULL DEFAULT 'AVAILABLE'
                       CHECK (availability IN ('AVAILABLE','QUOTA_EXHAUSTED','UNAVAILABLE')),
@@ -499,4 +505,67 @@ CREATE TABLE IF NOT EXISTS gateway_models (
   max_tokens     INTEGER,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (provider, model)
+);
+
+-- --- POC-10: Command Center sebagai chat room umum ---------------------------
+
+-- Satu percakapan operator↔Brain di dalam satu project.
+--
+-- gateway_session_ref memegang session key gateway untuk semantik CONTINUE
+-- (jalur lambat transkrip D48 bergantung padanya); NULL berarti percakanan
+-- belum pernah berjalan — dispatch berikutnya FRESH. Ganti Brain men-NULL-kan
+-- ref ini: context window milik Brain lama tidak bisa dikloning (batasan
+-- gateway yang sama dengan FORK D46), dan operator sudah memutuskan reset itu
+-- harus eksplisit (POC-10 §10.2).
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  id                  TEXT PRIMARY KEY,
+  project_id          TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  brain_id            TEXT NOT NULL,
+  title               TEXT,
+  gateway_session_ref TEXT,
+  status              TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','ARCHIVED')),
+  actor               TEXT NOT NULL,
+  created_at          INTEGER NOT NULL,
+  last_active_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_project ON chat_sessions(project_id, last_active_at DESC);
+
+-- Transkrip chat. `seq` ditugaskan per sesi (MAX+1 dalam satu transaksi),
+-- bukan dipercayakan pada created_at: jam uji di repo ini sering diam di
+-- satu milidetik, dan dua pesan dengan stempel sama adalah urutan yang
+-- bergantung pada rencana eksekusi — pola yang sama dengan execution_messages
+-- (seq milik sesi, bukan eksekusi).
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id          TEXT PRIMARY KEY,
+  session_id  TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+  seq         INTEGER NOT NULL,
+  role        TEXT NOT NULL CHECK (role IN ('operator','brain','system')),
+  content     TEXT NOT NULL,
+  attachments TEXT,
+  created_at  INTEGER NOT NULL,
+  UNIQUE (session_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, seq);
+
+-- Sandbox chat: satu agen gateway `sem-chat-*` per (project, brain).
+--
+-- Dikunci per (project, brain) DAN BUKAN per sesi — dua sesi yang memilih
+-- pasangan sama berbagi satu agen (masing-masing dengan gateway_session_ref
+-- sendiri; percakapan tetap terpisah di gateway). Tanpa reaper: baris hilang
+-- hanya saat operator kill manual (Process Manager D78) dan pesan berikutnya
+-- memprovisikan ulang — last_used_at informasional, bukan jam penyapu.
+-- brain_id sengaja tanpa FK: sesi/baris boleh menunjuk Brain yang sudah
+-- dihapus; endpoint pesan yang menolaknya dengan alasan, bukan DB yang
+-- meruntuhkan riwayat.
+CREATE TABLE IF NOT EXISTS chat_sandboxes (
+  project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  brain_id     TEXT NOT NULL,
+  agent_id     TEXT NOT NULL,
+  provider     TEXT NOT NULL,
+  model        TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER NOT NULL,
+  PRIMARY KEY (project_id, brain_id)
 );

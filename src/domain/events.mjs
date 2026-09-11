@@ -28,6 +28,13 @@ export const EventKind = Object.freeze({
   LEASE_RECLAIMED: "lease.reclaimed",
   APPROVAL_REQUESTED: "approval.requested",
   APPROVAL_DECIDED: "approval.decided",
+  // POC-10: audit chat. Tidak ada `chat.sandbox-released` — pelepasan sandbox
+  // chat selalu manual lewat Process Manager (D78) dan kill sudah tercatat di
+  // sana; mengauditnya dua kali di dua tempat adalah dua jejak yang bisa
+  // saling bertengkar soal urutan.
+  CHAT_SESSION_CREATED: "chat.session-created",
+  CHAT_MESSAGE_SENT: "chat.message-sent",
+  CHAT_SANDBOX_PROVISIONED: "chat.sandbox-provisioned",
 });
 
 // Payloads are audit data, not a place to stash credentials. Anything matching

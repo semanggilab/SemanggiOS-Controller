@@ -3114,3 +3114,45 @@ bundel klien sebelum deploy kedua, dan deploy kedua itu benar.
 **Yang belum diputuskan operator.** Mana dari dua Dockerfile itu yang kanonik.
 Selama keduanya hidup berdampingan dengan nama yang tidak menyebut bedanya,
 build berikutnya akan mengulang kesalahan yang sama.
+
+## D95 — POC-10 T1+T2: fondasi data chat dan pool `sem-chat-*`
+
+**Apa.** Tahap 1 dan 2 POC-10 (Command Center sebagai chat room umum) masuk
+sebagai modul dorman: skema + repo + event chat, role `chat` di tiga lapis
+(levels/brain map/category), dan modul provisioning `chat-sandbox.mjs` yang
+menjadi satu-satunya penulis armada `sem-chat-*`. Belum ada pemanggil API —
+semuanya menunggu T3 (API) dan T5 (UI).
+
+**Empat jangkar.**
+
+1. *Dua batas, dua kolom.* `resources.chat_concurrency_limit` berdiri sendiri
+   di samping `concurrency_limit`; `provision()` hanya menghitung agen
+   `sem-chat-*`, sehingga ruang chat tidak bisa memakan jatah task — dan
+   sebaliknya.
+
+2. *Legacy workspace tidak direlokasi.* D80 memindahkan sandbox task ke
+   workspace baru saat menemukan state lama; untuk chat kami justru menolak
+   dengan `legacy-workspace-state` tanpa memindah apa pun. Workspace project
+   ADALAH kosakata ruang chat — memindahnya sama dengan mengganti alamat
+   obrolan di tengah percakapan.
+
+3. *Defaults role chat di kode, bukan boot-INSERT.* Spec §12.4 menyebut grid
+   diisi "sudut kanan bawah"; kami menaruh `chat:NORMAL` di
+   `DEFAULT_ROLE_LEVELS` dan baris `chat` di `DEFAULT_BRAIN_MAP` — idiom
+   idempotent D66 — tanpa menyentuh DB saat boot. Grid operator tetap
+   sumber override; baris kode hanya titik awal yang bisa dipaku ulang.
+
+4. *Provisioning tidak pernah throw.* Kegagalan kembali sebagai
+   `{ok:false, why}` — `cap-full`, `no-resource-entry`, `create-failed`,
+   `legacy-workspace-state` — mengikuti janji D80/D81 bahwa pemanggil selalu
+   mendapat objek hasil yang bisa diperiksa, bukan exception.
+
+Plus: transkrip memakai kolom `seq` eksplisit (UNIQUE(session_id, seq)) —
+`created_at` tidak dijamin monoton di mesin multi-proses; retry create
+memakai variasi nama `-r<shortId>` SEKALI dengan workspace tetap (nama itu
+alamat jaringan, workspace itu alamat berkas — hanya nama yang boleh
+membungkuk); keeper `reconcileAll` terbukti (tes) tidak memangkas `sem-chat-*`.
+
+**Catatan penyebaran.** `brain-map.mjs` hanya menambah baris `chat` di atas
+HEAD; pin operator `qwen-high` (D68) dipertahankan — scp sesi ini sempat
+menimpanya dengan salinan tua `codex-*`, tertangkap sebelum commit.

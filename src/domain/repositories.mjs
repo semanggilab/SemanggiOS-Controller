@@ -1174,6 +1174,35 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       );
     },
 
+    /**
+     * POC-10 §10.3: batas agen chat, kolom kebijakannya sendiri. Tulisan
+     * operator lewat Model Map — event `resource.policy` (bukan
+     * `resource.availability`), kelas jejak yang sama dengan D66: keputusan
+     * manusia soal kebijakan, bukan temuan scheduler soal dunia.
+     */
+    async setChatConcurrencyLimit(provider, model, limit, { actor = "operator" } = {}) {
+      const n = Number(limit);
+      if (!Number.isInteger(n) || n < 0) {
+        throw new Error(`chat_concurrency_limit must be an integer >= 0, got "${limit}"`);
+      }
+      const before = await resources.get(provider, model);
+      if (!before) throw new Error(`unknown resource ${provider}/${model}`);
+      await store.run(
+        `UPDATE resources SET chat_concurrency_limit = ?, updated_at = ?
+           WHERE lower(provider) = lower(?) AND lower(model) = lower(?)`,
+        [n, now(), provider, model],
+      );
+      const after = await resources.get(provider, model);
+      await events.append({
+        kind: "resource.policy",
+        subjectType: "resource",
+        subjectId: `${provider}/${model}`,
+        actor,
+        payload: { field: "chat_concurrency_limit", from: before.chat_concurrency_limit, to: n },
+      });
+      return after;
+    },
+
     async list() {
       return (await store.all(`SELECT * FROM resources ORDER BY provider, model`)).map(hydrateResource);
     },
@@ -1621,5 +1650,182 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
     },
   };
 
-  return { store, projects, workers, tasks, executions, resources, leases, approvals, messages };
+  // --- POC-10: chat ------------------------------------------------------------
+  //
+  // Chat adalah permukaan KEDUA di atas fondasi yang sama, bukan variasi task:
+  // tidak ada baris tasks/executions untuk chat, jadi seluruh keadaannya hidup
+  // di tiga tabel ini. Ukuran repo dibuat minimal — resolusi Brain, dispatch,
+  // dan ganti-Brain milik lapisan domain/endpoint (chat-sandbox, T3), bukan
+  // penyimpanan.
+
+  const chatSessions = {
+    async create({ id = shortId("CHS"), projectId, brainId, title = null, actor }) {
+      const project = await projects.get(projectId);
+      if (!project) throw new Error(`unknown project ${projectId}`);
+      if (!brainId) throw new Error("brainId is required");
+      if (!actor) throw new Error("actor is required");
+      const t = now();
+      await store.run(
+        `INSERT INTO chat_sessions (id, project_id, brain_id, title, gateway_session_ref, status, actor, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, NULL, 'ACTIVE', ?, ?, ?)`,
+        [id, projectId, brainId, title, actor, t, t],
+      );
+      await events.append({
+        kind: "chat.session-created",
+        subjectType: "chat_session",
+        subjectId: id,
+        actor,
+        payload: { projectId, brainId, title },
+      });
+      return chatSessions.get(id);
+    },
+
+    get: (id) => store.get(`SELECT * FROM chat_sessions WHERE id = ?`, [id]),
+
+    /** Sidebar project aktif — terbaru dulu (komentar baku repo ini). */
+    listByProject: (projectId) =>
+      store.all(`SELECT * FROM chat_sessions WHERE project_id = ? ORDER BY last_active_at DESC`, [projectId]),
+
+    /**
+     * Judul dan status saja. brain_id dan gateway_session_ref TIDAK ada di
+     * sini dengan sengaja: keduanya punya konsekuensi (reset context) yang
+     * menuntut konfirmasi eksplisit operator (POC-10 §10.2) — jalurnya
+     * sendiri di endpoint T3, bukan patch serbaguna.
+     */
+    async patch(id, { title, status, actor = "operator" } = {}) {
+      const session = await chatSessions.get(id);
+      if (!session) throw new Error(`unknown chat session ${id}`);
+      const sets = [];
+      const params = [];
+      if (title !== undefined) {
+        sets.push("title = ?");
+        params.push(String(title).slice(0, 200));
+      }
+      if (status !== undefined) {
+        if (!["ACTIVE", "ARCHIVED"].includes(status)) {
+          throw new Error(`status must be ACTIVE or ARCHIVED, got "${status}"`);
+        }
+        sets.push("status = ?");
+        params.push(status);
+      }
+      if (sets.length === 0) return session;
+      params.push(id);
+      await store.run(`UPDATE chat_sessions SET ${sets.join(", ")} WHERE id = ?`, params);
+      return chatSessions.get(id);
+    },
+
+    /** Dipanggil jalur dispatch: ingat kunci CONTINUE, hidupkan jam sesi. */
+    async setGatewayRef(id, ref) {
+      await store.run(`UPDATE chat_sessions SET gateway_session_ref = ?, last_active_at = ? WHERE id = ?`, [
+        ref,
+        now(),
+        id,
+      ]);
+      return chatSessions.get(id);
+    },
+
+    touch: (id) =>
+      store.run(`UPDATE chat_sessions SET last_active_at = ? WHERE id = ?`, [now(), id]).then(() => chatSessions.get(id)),
+
+    async remove(id) {
+      const session = await chatSessions.get(id);
+      if (!session) throw new Error(`unknown chat session ${id}`);
+      await store.run(`DELETE FROM chat_sessions WHERE id = ?`, [id]);
+      return { deleted: true, sessionId: id };
+    },
+  };
+
+  const chatMessages = {
+    /**
+     * Append satu pesan + bump jam sesi dalam SATU transaksi — pesan tanpa
+     * bump adalah sesi yang tidak naik di sidebar padahal jelas aktif.
+     * seq per sesi (MAX+1), bukan created_at: jam uji di repo ini diam di
+     * satu milidetik, dan urutan transkrip tidak boleh bergantung pada
+     * rencana eksekusi (pola execution_messages).
+     */
+    async append({ sessionId, role, content, attachments = null, actor = "operator" }) {
+      if (!["operator", "brain", "system"].includes(role)) {
+        throw new Error(`role must be operator|brain|system, got "${role}"`);
+      }
+      const session = await chatSessions.get(sessionId);
+      if (!session) throw new Error(`unknown chat session ${sessionId}`);
+      const id = shortId("CHM");
+      const t = now();
+      await store.tx(async () => {
+        const max = await store.get(`SELECT MAX(seq) AS m FROM chat_messages WHERE session_id = ?`, [sessionId]);
+        await store.run(
+          `INSERT INTO chat_messages (id, session_id, seq, role, content, attachments, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [id, sessionId, (max?.m ?? 0) + 1, role, content, attachments ? JSON.stringify(attachments) : null, t],
+        );
+        await store.run(`UPDATE chat_sessions SET last_active_at = ? WHERE id = ?`, [t, sessionId]);
+      });
+      await events.append({
+        kind: "chat.message-sent",
+        subjectType: "chat_session",
+        subjectId: sessionId,
+        actor: role === "operator" ? actor : "controller",
+        payload: { role, messageId: id, attachments: attachments ?? [] },
+      });
+      return chatMessages.get(id);
+    },
+
+    get: (id) => store.get(`SELECT * FROM chat_messages WHERE id = ?`, [id]),
+
+    list: (sessionId) =>
+      store
+        .all(`SELECT * FROM chat_messages WHERE session_id = ? ORDER BY seq ASC`, [sessionId])
+        .then((rows) => rows.map((r) => ({ ...r, attachments: json(r.attachments, null) }))),
+  };
+
+  const chatSandboxes = {
+    get: (projectId, brainId) =>
+      store.get(`SELECT * FROM chat_sandboxes WHERE project_id = ? AND brain_id = ?`, [projectId, brainId]),
+
+    /** Satu baris per (project, brain) — INSERT OR REPLACE, kunci komposit. */
+    async upsert({ projectId, brainId, agentId, provider, model }) {
+      const t = now();
+      await store.run(
+        `INSERT INTO chat_sandboxes (project_id, brain_id, agent_id, provider, model, created_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, brain_id) DO UPDATE SET
+           agent_id = excluded.agent_id,
+           provider = excluded.provider,
+           model = excluded.model,
+           last_used_at = excluded.last_used_at`,
+        [projectId, brainId, agentId, provider, model, t, t],
+      );
+      return chatSandboxes.get(projectId, brainId);
+    },
+
+    touch: (projectId, brainId) =>
+      store.run(`UPDATE chat_sandboxes SET last_used_at = ? WHERE project_id = ? AND brain_id = ?`, [
+        now(),
+        projectId,
+        brainId,
+      ]).then(() => chatSandboxes.get(projectId, brainId)),
+
+    /** Baris saja — agen gateway tetap milik Process Manager (D78). */
+    async remove(projectId, brainId) {
+      await store.run(`DELETE FROM chat_sandboxes WHERE project_id = ? AND brain_id = ?`, [projectId, brainId]);
+      return { deleted: true, projectId, brainId };
+    },
+
+    list: () => store.all(`SELECT * FROM chat_sandboxes ORDER BY project_id, brain_id`),
+  };
+
+  return {
+    store,
+    projects,
+    workers,
+    tasks,
+    executions,
+    resources,
+    leases,
+    approvals,
+    messages,
+    chatSessions,
+    chatMessages,
+    chatSandboxes,
+  };
 }

@@ -60,29 +60,29 @@ export const PROFILES = Object.freeze(["fast", "balanced", "quality"]);
 
 export const DEFAULT_ROLE_LEVELS = Object.freeze({
   software: Object.freeze({
-    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL }),
-    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL }),
-    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL }),
+    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL, chat: Level.NORMAL }),
+    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL, chat: Level.NORMAL }),
+    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL, chat: Level.NORMAL }),
   }),
   frontend: Object.freeze({
-    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL, browser: Level.LOW }),
-    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL, browser: Level.NORMAL }),
-    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL, browser: Level.CRITICAL }),
+    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL, browser: Level.LOW, chat: Level.NORMAL }),
+    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL, browser: Level.NORMAL, chat: Level.NORMAL }),
+    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL, browser: Level.CRITICAL, chat: Level.NORMAL }),
   }),
   backend: Object.freeze({
-    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL }),
-    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL }),
-    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL }),
+    fast: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.NORMAL, tester: Level.LOW, learner: Level.NORMAL, chat: Level.NORMAL }),
+    balanced: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.NORMAL, reviewer: Level.CRITICAL, tester: Level.NORMAL, learner: Level.CRITICAL, chat: Level.NORMAL }),
+    quality: Object.freeze({ analyst: Level.CRITICAL, architect: Level.CRITICAL, builder: Level.CRITICAL, reviewer: Level.CRITICAL, tester: Level.CRITICAL, learner: Level.CRITICAL, chat: Level.NORMAL }),
   }),
   research: Object.freeze({
-    fast: Object.freeze({ researcher: Level.NORMAL, writer: Level.NORMAL, reviewer: Level.NORMAL, analyst: Level.NORMAL }),
-    balanced: Object.freeze({ researcher: Level.NORMAL, writer: Level.NORMAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
-    quality: Object.freeze({ researcher: Level.CRITICAL, writer: Level.CRITICAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
+    fast: Object.freeze({ researcher: Level.NORMAL, writer: Level.NORMAL, reviewer: Level.NORMAL, analyst: Level.NORMAL, chat: Level.NORMAL }),
+    balanced: Object.freeze({ researcher: Level.NORMAL, writer: Level.NORMAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL, chat: Level.NORMAL }),
+    quality: Object.freeze({ researcher: Level.CRITICAL, writer: Level.CRITICAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL, chat: Level.NORMAL }),
   }),
   content: Object.freeze({
-    fast: Object.freeze({ strategist: Level.CRITICAL, writer: Level.NORMAL, reviewer: Level.NORMAL, analyst: Level.NORMAL }),
-    balanced: Object.freeze({ strategist: Level.CRITICAL, writer: Level.NORMAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
-    quality: Object.freeze({ strategist: Level.CRITICAL, writer: Level.CRITICAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL }),
+    fast: Object.freeze({ strategist: Level.CRITICAL, writer: Level.NORMAL, reviewer: Level.NORMAL, analyst: Level.NORMAL, chat: Level.NORMAL }),
+    balanced: Object.freeze({ strategist: Level.CRITICAL, writer: Level.NORMAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL, chat: Level.NORMAL }),
+    quality: Object.freeze({ strategist: Level.CRITICAL, writer: Level.CRITICAL, reviewer: Level.CRITICAL, analyst: Level.CRITICAL, chat: Level.NORMAL }),
   }),
 });
 
@@ -103,11 +103,11 @@ export function rolesForTemplate(template) {
 /**
  * Role yang TIDAK disediakan template AgentOS mana pun.
  *
- * Diperiksa langsung di `workspace-presets.ts`: sepuluh role tersedia
- * (Builder, Reviewer, Tester, Learner, Browser Agent, Research Lead, Archivist,
- * Strategist, Writer, Analyst) dan **tidak ada Architect**. Kata "architect"
- * muncul tepat sekali di seluruh berkas itu — di dalam *deskripsi* Learner pada
- * template backend, bukan sebagai role.
+ * `architect`: diperiksa langsung di `workspace-presets.ts` — sepuluh role
+ * tersedia (Builder, Reviewer, Tester, Learner, Browser Agent, Research Lead,
+ * Archivist, Strategist, Writer, Analyst) dan **tidak ada Architect**. Kata
+ * "architect" muncul tepat sekali di seluruh berkas itu — di dalam *deskripsi*
+ * Learner pada template backend, bukan sebagai role.
  *
  * Itu bukan kelalaian AgentOS melainkan asumsi templatenya: `docs/architecture.md`
  * yang di-scaffold berjudul "Current shape · Dependencies · Risks" — deskriptif
@@ -117,12 +117,16 @@ export function rolesForTemplate(template) {
  * Skill Builder bahkan menjauhkannya dari pekerjaan desain secara eksplisit:
  * *"Prefer direct code or artifact changes over speculative planning."*
  *
+ * `chat` (POC-10 §10.1): role NETRAL milik Semanggi untuk resolusi Brain
+ * default di chat room — bukan pekerjaan yang didekomposisi, jadi tidak ada
+ * alasan template AgentOS menyediakannya.
+ *
  * `role` di AgentOS bertipe `string` bebas (bukan union), jadi operator boleh
  * menambahkan Architect sendiri lewat UI dengan preset `worker`. Tabel di atas
  * sudah menyiapkan levelnya supaya begitu role itu ada, ia langsung dirutekan
  * ke Brain critical — kesalahan desain adalah yang paling mahal dibatalkan.
  */
-export const ROLES_NOT_IN_AGENTOS = Object.freeze(["architect"]);
+export const ROLES_NOT_IN_AGENTOS = Object.freeze(["architect", "chat"]);
 
 /**
  * Level efektif untuk sebuah (template, role, profile, project).

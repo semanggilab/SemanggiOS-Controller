@@ -39,6 +39,12 @@ export const ROLE_CATEGORY = Object.freeze({
   learner: "documentation",
   writer: "documentation",
   archivist: "documentation",
+  // POC-10 §10.1: role netral untuk resolusi Brain default di chat. Chat tidak
+  // pernah membuat task sehingga kategorinya tidak pernah dibaca RoutingPolicy
+  // — entri ini ada supaya role "chat" adalah warga kosakata kelas satu:
+  // resolveLevel dan brainMap.resolve menerimanya tanpa jalur istimewa, dan
+  // halaman Role/Brain Map menampilkannya bersama role sungguhan.
+  chat: "analysis",
 });
 
 /** Level → kelas kualitas task. Satu-satu; keduanya kosakata untuk hal sama. */

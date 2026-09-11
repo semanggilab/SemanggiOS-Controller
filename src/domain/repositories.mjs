@@ -236,7 +236,8 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           GROUP BY t.project_id`,
         [since],
       );
-      return new Map(rows.map((r) => [r.project_id, r.n]));
+      // COUNT(int8) comes back as a string from pg — normalize for consumers
+      return new Map(rows.map((r) => [r.project_id, Number(r.n)]));
     },
   };
 
@@ -285,7 +286,7 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           WHERE worker_id = ? AND status IN (?, ?)`,
         [workerId, Status.DISPATCHED, Status.RUNNING],
       );
-      return row?.n ?? 0;
+      return Number(row?.n ?? 0);
     },
 
     /**
@@ -812,7 +813,8 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
         await store.run(`DELETE FROM approvals WHERE task_id = ?`, [taskId]);
 
         const execCount = await store.get(`SELECT COUNT(*) AS n FROM executions WHERE task_id = ?`, [taskId]);
-        const method = execCount.n === 0 ? "hard" : "soft";
+        // "0" === 0 is false when pg hands COUNT back as a string
+        const method = Number(execCount.n) === 0 ? "hard" : "soft";
         if (method === "hard") {
           await store.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
         } else {
@@ -860,7 +862,8 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           `SELECT MAX(revision_no) AS n FROM executions WHERE task_id = ?`,
           [taskId],
         );
-        const revisionNo = (last?.n ?? 0) + 1;
+        // same int8-as-string contract as chat_messages.seq above
+        const revisionNo = Number(last?.n ?? 0) + 1;
 
         // CONTINUE resumes the previous conversation. FORK does NOT inherit the
         // ref, and that is deliberate rather than an oversight: on this gateway
@@ -920,7 +923,7 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           WHERE task_id = ? AND status IN ('FAILED','CANCELLED','BLOCKED') AND created_at >= ?`,
         [taskId, since],
       );
-      return row?.n ?? 0;
+      return Number(row?.n ?? 0);
     },
 
     /**
@@ -1305,7 +1308,7 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           WHERE model_provider = ? AND model_id = ? AND status IN (?, ?)`,
         [provider, model, ExecutionStatus.DISPATCHED, ExecutionStatus.RUNNING],
       );
-      return row?.n ?? 0;
+      return Number(row?.n ?? 0);
     },
   };
 
@@ -1789,10 +1792,13 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       const t = now();
       await store.tx(async () => {
         const max = await store.get(`SELECT MAX(seq) AS m FROM chat_messages WHERE session_id = ?`, [sessionId]);
+        // pg drivers return int8 (bigint) as string: coerce before the +1, or
+        // "11" + 1 becomes the string "111" (live: seq grew to 1111111111111111111).
+        const seq = Number(max?.m ?? 0) + 1;
         await store.run(
           `INSERT INTO chat_messages (id, session_id, seq, role, content, attachments, status, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          [id, sessionId, (max?.m ?? 0) + 1, role, content, attachments ? JSON.stringify(attachments) : null, status, t],
+          [id, sessionId, seq, role, content, attachments ? JSON.stringify(attachments) : null, status, t],
         );
         await store.run(`UPDATE chat_sessions SET last_active_at = ? WHERE id = ?`, [t, sessionId]);
       });

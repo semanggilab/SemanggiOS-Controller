@@ -3472,6 +3472,21 @@ workspace project hidup. Journal kini kosong, tapi akarnya (workspace_dir
 agen pool = workspace project) masih ada — calon keputusan: kill chat pool
 tidak memakai `agents.delete`, atau fork memagari cleanup workspace bersama.
 
+**Keputusan 5 — glm-5.2 dipaku 131072, bukan dikosongkan.** Operator minta
+nilai "Max output 8.2K" zai/glm-5.2 dihapus agar output tak terpotong
+(kasus D82). Sumber nilai itu eksplisit di
+`models.providers.zai.models[glm-5.2].maxTokens = 8192` pada openclaw.json
+gateway — dan menghapusnya menyisakan fallback tak terdefinisi (default
+katalog bisa mengembalikan 8192 lagi). Nilai itu dinaikkan ke 131072 —
+angka yang sudah terbukti berjalan pada glm-5.1 lewat API zai yang sama —
+dengan backup `openclaw.json.before-glm52-maxtokens-20260912`; halaman
+Model Map kini menampilkan 131K setelah refresh. Katalog routing juga
+mendaftarkan `codex-sol-high`/`codex-terra-low` (commit `44ddb73`) sehingga
+kedua tier baru muncul sebagai nama katalog di baris keluarga modelnya
+(satu baris per keluarga codex — bukan per tier — karena kunci Model Map
+adalah (provider, model), dan semua tier claude berbagi satu identitas
+langganan `claude-code/claude-code`).
+
 **Bukti.** Controller: `chat-completion.mjs` verdict + tes, `applyLateError`
 hook + 2 tes (in-flight → FAILED; final tak ditimpa), `ensureProbeAgent`
 relokasi + tes; commit `df6d681` + `cb9bd8a`, suite cluster 649 lulus

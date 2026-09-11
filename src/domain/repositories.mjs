@@ -1724,6 +1724,32 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       return chatSessions.get(id);
     },
 
+    /**
+     * Ganti Brain sesi aktif (POC-10 §10.2) — satu-satunya penulis brain_id
+     * pasca-create, dan selalu melepas gateway_session_ref: Brain baru mulai
+     * dari context window kosong, transkrip chat_messages TIDAK tersentuh.
+     * Pemanggil (endpoint T3) yang bertanggung jawab atas gerbang
+     * confirmReset — repo ini dipercaya sudah melewati gerbang itu.
+     */
+    async switchBrain(id, { brainId, actor = "operator" }) {
+      const session = await chatSessions.get(id);
+      if (!session) throw new Error(`unknown chat session ${id}`);
+      if (!brainId) throw new Error("brainId is required");
+      await store.run(`UPDATE chat_sessions SET brain_id = ?, gateway_session_ref = NULL, last_active_at = ? WHERE id = ?`, [
+        brainId,
+        now(),
+        id,
+      ]);
+      await events.append({
+        kind: "chat.brain-switched",
+        subjectType: "chat_session",
+        subjectId: id,
+        actor,
+        payload: { fromBrainId: session.brain_id, toBrainId: brainId, contextReset: true },
+      });
+      return chatSessions.get(id);
+    },
+
     touch: (id) =>
       store.run(`UPDATE chat_sessions SET last_active_at = ? WHERE id = ?`, [now(), id]).then(() => chatSessions.get(id)),
 
@@ -1743,9 +1769,12 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
      * satu milidetik, dan urutan transkrip tidak boleh bergantung pada
      * rencana eksekusi (pola execution_messages).
      */
-    async append({ sessionId, role, content, attachments = null, actor = "operator" }) {
+    async append({ sessionId, role, content, attachments = null, status = "DONE", actor = "operator" }) {
       if (!["operator", "brain", "system"].includes(role)) {
         throw new Error(`role must be operator|brain|system, got "${role}"`);
+      }
+      if (!["PENDING", "RUNNING", "DONE", "FAILED"].includes(status)) {
+        throw new Error(`status must be PENDING|RUNNING|DONE|FAILED, got "${status}"`);
       }
       const session = await chatSessions.get(sessionId);
       if (!session) throw new Error(`unknown chat session ${sessionId}`);
@@ -1754,9 +1783,9 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       await store.tx(async () => {
         const max = await store.get(`SELECT MAX(seq) AS m FROM chat_messages WHERE session_id = ?`, [sessionId]);
         await store.run(
-          `INSERT INTO chat_messages (id, session_id, seq, role, content, attachments, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [id, sessionId, (max?.m ?? 0) + 1, role, content, attachments ? JSON.stringify(attachments) : null, t],
+          `INSERT INTO chat_messages (id, session_id, seq, role, content, attachments, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [id, sessionId, (max?.m ?? 0) + 1, role, content, attachments ? JSON.stringify(attachments) : null, status, t],
         );
         await store.run(`UPDATE chat_sessions SET last_active_at = ? WHERE id = ?`, [t, sessionId]);
       });
@@ -1776,6 +1805,27 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       store
         .all(`SELECT * FROM chat_messages WHERE session_id = ? ORDER BY seq ASC`, [sessionId])
         .then((rows) => rows.map((r) => ({ ...r, attachments: json(r.attachments, null) }))),
+
+    /**
+     * Perbaruan pengiriman pesan brain (T3): PENDING → RUNNING → DONE/FAILED.
+     * Konten hanya boleh ikut saat DONE — baris PENDING/RUNNING sengaja lahir
+     * kosong supaya polling punya sesuatu untuk ditunggu. Bukan jalur umum
+     * menyunting transkrip: pesan operator tidak punya status selain DONE.
+     */
+    async updateDelivery(id, { status, content, error = null }) {
+      if (!["PENDING", "RUNNING", "DONE", "FAILED"].includes(status)) {
+        throw new Error(`delivery status must be PENDING|RUNNING|DONE|FAILED, got "${status}"`);
+      }
+      const sets = ["status = ?", "error = ?"];
+      const params = [status, error];
+      if (content !== undefined) {
+        sets.push("content = ?");
+        params.push(String(content));
+      }
+      params.push(id);
+      await store.run(`UPDATE chat_messages SET ${sets.join(", ")} WHERE id = ?`, params);
+      return chatMessages.get(id);
+    },
   };
 
   const chatSandboxes = {

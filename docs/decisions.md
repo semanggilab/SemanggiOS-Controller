@@ -3193,3 +3193,53 @@ health       200
 sendiri. Dibersihkan ke 86%. Sebuah build yang menumpuk image tanpa dibersihkan
 akhirnya menjatuhkan deploy yang tidak ada hubungannya dengan build itu.
 
+
+## D97 — POC-10 T3+T4: API chat, dispatch tanpa task, injeksi konteks
+
+**Apa.** Permukaan HTTP §8 (sessions CRUD, messages async-polling, uploads
+akar sesi, ganti Brain confirmReset, delete admin-only) + `chat-dispatch.mjs`
+(satu giliran: transkrip → konteks → sandbox → dispatch) + `chat-context.mjs`
+(blok konteks project/task) + `dispatchChat` tipis di gateway-ws. Chat kini
+bisa dipanggil end-to-end dari proxy; UI T5 menyusul.
+
+**Lima jangkar.**
+
+1. *Polling, bukan koneksi ditahan.* POST messages menulis operator (DONE) +
+   brain (PENDING) SEKARANG, bekerja di latar, jawab 200; UI memungut lewat
+   GET sesi — kolom `status`/`error` baru di chat_messages (migrasi T3).
+   Alasan sama dengan D74: latensi Brain puluhan detik vs koneksi HTTP.
+
+2. *Idempotency = id pesan brain; CONTINUE = ref tersimpan.* dispatchChat
+   tidak menyentuh sessionKeyFor/admission — kunci datang dari
+   chat_sessions.gateway_session_ref (peran persis executions.session_ref);
+   dispatch pertama menyabit kunci segar `chat:<sesi>:<jam>` dan menyimpan
+   balasan gateway; ganti Brain melepas ref → kunci baru = context kosong.
+   `agent` MENYELESAIKAN permintaan dengan terminalReply (terukur E1) — tidak
+   perlu agent.wait, dan ekstraksi teks menyisir blok terstruktur (pelajaran
+   D92: String() mentah atas array menghasilkan "[object Object]").
+
+3. *Konteks injeksi, transkrip bersih.* Blok T4 (status task + role/level +
+   3 event terakhir, ringkasan project) menempel pada PESAN yang dikirim
+   saja — transkrip menyimpan apa yang operator ketik, persis. Rujukan hantu
+   dilaporkan "not found", bukan ditebak. Maks 3 task per pesan: blok lebih
+   panjang dari pertanyaannya adalah jawaban yang menenggelamkan pertanyaan.
+
+4. *Gerbang eligibilitas hidup di server.* `isChatEligible` (intent.mjs)
+   diekspos `GET /api/work/chat/eligible` — UI bertanya, tidak menilai
+   sendiri; perintah prefix, verba task-scoped, sapaan murni, dan task id
+   telanjang tetap milik jalur lama (§3.1.1).
+
+5. *Gagal = baris FAILED, bukan 500.* Sandbox cap-full/no-resource/legacy,
+   gateway error, brain hilang — semuanya status FAILED + `error` yang bisa
+   dibaca operator; janji D80/D81 versi HTTP. Assert tes: nol baris
+   tasks/executions sepanjang percakapan.
+
+**Catatan.** Default brain sesi baru lewat `brainMap.resolve` role `chat`
+(grid > katalog fallback) — di harness tes fallback katalog menemukan
+kandidat, jadi cabang "tidak ada default sama sekali → 400" tetap ada sebagai
+pertahanan tanpa tes (jujur, bukan disembunyikan). Upload akar
+`chat/<sesi>/uploads` (TANPA tmp/ — §7.5) memakai `saveUploadTo`
+(generalisasi saveUpload; pagar D76/D77 sama), penyapu TTL ikut menyapu akar
+chat. Balapan penomoran keempat dan kelima (D92 kembar lalu D94 kembar)
+diselesaikan `ca26fad` + commit renumber D96; `acp-dispatch.test.mjs`
+(sesi paralel) masih merah saat commit ini — bukan milik POC-10.

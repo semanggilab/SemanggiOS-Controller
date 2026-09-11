@@ -11,6 +11,7 @@ import { createOperators } from "./domain/operators.mjs";
 import { createBrains, brainsFromRoutingConfig, Level } from "./domain/brains.mjs";
 import { createSandboxProvision } from "./domain/sandbox-provision.mjs";
 import { createChatSandbox } from "./domain/chat-sandbox.mjs";
+import { createChatDispatch } from "./domain/chat-dispatch.mjs";
 import { createQuotaRecovery } from "./domain/quota-recovery.mjs";
 import { createBrainMap, DEFAULT_BRAIN_MAP } from "./domain/brain-map.mjs";
 import { createThinkingLevels } from "./domain/thinking-levels.mjs";
@@ -173,6 +174,19 @@ export async function createController({
     now,
     log: log.child({ component: "chat-sandbox" }),
   });
+  // POC-10 T3: pengiriman pesan chat. brainFor diberi sebagai fungsi, bukan
+  // impor langsung: resolusi id → baris brains adalah keputusan aplikasi
+  // (termasuk kelak: brain mati → jawaban yang lebih baik dari crash), bukan
+  // keputusan modul pengiriman.
+  const chatDispatch = createChatDispatch({
+    repos,
+    events,
+    chatSandbox,
+    runtime,
+    brainFor: async (session) => brains.get(session.brain_id),
+    now,
+    log: log.child({ component: "chat-dispatch" }),
+  });
   const admission = createAdmission({ repos, events, policy, brains, runtime, sandboxProvision, config, now, log: log.child({ component: "admission" }) });
   // D84: probe pemulihan kuota — satu run minimal per model ter-exhaust per
   // pass, mengukur "bisa digunakan" alih-alih menebak jangkar waktunya.
@@ -203,5 +217,5 @@ export async function createController({
   // (D67) harus tahu baris mana yang akan di-seed ulang pada boot berikutnya —
   // menghapus baris yang masih ada di seed adalah penghapusan yang tidak
   // pernah terjadi.
-  return { store, sharedState, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, sandboxProvision, chatSandbox, quotaRecovery, config, now, log, runtime, seedResources: resources };
+  return { store, sharedState, events, repos, operators, brains, brainMap, thinkingLevels, gatewayModels, policy, admission, scheduler, gatewayHooks, sandboxProvision, chatSandbox, chatDispatch, quotaRecovery, config, now, log, runtime, seedResources: resources };
 }

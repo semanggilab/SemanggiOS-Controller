@@ -223,6 +223,18 @@ class SqliteStore {
     // Tiga tabel chat (sessions/messages/sandboxes) dibuat oleh SCHEMA di atas
     // (CREATE TABLE IF NOT EXISTS) — tabel baru tidak butuh ALTER; catatan ini
     // hanya penanda bahwa mereka memang bagian migrasi POC-10 yang sama.
+    // T3: kolom pengiriman pesan brain — tabel chat_messages dibuat di T1 tanpa
+    // ini, dan DB yang sudah memakai T1 butuh ALTER (pola migrasi sama dengan
+    // resource_retries di atas).
+    const chatMessageCols = cols("chat_messages");
+    if (chatMessageCols.length > 0) {
+      if (!chatMessageCols.includes("status")) {
+        this.#db.exec(`ALTER TABLE chat_messages ADD COLUMN status TEXT NOT NULL DEFAULT 'DONE'`);
+      }
+      if (!chatMessageCols.includes("error")) {
+        this.#db.exec(`ALTER TABLE chat_messages ADD COLUMN error TEXT`);
+      }
+    }
 
     // D54: penanda hapus-lunak. Nullable: baris lama tidak pernah dihapus,
     // jadi NULL berarti "hidup" tanpa perlu backfill.
@@ -469,6 +481,11 @@ class PostgresStore {
     await this.#sql.unsafe(
       "ALTER TABLE resources ADD COLUMN IF NOT EXISTS chat_concurrency_limit BIGINT NOT NULL DEFAULT 1",
     );
+    // T3: kolom pengiriman pesan brain (padanan ALTER sqlite di atas).
+    await this.#sql.unsafe(
+      "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'DONE'",
+    );
+    await this.#sql.unsafe("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS error TEXT");
     await this.#sql.unsafe(`
       CREATE OR REPLACE FUNCTION semanggi_reject_event_mutation() RETURNS trigger AS $$
       BEGIN RAISE EXCEPTION 'event_log is append-only'; END; $$ LANGUAGE plpgsql;

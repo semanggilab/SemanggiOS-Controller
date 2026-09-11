@@ -26,7 +26,7 @@ import { DEFAULT_BRAIN_MAP } from "../domain/brain-map.mjs";
 import { quotaDriverCatalog, quotaDriverIdFor } from "../domain/quota-drivers/index.mjs";
 import { buildPlan, LEVEL_TO_QUALITY, ROLE_CATEGORY } from "../domain/decompose.mjs";
 import { EventKind } from "../domain/events.mjs";
-import { classify, Intent, Action } from "../interface/intent.mjs";
+import { classify, Intent, Action, isChatEligible } from "../interface/intent.mjs";
 import { markRegistered, parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
 import { probeWorkspaceFor, busyAgentsByRef as sharedBusyAgentsByRef } from "../domain/sandbox-provision.mjs";
 import { isPreambleWrapped } from "../runtime/instruction.mjs";
@@ -44,6 +44,8 @@ import {
   readWorkspaceFile,
   resolveWorkspaceFile,
   saveUpload,
+  saveUploadTo,
+  uploadDirForChat,
   UPLOAD_DIR,
   UPLOAD_MAX_BYTES,
 } from "../domain/workspace-files.mjs";
@@ -653,6 +655,222 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     });
     log.info("project.upload-deleted", { project: id, path: removed.path, by });
     return removed;
+  });
+
+  // --- POC-10 chat (T3, spec §8) -------------------------------------------
+  //
+  // Percakapan TIDAK membuat task: seluruh route di bawah tidak pernah
+  // menyentuh repos.tasks/repos.executions. Audit tetap kelas task —
+  // chat.session-created / chat.message-sent ditulis oleh repo, bukan di sini.
+
+  const presentChatSession = (s) => ({
+    id: s.id,
+    projectId: s.project_id,
+    brainId: s.brain_id,
+    title: s.title ?? null,
+    gatewaySessionRef: s.gateway_session_ref ?? null,
+    status: s.status,
+    actor: s.actor,
+    createdAt: s.created_at,
+    lastActiveAt: s.last_active_at,
+  });
+
+  const presentChatMessage = (m) => ({
+    id: m.id,
+    sessionId: m.session_id,
+    seq: m.seq,
+    role: m.role,
+    content: m.content,
+    attachments: m.attachments ?? null,
+    status: m.status ?? "DONE",
+    error: m.error ?? null,
+    createdAt: m.created_at,
+  });
+
+  const getChatSessionOr404 = async (id) => {
+    const session = await repos.chatSessions.get(id);
+    if (!session) throw notFound(`unknown chat session ${id}`);
+    return session;
+  };
+
+  /**
+   * Otak default sesi baru: resolusi role `chat` — bukan sel brain_map
+   * dibaca mentah, melainkan jalur resolve() yang sama dengan dispatch task
+   * (override operator > default grid > katalog), supaya "chat" granular
+   * persis seperti role lain (§10.1).
+   */
+  const resolveDefaultChatBrain = async (project) => {
+    const template = String(project.template ?? "software").toLowerCase();
+    const profile = String(project.profile ?? "balanced").toLowerCase();
+    const globalRows = await controller.store.all(
+      `SELECT role, level FROM role_levels WHERE template = ? AND profile = ?`,
+      [template, profile],
+    );
+    const overrides = Object.fromEntries(globalRows.map((r) => [r.role, r.level]));
+    const projectRows = await repos.projects.roleLevels.list(project.id);
+    const projectOverrides = Object.fromEntries(projectRows.map((r) => [r.role, r.level]));
+    const level = resolveLevel({ template, role: "chat", profile, overrides, projectOverrides });
+    const pick = await controller.brainMap.resolve({ template, role: "chat", level, brains: controller.brains });
+    return pick.candidates[0]?.brain ?? null;
+  };
+
+  route("POST", "/api/work/chat/sessions", async (_p, body, _q, actor) => {
+    const projectId = String(body?.projectId ?? "").trim();
+    if (!projectId) throw badRequest("projectId is required");
+    const project = await repos.projects.get(projectId);
+    if (!project) throw notFound(`unknown project ${projectId}`);
+
+    let brain;
+    const explicitBrainId = String(body?.brainId ?? "").trim();
+    if (explicitBrainId) {
+      brain = await controller.brains.get(explicitBrainId);
+      if (!brain) throw notFound(`unknown brain ${explicitBrainId}`);
+    } else {
+      brain = await resolveDefaultChatBrain(project);
+      if (!brain) {
+        throw badRequest("no default Brain for role chat — set one in Role Brain Map or pass brainId");
+      }
+    }
+
+    const session = await repos.chatSessions.create({
+      projectId: project.id,
+      brainId: brain.id,
+      title: body?.title != null ? String(body.title).slice(0, 200) : null,
+      actor: actor?.kind === "operator" ? actor.name : String(body?.user ?? "agentos-ui"),
+    });
+    log.info("chat.session-created", { session: session.id, project: project.id, brain: brain.name });
+    return { session: presentChatSession(session), brainDefault: !explicitBrainId };
+  });
+
+  route("GET", "/api/work/chat/sessions", async (_p, _b, query) => {
+    const projectId = String(query.get("projectId") ?? "").trim();
+    if (!projectId) throw badRequest("projectId query param is required");
+    const project = await repos.projects.get(projectId);
+    if (!project) throw notFound(`unknown project ${projectId}`);
+    const sessions = await repos.chatSessions.listByProject(projectId);
+    return { sessions: sessions.map(presentChatSession) };
+  });
+
+  route("GET", "/api/work/chat/sessions/{id}", async ({ id }) => {
+    const session = await getChatSessionOr404(id);
+    const messages = await repos.chatMessages.list(session.id);
+    return { session: presentChatSession(session), messages: messages.map(presentChatMessage) };
+  });
+
+  route("PATCH", "/api/work/chat/sessions/{id}", async ({ id }, body) => {
+    const session = await getChatSessionOr404(id);
+    const title = body?.title !== undefined ? String(body.title).slice(0, 200) : undefined;
+    const status = body?.status !== undefined ? String(body.status).toUpperCase() : undefined;
+    const patched = await repos.chatSessions.patch(id, { title, status });
+    log.info("chat.session-patched", { session: id, archived: patched.status === "ARCHIVED" });
+    return { session: presentChatSession(patched) };
+  });
+
+  // Gerbang routing composer T5 (§12.6.4): UI TIDAK menilai sendiri teks apa
+  // yang boleh masuk chat — ia bertanya ke sini, sehingga aturan hidup di satu
+  // tempat (intent.mjs) dengan tes, dan perubahan aturan tidak menuntut
+  // deploy ulang UI.
+  route("GET", "/api/work/chat/eligible", async (_p, _b, query) => {
+    return { eligible: isChatEligible(String(query.get("text") ?? "")) };
+  });
+
+  route("POST", "/api/work/chat/sessions/{id}/messages", async ({ id }, body, _q, actor) => {
+    const session = await getChatSessionOr404(id);
+    if (session.status !== "ACTIVE") throw conflict("session is archived — unarchive it before sending messages");
+    const text = String(body?.text ?? "").trim();
+    if (!text) throw badRequest("text is required");
+
+    // §7.3 ditegakkan struktural: client mengirim projectId aktifnya dan
+    // harus cocok dengan milik sesi — operator tidak boleh diam-diam bertanya
+    // tentang project B dengan sandbox yang mount workspace project A.
+    const activeProjectId = String(body?.projectId ?? session.project_id);
+    if (activeProjectId !== session.project_id) {
+      throw badRequest(`session belongs to project ${session.project_id}, but ${activeProjectId} is active`);
+    }
+
+    const uploadRoot = uploadDirForChat(session.id);
+    const attachments = Array.isArray(body?.attachments)
+      ? body.attachments.map((p) => String(p))
+      : null;
+    if (attachments) {
+      for (const ref of attachments) {
+        if (!ref.startsWith(`${uploadRoot}/`) || ref.includes("..")) {
+          throw badRequest(`attachment must live under ${uploadRoot}/ — got "${ref}"`);
+        }
+      }
+    }
+
+    const { operatorMessage, brainMessage } = await controller.chatDispatch.sendMessage({
+      session,
+      text,
+      attachments,
+      actor: actor?.kind === "operator" ? actor.name : String(body?.user ?? "agentos-ui"),
+    });
+    return { operatorMessage: presentChatMessage(operatorMessage), message: presentChatMessage(brainMessage) };
+  });
+
+  route("POST", "/api/work/chat/sessions/{id}/uploads", async ({ id }, body, query, actor) => {
+    const session = await getChatSessionOr404(id);
+    if (session.status !== "ACTIVE") throw conflict("session is archived — unarchive it before uploading");
+    const project = await repos.projects.get(session.project_id);
+    if (!project) throw notFound(`unknown project ${session.project_id}`);
+    const bytes = body?.__raw;
+    const name = String(query.get("name") ?? "");
+    if (!Buffer.isBuffer(bytes) || bytes.length === 0) throw badRequest("berkas kosong");
+    if (bytes.length > UPLOAD_MAX_BYTES) {
+      throw badRequest(`berkas melebihi batas ${UPLOAD_MAX_BYTES / 1024 / 1024}MB`);
+    }
+    // Akar chat/<session>/uploads (§7.5) — pagar D76/D77 berlaku sama lewat
+    // saveUploadTo; berbeda dari staging, berkas TIDAK diadopsi task mana pun.
+    const saved = await saveUploadTo(project.workspace_path, uploadDirForChat(session.id), name, bytes);
+    if (!saved.ok) throw badRequest(saved.reason);
+    const by = actor?.kind === "operator" ? actor.name : String(query.get("user") ?? "agentos-ui");
+    await controller.events.append({
+      kind: "chat.upload-created",
+      subjectType: "chat_session",
+      subjectId: session.id,
+      actor: by,
+      payload: { path: saved.path, size: saved.size },
+    });
+    log.info("chat.upload-created", { session: session.id, path: saved.path, size: saved.size, by });
+    return saved;
+  });
+
+  // Ganti Brain sesi aktif (§10.2): pertahanan di API, bukan cuma dialog UI —
+  // reset context TIDAK PERNAH terjadi tanpa confirmReset eksplisit.
+  route("POST", "/api/work/chat/sessions/{id}/brain", async ({ id }, body, _q, actor) => {
+    const session = await getChatSessionOr404(id);
+    const brainId = String(body?.brainId ?? "").trim();
+    if (!brainId) throw badRequest("brainId is required");
+    const brain = await controller.brains.get(brainId);
+    if (!brain) throw notFound(`unknown brain ${brainId}`);
+    if (brain.id === session.brain_id) return { session: presentChatSession(session), changed: false };
+    if (body?.confirmReset !== true) {
+      throw conflict(
+        `switching to ${brain.name} resets the model's conversation context (transcript stays); resend with confirmReset:true`,
+      );
+    }
+    const switched = await repos.chatSessions.switchBrain(id, {
+      brainId: brain.id,
+      actor: actor?.kind === "operator" ? actor.name : String(body?.user ?? "agentos-ui"),
+    });
+    log.info("chat.brain-switched", { session: id, from: session.brain_id, to: brain.id });
+    return { session: presentChatSession(switched), changed: true };
+  });
+
+  route("DELETE", "/api/work/chat/sessions/{id}", async ({ id }, _b, _q, actor) => {
+    if (actor?.role !== "admin") throw forbidden("only an admin may delete a chat session");
+    const session = await getChatSessionOr404(id);
+    await repos.chatSessions.remove(id);
+    await controller.events.append({
+      kind: "chat.session-deleted",
+      subjectType: "chat_session",
+      subjectId: id,
+      actor: actor?.name ?? "admin",
+      payload: { projectId: session.project_id, brainId: session.brain_id },
+    });
+    log.info("chat.session-deleted", { session: id, by: actor?.name ?? "admin" });
+    return { deleted: true, sessionId: id };
   });
 
   // Project-level Role Level overrides (Settings → Project → Edit modal).

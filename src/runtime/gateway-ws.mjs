@@ -67,6 +67,29 @@ export function parseGatewayQuota(errorLike) {
 }
 
 /**
+ * Teks balasan asisten dari payload `agent` (POC-10 T3). Terukur E1:
+ * terminalReply.text string polos; terukur D92: konten juga datang sebagai
+ * array blok terstruktur — String() mentah atas array menghasilkan teks
+ * "[object Object]", jadi ekstraksi menyisir blok bertipe teks. Null kalau
+ * tidak ada blok teks sama sekali: "model menjawab kosong" adalah fakta yang
+ * pemanggil boleh laporkan, bukan error yang disembunyikan.
+ */
+function replyText(reply) {
+  if (!reply) return null;
+  if (typeof reply === "string") return reply;
+  if (typeof reply.text === "string") return reply.text;
+  const content = reply.content ?? reply.message ?? null;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts = content
+      .map((block) => (typeof block === "string" ? block : typeof block?.text === "string" ? block.text : null))
+      .filter((s) => typeof s === "string" && s.length > 0);
+    return parts.length > 0 ? parts.join("\n") : null;
+  }
+  return null;
+}
+
+/**
  * Derives the conversation key for a dispatch.
  *
  * CONTINUE inherits `session_ref` and therefore reuses the key derived from it;
@@ -995,6 +1018,42 @@ export function createGatewayRuntime(config = {}, { WebSocketImpl = globalThis.W
         }
         throw err;
       }
+    },
+
+    /**
+     * POC-10 T3: jalur dispatch chat — tipis dan TIDAK menyentuh
+     * tasks/executions (requirement eksplisit "percakapan tidak membuat
+     * task"). Saudara kembar dispatch() di atas, tapi tanpa admission,
+     * sessionKeyFor, atau preamble task: kunci sesi datang dari pemanggil
+     * (chat_sessions.gateway_session_ref), idempotency dari id pesan brain.
+     *
+     * `agent` menyelesaikan permintaan DENGAN balasan (terukur E1/D92:
+     * terminalReply.text) — tidak perlu agent.wait; koreksi end-frame prematur
+     * D82 adalah urusan gateway pada jalur ini karena kita membaca payload
+     * final, bukan stream.
+     *
+     * Konten balasan bisa blok terstruktur (pelajaran D92: jangan String()
+     * mentah) — ekstrak teks, kosong kalau tidak ada blok teks sama sekali.
+     */
+    async dispatchChat({ agentId, message, sessionKey, idempotencyKey, label }) {
+      const payload = await request(runMethod, {
+        message,
+        idempotencyKey,
+        agentId: String(agentId ?? "").toLowerCase(),
+        sessionKey,
+        label: label ?? "chat",
+        deliver: false,
+      });
+      const reply = replyText(payload?.terminalReply ?? payload?.reply ?? null);
+      return {
+        runtimeRef: payload?.runId ?? payload?.id ?? null,
+        // Kunci yang gateway akui — disimpan pemanggil sebagai ref CONTINUE.
+        // Fallback ke kunci yang kita kirim: gateway lama memangkas field ini
+        // dan kunci pengirim tetap benar untuk menyambung.
+        sessionRef: payload?.sessionKey ?? sessionKey ?? null,
+        reply,
+        raw: payload,
+      };
     },
 
     /**

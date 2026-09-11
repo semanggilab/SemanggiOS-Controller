@@ -543,6 +543,13 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   role        TEXT NOT NULL CHECK (role IN ('operator','brain','system')),
   content     TEXT NOT NULL,
   attachments TEXT,
+  -- Hanya bermakna untuk role='brain': pesan operator SELALU 'DONE' saat
+  -- ditulis. PENDING/RUNNING adalah baris yang dilepas lebih dulu supaya UI
+  -- bisa polling (rekomendasi §8 POC-10) alih-alih menahan koneksi HTTP
+  -- puluhan detik — masalah yang sama dengan alasan D74 memberi /doc seksi
+  -- live. FAILED membawa alasan di `error`.
+  status      TEXT NOT NULL DEFAULT 'DONE' CHECK (status IN ('PENDING','RUNNING','DONE','FAILED')),
+  error       TEXT,
   created_at  INTEGER NOT NULL,
   UNIQUE (session_id, seq)
 );

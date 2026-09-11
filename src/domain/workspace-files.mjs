@@ -185,6 +185,10 @@ export const uploadStagingDir = () => UPLOAD_DIR;
 /** Direktori lampiran milik satu task (D77). */
 export const uploadDirForTask = (taskId) => `deliverables/${taskId}/${UPLOAD_DIR}`;
 
+/** Direktori lampiran milik satu sesi chat (POC-10 §7.5) — akar ketiga,
+ * sejajar staging dan per-task; TIDAK diadopsi ke task mana pun. */
+export const uploadDirForChat = (sessionId) => `chat/${sessionId}/uploads`;
+
 /**
  * Ekstensi unggahan yang diterima — TEKS SAJA (D77). Lampiran adalah bahan
  * yang dibaca agen dan ditampilkan operator di viewer; berkas biner tidak
@@ -256,6 +260,16 @@ function sanitizeUploadName(requestedName) {
  * @returns {{ok: true, path: string, size: number} | {ok: false, reason: string}}
  */
 export async function saveUpload(workspacePath, requestedName, bytes) {
+  return saveUploadTo(workspacePath, UPLOAD_DIR, requestedName, bytes);
+}
+
+/**
+ * Inti saveUpload dengan akar relatif bebas-dalam-workspace (POC-10 T3: akar
+ * `chat/<session>/uploads`). Semua pagar D76/D77 berlaku sama — nama, ekstensi
+ * teks, NUL-sniff, batas byte; yang berubah hanya direktori tujuan. Kontainmen
+ * leksikal resolve() tetap menjaga path keluar-workspace.
+ */
+export async function saveUploadTo(workspacePath, relativeDir, requestedName, bytes) {
   const name = sanitizeUploadName(requestedName);
   if (!name) return { ok: false, reason: "nama berkas kosong atau tidak sah" };
   if (!Buffer.isBuffer(bytes) || bytes.length === 0) return { ok: false, reason: "berkas kosong" };
@@ -268,11 +282,11 @@ export async function saveUpload(workspacePath, requestedName, bytes) {
   if (bytes.subarray(0, 8192).includes(0)) {
     return { ok: false, reason: `${name} terdeteksi biner — lampiran hanya berkas teks` };
   }
-  const dir = resolve(workspacePath, UPLOAD_DIR);
+  const dir = resolve(workspacePath, relativeDir);
   await mkdir(dir, { recursive: true });
   const target = resolve(dir, name);
   await writeFile(target, bytes);
-  return { ok: true, path: `${UPLOAD_DIR}/${name}`, size: bytes.length };
+  return { ok: true, path: `${relativeDir}/${name}`, size: bytes.length };
 }
 
 /**
@@ -398,6 +412,19 @@ export async function cleanUploads(workspacePath, ttlMs, now = () => Date.now())
   }
   for (const taskDir of taskDirs) {
     await sweepDir(resolve(base, "deliverables", taskDir, UPLOAD_DIR), (entry) => `deliverables/${taskDir}/${UPLOAD_DIR}/${entry}`);
+  }
+  // POC-10 §7.5: akar chat/<session>/uploads ikut tersapu dengan TTL yang
+  // sama — lampiran chat tidak diadopsi task mana pun, jadi jam adalah
+  // satu-satunya pembersihnya. Pola satu tingkat di bawah chat/, bukan walk
+  // bebas, dengan alasan yang sama dengan deliverables di atas.
+  let chatDirs;
+  try {
+    chatDirs = await readdir(resolve(base, "chat"));
+  } catch {
+    chatDirs = [];
+  }
+  for (const chatDir of chatDirs) {
+    await sweepDir(resolve(base, "chat", chatDir, "uploads"), (entry) => `chat/${chatDir}/uploads/${entry}`);
   }
   return removed;
 }

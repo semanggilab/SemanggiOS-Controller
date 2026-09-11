@@ -119,6 +119,31 @@ export function parseModelSpec(text) {
 
 const CHATTY = /^(hi|halo|hello|thanks|terima kasih|makasih|good morning|pagi|siang)\b/i;
 
+/**
+ * POC-10 §3.1.1/§12.6: apakah teks ini layak dikirim ke endpoint chat saat
+ * client punya sesi chat aktif? "Terpercaya" berarti UI tidak menilai sendiri
+ * — aturannya hidup di satu tempat ini, dengan tes.
+ *
+ * Bukan klasifikasi baru, melainkan gerbang TUNGGAL atas hal-hal yang tetap
+ * milik jalur lama:
+ *   - perintah eksplisit (`/work`, `TASK:`, …) — INTENT_PREFIX;
+ *   - verba task-scoped di awal ("status …", "cancel …") — VERBS;
+ *   - sapaan basa-basi murni (CHATTY tanpa taskId) — sapaan adalah jawaban
+ *     konfirmasi kecil jalur lama, bukan pertanyaan untuk sebuah Brain;
+ *   - task id telanjang — pertanyaan status yang jalur lama konfirmasikan.
+ * Sisanya (prosa bebas) → chat, SELAMA sesi aktif — penentu "sesi aktif"
+ * adalah keadaan client, bukan teks.
+ */
+export function isChatEligible(raw) {
+  const text = normalizeTaskIds(String(raw ?? "").trim());
+  if (!text) return false;
+  if (INTENT_PREFIX.test(text)) return false;
+  if (VERBS.some((v) => v.re.test(text))) return false;
+  if (CHATTY.test(text) && !TASK_ID.test(text)) return false;
+  if (TASK_ID.test(text) && text.replace(TASK_ID_ALL, "").trim() === "") return false;
+  return true;
+}
+
 // Explicit intent prefixes — spec §8.2 documents them and the Command
 // Center's template buttons insert them. An operator who DECLARED the intent
 // is not guessing, so a declared intent must never be downgraded to CONFIRM.

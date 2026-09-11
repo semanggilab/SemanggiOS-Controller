@@ -3156,3 +3156,40 @@ membungkuk); keeper `reconcileAll` terbukti (tes) tidak memangkas `sem-chat-*`.
 **Catatan penyebaran.** `brain-map.mjs` hanya menambah baris `chat` di atas
 HEAD; pin operator `qwen-high` (D68) dipertahankan — scp sesi ini sempat
 menimpanya dengan salinan tua `codex-*`, tertangkap sebelum commit.
+
+## D94 — Image AgentOS membawa CLI OpenClaw dari FORK, dan versinya dipaku, bukan diwariskan
+
+**Yang ditemukan operator.** Baseline produksi adalah AgentOS v0.7.7 dengan
+OpenClaw 2026.8.2 di atas Postgres + Redis. Image yang saya bangun membawa CLI
+**2026.6.11** — mundur dua rilis — meski `--build-arg OPENCLAW_CLI_IMAGE` sudah
+dikirim.
+
+**Sebabnya satu baris.** Di `Dockerfile.before-poc5-...`, versinya ditulis
+langsung pada `COPY --from=ghcr.io/openclaw/openclaw:2026.6.11`. `COPY --from=`
+tidak pernah membaca ARG; ia menyalin string yang tertulis. ARG di kepala berkas
+ada, terdokumentasi, dan tidak menentukan apa pun — build-arg operator diabaikan
+tanpa satu peringatan pun. `Dockerfile.semanggi` memakai stage bernama
+(`FROM ${OPENCLAW_CLI_IMAGE} AS openclaw-cli`), sehingga ARG benar-benar
+berlaku.
+
+**Dan CLI-nya harus dari fork.** Gateway menjalankan `/root/openclaw-fork`
+(branch `semanggi`), yang menambahkan `acp.spawn` — satu-satunya jalur menuju
+harness Claude dari RPC. AgentOS yang membawa CLI hulu akan tampak sehat sambil
+kehilangan jalur itu saat dipakai. Default ARG kini menunjuk image gateway yang
+sedang berjalan, tempat hasil build fork tinggal.
+
+**Terpasang dan terverifikasi di container yang jalan:**
+
+```
+CLI          2026.8.2, commit fork 2beed1a293c5
+acp.spawn    40 berkas di /app/dist
+UI Semanggi  ada
+coercion D92 ada di bundel klien
+health       200
+```
+
+**Ongkos yang tercatat.** Percobaan deploy sebelumnya gagal dengan
+`No space left on device` — disk node 100%, sebagian besar image percobaan saya
+sendiri. Dibersihkan ke 86%. Sebuah build yang menumpuk image tanpa dibersihkan
+akhirnya menjatuhkan deploy yang tidak ada hubungannya dengan build itu.
+

@@ -85,7 +85,21 @@ export function createChatDispatch({ repos, events, chatSandbox, runtime, brainF
       }
 
       await mark("RUNNING");
-      const fresh = session.gateway_session_ref ?? freshSessionKey(session.id, now());
+
+      // Kunci sesi gateway milik SATU agen selamanya — formatnya memuat nama
+      // agennya (agent:<agentId>:…). Pasca-kill, reprovisi memakai variasi
+      // nama (D81), dan dispatch lanjutan dengan ref lama ditolak gateway:
+      // "does not match session key agent" (terukur CHS-E6A3263B setelah
+      // kill operator). Agen baru tidak membawa memori agennya yang mati,
+      // jadi kunci baru bukan pilihan melainkan kenyataan — context reset
+      // adalah efek jujur dari sandbox yang diganti.
+      const refAgent = String(session.gateway_session_ref ?? "").startsWith("agent:")
+        ? String(session.gateway_session_ref).split(":")[1]
+        : null;
+      const staleRef = Boolean(refAgent && refAgent !== resolved.agentId);
+      const fresh = staleRef || !session.gateway_session_ref
+        ? freshSessionKey(session.id, now())
+        : session.gateway_session_ref;
       const result = await runtime.dispatchChat({
         agentId: resolved.agentId,
         message,
@@ -95,8 +109,10 @@ export function createChatDispatch({ repos, events, chatSandbox, runtime, brainF
       });
 
       // Kunci pertama diingat SEKALI; ganti Brain melepasnya (switchBrain),
-      // dan dispatch berikutnya menyabit kunci baru = context kosong.
-      if (!session.gateway_session_ref && result.sessionRef) {
+      // dan dispatch berikutnya menyabit kunci baru = context kosong. Ref
+      // basi pasca-kill ikut diganti di sini — poller penyelesaian membaca
+      // transkrip dari ref inilah.
+      if ((!session.gateway_session_ref || staleRef) && result.sessionRef) {
         await repos.chatSessions.setGatewayRef(session.id, result.sessionRef);
       } else {
         await repos.chatSessions.touch(session.id);

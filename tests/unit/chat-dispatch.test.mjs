@@ -95,6 +95,34 @@ test("first dispatch stores the gateway ref once; the second CONTINUEs it", asyn
   assert.equal(t.dispatched[1].sessionKey, "gw-sess-1");
 });
 
+test("pasca-kill: agen dengan nama variasi TIDAK meneruskan ref agen mati — kunci baru, ref diganti", async () => {
+  // Terukur di CHS-E6A3263B: gateway menolak dispatch lanjutan dengan
+  // "agent … does not match session key agent …" karena kunci sesi menyandang
+  // nama agen lama. Reprovisi bermacam nama harus menyabit kunci segar.
+  const t = await setup({ sandbox: { ok: true, reused: false, agentId: "sem-chat-a-r1c2", name: "sem-chat-a-r1c2" } });
+  // Giliran pertama dari agen asli menanam ref berprefix agent:<agentId lama>.
+  t.runtime.sessionRef = "agent:sem-chat-a:chat:S1:1";
+  const first = await t.chatDispatch.sendMessage({ session: t.session, text: "one" });
+  await flush(t.h, first.brainMessage.id);
+  assert.equal((await t.h.repos.chatSessions.get(t.session.id)).gateway_session_ref, "agent:sem-chat-a:chat:S1:1");
+
+  // Kill + reprovisi: resolveChatSandbox kini menunjuk agen variasi, dan
+  // gateway pasti membalas sessionRef atas nama agen barunya.
+  t.runtime.sessionRef = "agent:sem-chat-a-r1c2:chat:S1:2";
+  const second = await t.chatDispatch.sendMessage({
+    session: await t.h.repos.chatSessions.get(t.session.id),
+    text: "two",
+  });
+  await flush(t.h, second.brainMessage.id);
+  assert.notEqual(t.dispatched[1].sessionKey, "agent:sem-chat-a:chat:S1:1", "ref agen mati tidak diteruskan");
+  assert.ok(String(t.dispatched[1].sessionKey).startsWith("chat:"), "kunci segar buatan controller");
+  assert.equal(
+    (await t.h.repos.chatSessions.get(t.session.id)).gateway_session_ref,
+    "agent:sem-chat-a-r1c2:chat:S1:2",
+    "ref diganti ke agen yang hidup sekarang — poller membaca dari sini",
+  );
+});
+
 test("T4 context rides the dispatch message but never the transcript", async () => {
   const t = await setup();
   const task = await t.h.repos.tasks.create({

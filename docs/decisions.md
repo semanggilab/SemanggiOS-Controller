@@ -2,7 +2,7 @@
 
 Each entry records a choice the spec left open, or a place where implementation forced a decision. POC-4 §9 requires the storage choice to be recorded in the implementation PR; the rest are here for the same reason.
 
-**Cakupan:** D1–D35 adalah POC-4 (controller, scheduler, routing, Slack, Brain). D36–D41 adalah fase UI — halaman Semanggi di dalam AgentOS, setelan project, probe level empiris, transkrip yang lengkap, dan jalur build image. D42–D45 adalah era Brain sebagai sumber routing. D46–D48 adalah era loop cepat NFS dan kejujuran kontrak gateway: iterasi tanpa build image, penolakan lambat yang dipetakan ke eksekusi, uji koneksi yang jujur, dan transkrip yang menangkap output tool.
+**Cakupan:** D1–D35 adalah POC-4 (controller, scheduler, routing, Slack, Brain). D36–D41 adalah fase UI — halaman Semanggi di dalam AgentOS, setelan project, probe level empiris, transkrip yang lengkap, dan jalur build image. D42–D45 adalah era Brain sebagai sumber routing. D46–D48 adalah era loop cepat NFS dan kejujuran kontrak gateway: iterasi server tanpa build image, penolakan lambat yang dipetakan ke eksekusi, uji koneksi yang jujur, dan transkrip yang menangkap output tool. **D99 menetapkan tiga jalur development/deployment dan membatasi D46 menjadi jalur cepat khusus server: local Docker Compose adalah default, server-fast hanya atas permintaan deploy server, dan image path untuk build/rebuild/deploy image atau perubahan runtime yang tidak bisa dibawa source sync.**
 
 **Cara membaca:** judul yang ~~dicoret~~ adalah keputusan yang **sudah tidak berlaku** — isinya sengaja dipertahankan karena alasan sebuah keputusan gugur seringkali lebih berguna daripada keputusan penggantinya. Judul tanpa coretan berlaku sampai ada entri yang membatalkannya secara eksplisit.
 
@@ -12,6 +12,7 @@ Each entry records a choice the spec left open, or a place where implementation 
 | ~~D8~~ (kontrak dispatch AgentOS sengaja tidak diimplementasikan) | D12, D13 | Jalur itu tidak lagi ditunggu — dispatch tidak pernah lewat AgentOS |
 | ~~D17~~ sebagian ("Gemini tidak melapor usage") | D19 | Gemini melapor; permintaannya yang tidak pernah mengirim `stream_options.include_usage` |
 | ~~D30~~ sebagian (dua janji upgrade 7.1) | D34 | `workspaceDir` dan `agentRuntime.acp.agent` terbukti tidak ada di 7.1 |
+| D46 sebagian ("iterasi default lewat NFS") | D99 | Mekanisme NFS tetap sah sebagai **server-fast path**, tetapi default development global pindah ke local Docker Compose |
 
 ## D1 — SQLite now, Postgres-portable by construction
 
@@ -1368,7 +1369,7 @@ sel sebelah; `belowLevel` terlihat; Brain mati ditolak saat disetel; sel
 kosong jatuh ke default lalu kandidat), plus lapisan default di
 `tests/unit/project-role-levels.test.mjs`.
 
-## D46 — Iterasi default lewat sumber di NFS; rebuild image hanya perintah eksplisit
+## D46 — Jalur cepat server lewat sumber di NFS; rebuild image hanya perintah eksplisit *(klaim default global dibatasi D99)*
 
 Loop lama membayar harga penuh Docker untuk setiap perubahan: build image di
 `Kubus01-01`, `docker save` ke tar, `scp` ke tiap node, `docker load`, lalu
@@ -1376,12 +1377,19 @@ Loop lama membayar harga penuh Docker untuk setiap perubahan: build image di
 harga itu tidak membeli apa-apa — tidak ada isolasi yang didapat dari image
 yang tidak sudah diberikan oleh NFS yang memang dipakai untuk state.
 
-Keputusan: service menjalankan kode dari dua direktori sumber di NFS —
-`agentos-src/` (standalone build AgentOS) dan `controller-src/` (sumber
-controller apa adanya) — dan iterasi menjadi **sunting → tes → sync →
-restart**. Rebuild image hanya terjadi atas perintah eksplisit, atau bila
-perubahan menyentuh entrypoint, Dockerfile, base image, atau dependensi
+Keputusan **untuk deployment server**: service menjalankan kode dari dua
+direktori sumber di NFS — `agentos-src/` (standalone build AgentOS) dan
+`controller-src/` (sumber controller apa adanya) — sehingga jalur cepat server
+menjadi **revisi tervalidasi → tes server yang relevan → commit → sync →
+restart → verify**. Rebuild image hanya terjadi atas perintah eksplisit, atau
+bila perubahan menyentuh entrypoint, Dockerfile, base image, atau dependensi
 sistem; hasilnya di-push ke registry.
+
+**Batas cakupan (D99).** Keputusan ini tidak lagi berarti NFS adalah default
+development global. D46 hanya aktif ketika operator meminta **deploy ke
+server / jalur server / server-fast**. Bila target tidak disebut, development
+berjalan local dengan Docker Compose. Revisi yang akan dipromosikan melalui
+D46 seharusnya sudah melewati build, test, deploy, dan verify local.
 
 Konsekuensi yang dicatat sengaja:
 
@@ -1425,7 +1433,7 @@ kontrak volume baru dijaga `tests/stack-schema.sh`.
 skrip sync, dan kedua service terbukti menjalankan kode dari NFS — controller
 sejak deploy stack, AgentOS sejak image baru. Uji asap terautentikasi lulus
 (`/control` dan `/summary` 200, bundle memuat teks UI terbaru). Mulai sini
-iterasi UI/controller tidak lagi menyentuh image.
+deploy **server-fast** untuk perubahan UI/controller tidak lagi menyentuh image. D99 kemudian memindahkan default development harian ke local Docker Compose; kalimat ini hanya menjelaskan sifat jalur server setelah migrasi D46.
 
 **Jebakan yang ditemukan saat migrasi: `.env` stack adalah sumber tag, dan ia
 basi.** `docker stack deploy` mengambil tag dari `SEMANGGI_*_IMAGE` di
@@ -3294,3 +3302,154 @@ sejarah; dua lampiran dirujuk satu balasan. Dua baris FAILED + satu DONE
 kosong di CHS-E6A3263B dibiarkan sebagai sejarah jujur bug-bug di atas.
 Insiden proses: salinan tar macOS membawa xattr macl yang menjadikan berkas
 mode 600 → EACCES di container; chmod 644 setelah salin kini langkah wajib.
+
+## D99 — Local Docker Compose menjadi default; D46 hanya server-fast, jalur image tetap eksplisit
+
+**Masalah yang diselesaikan.** D46 memangkas biaya loop deployment server dengan
+menghilangkan rebuild image dari setiap perubahan source. Tetapi menjadikannya
+"default" untuk seluruh development tetap membuat feedback loop harian bergantung
+pada SSH, working tree server, NFS production, restart Swarm, dan keadaan cluster.
+Itu adalah efek samping operasional yang tidak diperlukan untuk develop, build,
+test, dan verify perubahan sebelum dipromosikan.
+
+**Keputusan.** Workflow sekarang mempunyai **tiga jalur yang berbeda berdasarkan
+target**, dan target yang tidak disebut tidak pernah diasumsikan sebagai server:
+
+| Jalur | Trigger | Alur mengikat |
+|---|---|---|
+| **Local — DEFAULT** | Operator tidak menyebut server atau image | develop → build → test → deploy → verify **seluruhnya local dengan Docker Compose** |
+| **Server-fast — D46 / §5.1** | `deploy ke server`, `deploy server`, `jalur server`, `server-fast` | promosikan revisi tervalidasi → tes server relevan → commit → sync NFS → restart service → verify |
+| **Image — §5.2** | `build image`, `rebuild image`, `deploy image`, `jalur image`, atau perubahan runtime tidak bisa dibawa source sync | build Dockerfile yang benar → push registry → update service ke image/tag/digest baru → verify |
+
+### Resolusi intent yang mengikat
+
+1. **Tidak ada target disebut ⇒ local.** Tidak boleh SSH ke cluster, sync NFS,
+   restart Swarm, atau push registry hanya karena sesi sebelumnya bekerja di
+   server.
+2. **Permintaan deploy server ⇒ D46.** Jalur cepat NFS tetap keputusan yang sah
+   dan tetap menjadi cara normal mempromosikan perubahan source ke server.
+   Perbedaannya: ia bukan lagi loop development default.
+3. **Permintaan build/rebuild/deploy image ⇒ jalur image.** D41/D94/D96 tetap
+   mengikat: gunakan Dockerfile yang benar, verifikasi entrypoint/isi image yang
+   relevan, dan jangan menganggap build sukses sebagai bukti runtime benar.
+4. **Entrypoint, Dockerfile, base image, atau dependensi sistem tidak boleh
+   dipromosikan dengan source sync.** Development dan test tetap boleh dilakukan
+   local, tetapi deployment server-nya MUST memakai jalur image karena D46 tidak
+   dapat membawa perubahan runtime tersebut.
+
+### Kontrak jalur local
+
+Docker Compose adalah environment build/runtime/test local. Nama service tidak
+boleh ditebak; baca `docker compose config --services` dari Compose yang benar.
+Minimum definition of done local:
+
+1. `docker compose config` valid dan service target diketahui.
+2. `docker compose build` berhasil untuk service yang berubah.
+3. Unit/regression test yang relevan lulus di container Compose.
+4. `docker compose up -d` menghasilkan runtime local yang running/healthy sesuai
+   definisi Compose.
+5. Endpoint/API/UI yang berubah diverifikasi dengan request nyata; prinsip
+   verifikasi kontrak D34/D38/D41 tetap berlaku.
+6. Log service yang berubah tidak menunjukkan crash-loop atau error baru yang
+   relevan.
+
+Lulus local **tidak berarti otomatis deploy server**. Promotion adalah aksi
+terpisah dan hanya terjadi setelah operator meminta jalur server atau image.
+
+### Hubungan dengan aturan commit dan regression test
+
+Aturan commit `/root/semanggi-work-controller` dan `/root/agentos-fork` tetap
+mengikat **ketika working tree server disentuh** oleh server-fast atau image
+path: revisi tersedia → tes → `git add` + `git commit` → sync/rebuild + deploy.
+D99 tidak membuat local development wajib menulis langsung ke `/root/*` server.
+
+Setiap bug tetap membutuhkan tes regresi, baik ditemukan local maupun di
+cluster. Bug cluster tidak boleh "diperbaiki langsung" lalu dianggap selesai;
+perbaikannya harus kembali memiliki test yang dapat dijalankan dalam workflow
+local dan kemudian dipromosikan lewat jalur yang sesuai.
+
+### Status bukti
+
+D99 adalah **keputusan workflow**, bukan klaim bahwa setiap Compose service baru
+sudah dibuktikan pada cluster. Bukti produksi D46 tetap sah untuk server-fast.
+Bukti jalur image yang sudah dicatat pada D41/D94/D96 juga tetap sah. Yang
+berubah adalah **default dan pemilihan jalur**, bukan fakta historis deployment
+yang telah diukur.
+
+## D100 — Kegagalan run chat jujur lewat dua jalur vonis, probe pulih dari workspace legacy, dan empat harness ACP baru di image gateway
+
+**Konteks.** Sesi operator 2026-09-11: laporan UI Command Center (batch fork
+`9d2a6ece`+`f9997c47`, image `v077-fork-oc8.2-202609110353` — sidebar collapse,
+rename + menu 3-dot, footer modal, salin pesan/draf, pill dokumen membuka
+viewer) dan kegagalan ganti brain yang "menggantung". D98 menutup jalur sukses
+dan timeout; dua bentuk kegagalan run masih bocor.
+
+**Keputusan 1 — dua jalur vonis gagal, keduanya FAILED jujur.**
+
+1. *Run yang berjalan lalu gagal.* Fork menutup transkrip dengan pesan asisten
+   terminal berkalimat tetap `The agent run failed before producing a reply.`
+   Poller `chat-completion` mengenali kalimat itu (konstanta
+   `RUN_FAILURE_REPLY`) dan menyegel FAILED + error + event
+   `chat.message-failed` — bukan DONE kosong. Live: CHS-A71D7ECD
+   (groq/qwen-medium), vonis tiba lewat poller reguler 2 dtk.
+2. *Penolakan pra-run.* Gateway menolak dispatch sebelum run lahir;
+   `gateway.late-error` tiba dengan request id = id CHM dan TIDAK ADA baris
+   executions yang menyandangnya (chat tidak memakai task/execution — D95),
+   sehingga sink task tidak pernah melihatnya. Hook baru di `applyLateError`
+   (`runtime/session-events.mjs`) mengenali id CHM, menutup baris chat
+   in-flight sebagai FAILED dalam hitungan detik, menyentuh sesi, dan
+   mencatat `chat.message-failed` — hanya bila baris masih PENDING/RUNNING;
+   baris final tidak pernah ditimpa. Live: CHS-A06F5674 (cerebras, penolakan
+   kredensial) — FAILED detik yang sama, alasan auth terbaca operator.
+   Baris pertama sesi itu dibiarkan sebagai sejarah jujur: timeout 601 dtk
+   dari dispatch pra-perbaikan.
+
+**Keputusan 2 — probe pulih dari workspace legacy.** Test Connection qwen-low
+gagal `Legacy workspace setup state` (direktori agen terpangkas di NFS —
+keluarga galat yang sama dengan D81 untuk provisioning). `ensureProbeAgent`
+kini merelokasi workspace probe `-r<short>` lalu mencoba sekali lagi; cabang
+rename lama tetap. Live: log `brain.test-provision-relocate` →
+`probe/groq-r6e295394` provisioned — kegagalan yang tersisa jujur dan bukan
+milik kita: `Auth profile "groq:default" is temporarily unavailable` (kredensial
+gateway, urusan operator).
+
+**Keputusan 3 — data pendukung.** Baris `resources` `groq/qwen/qwen3-32b`
+dibuat lewat `POST /api/work/resources` (`sandbox:no-resource-entry` untuk
+kuota chat concurrency 1). Empat brain baru terdaftar: BRN-6D5E2860
+`claude-opus-low`, BRN-B555E477 `claude-sonnet-low` (claude-code preference
+mode — `effortEvidence` wajib: model dan effort dipaku launcher ACP),
+BRN-7ED55E36 `codex-sol-high`, BRN-206EC720 `codex-terra-low` (thinking
+guaranteed high/low).
+
+**Keputusan 4 — harness ACP = wrapper env-pin di image gateway.** Test
+Connection keempat brain di atas gagal jujur `not one of the gateway's ACP
+harness agents` — registry harness hidup di config gateway, bukan di tabel
+controller. Pendaftarannya bertumpu pada image: 4 wrapper
+`/usr/local/bin/semanggi-acp-<name>` (claude: `SEMANGGI_HARNESS_MODEL/EFFORT`
+exec wrapper bersama; codex: `SEMANGGI_CODEX_MODEL/EFFORT`) + daftar agen di
+`poc3-apply-config.sh` (13 agen) + COPY/chmod Dockerfile — image
+`kubuslab/semanggi-openclaw:poc8-20260911.1`.
+
+**Temuan proses yang mahal kalau hilang lagi.** Dockerfile gateway di
+`/root/semanggi-agent-platform` TIDAK lagi memuat `COPY --from=openclaw-dist`
+padahal image poc8-20260909.2 yang berjalan MEMILIKI lapisan itu — berkas
+tertimpa setelah build terakhir (bertepatan dengan `acp-codex-sol-high.sh`
+yang ada di konteks tapi tidak di COPY). Rebuild tanpa memulihkannya akan
+menghasilkan image yang sehat, start, dan diam-diam menjalankan bundle HULU
+— tanpa `acp.spawn` fork dan tanpa idempotency key (mode kegagalan persis
+yang dicegah langkah 2 build script, tapi di sisi image). Baris itu
+dipulihkan dan build baru diverifikasi `DIST-FORK-OK` (grep `acp.spawn` di
+`/app/dist` image). Selain itu: kub01-02 TIDAK PERNAH punya image gateway —
+semua task hanya selamat di kub01-01 (riwayat `Failed 12 hours ago`) — dan
+transfer manual `docker save | ssh docker load` dari mesin operator drop di
+tengah (netbird); jalur yang stabil adalah intra-cluster
+kub01-01 → root@10.10.0.12. Registry internal (§6.2) tetap penutup
+struktural.
+
+**Bukti.** Controller: `chat-completion.mjs` verdict + tes, `applyLateError`
+hook + 2 tes (in-flight → FAILED; final tak ditimpa), `ensureProbeAgent`
+relokasi + tes; commit `df6d681` + `cb9bd8a`, suite cluster 649 lulus
+(1 merah `acp-dispatch` milik sesi paralel, bukan POC-10). UI: smoke
+terauthentikasi 200, bundle memuat "Copy draft"/"Rename…". Live: dua sesi
+uji di atas di Postgres produksi.
+

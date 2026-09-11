@@ -74,7 +74,9 @@ export function parseGatewayQuota(errorLike) {
  * tidak ada blok teks sama sekali: "model menjawab kosong" adalah fakta yang
  * pemanggil boleh laporkan, bukan error yang disembunyikan.
  */
-function replyText(reply) {
+// Dipakai juga oleh chat-completion (POC-10 T5) untuk meratakan blok konten
+// pesan asisten transkrip gateway — bentuknya sama dengan reply dispatch.
+export function replyText(reply) {
   if (!reply) return null;
   if (typeof reply === "string") return reply;
   if (typeof reply.text === "string") return reply.text;

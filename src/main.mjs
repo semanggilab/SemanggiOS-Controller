@@ -11,6 +11,7 @@ import { createAgentOSRuntime } from "./runtime/agentos.mjs";
 import { createReconciler } from "./runtime/reconciler.mjs";
 import { createSessionEventSink } from "./runtime/session-events.mjs";
 import { applyRuntimeFailure } from "./domain/retry.mjs";
+import { createChatCompletion } from "./domain/chat-completion.mjs";
 import { cleanUploads } from "./domain/workspace-files.mjs";
 import { createSlackSurface } from "./interface/slack.mjs";
 import { createSlackApp } from "./interface/slack-app.mjs";
@@ -259,6 +260,30 @@ async function main() {
     })();
   }, Number(process.env.SEMANGGI_RECONCILE_MS ?? 20_000));
   reconcileTimer.unref?.();
+
+  // POC-10 T5 — poller penyelesaian giliran chat. Gateway fork menjawab
+  // dispatch dengan "accepted" saja; jawaban tinggal di transkrip gateway
+  // (chat.history), dan giliran brain ditutup dari sana. Kadensi 2 dtk:
+  // operator SEDANG menatap bubble PENDING — ini bukan latar yang boleh
+  // malas. Lock singleton 30 dtk menahan dua replica agar tidak menggandakan
+  // polling (idempoten sebenarnya — updateDelivery per baris — tapi boros).
+  const chatCompletion = createChatCompletion({
+    repos: controller.repos,
+    events: controller.events,
+    runtime,
+    log: log.child({ component: "chat-completion" }),
+    config: { turnTimeoutMs: Number(process.env.SEMANGGI_CHAT_TURN_TIMEOUT_MS ?? 600_000) },
+  });
+  const chatCompletionTimer = setInterval(() => {
+    void (async () => {
+      try {
+        await singleton("chat-completion", 30_000, () => chatCompletion.completeOnce());
+      } catch (err) {
+        console.error(`chat completion pass failed: ${err.message}`);
+      }
+    })();
+  }, Number(process.env.SEMANGGI_CHAT_COMPLETION_MS ?? 2_000));
+  chatCompletionTimer.unref?.();
 
   // D76/D77: penyapu lampiran — staging tmp/uploads/ DAN salinan per-task
   // deliverables/<task>/tmp/uploads/. Agen diinstruksikan menghapus segera

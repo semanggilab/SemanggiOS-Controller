@@ -1807,6 +1807,20 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
         .then((rows) => rows.map((r) => ({ ...r, attachments: json(r.attachments, null) }))),
 
     /**
+     * POC-10 T5 — baris brain yang masih dalam penerbangan (PENDING/RUNNING)
+     * beserta ref gateway sesinya: bahan bakar poller chat-completion.
+     * Definisi "masih hidup" hidup di satu tempat ini supaya poller dan
+     * API tidak berdebat soal siapa yang berhak di-poll.
+     */
+    listInFlight: () =>
+      store.all(
+        `SELECT m.id, m.session_id, m.status, m.created_at, s.gateway_session_ref
+           FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id
+          WHERE m.role = 'brain' AND m.status IN ('PENDING','RUNNING')
+          ORDER BY m.created_at ASC`,
+      ),
+
+    /**
      * Perbaruan pengiriman pesan brain (T3): PENDING → RUNNING → DONE/FAILED.
      * Konten hanya boleh ikut saat DONE — baris PENDING/RUNNING sengaja lahir
      * kosong supaya polling punya sesuatu untuk ditunggu. Bukan jalur umum

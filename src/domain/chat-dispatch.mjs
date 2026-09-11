@@ -101,7 +101,17 @@ export function createChatDispatch({ repos, events, chatSandbox, runtime, brainF
       } else {
         await repos.chatSessions.touch(session.id);
       }
-      await mark("DONE", { content: result.reply ?? "" });
+
+      // Gateway fork (metode `agent` bare) menjawab dispatch dengan
+      // {"status":"accepted"} saja — balasan tiba belakangan sebagai event
+      // dan hanya utuh di transkrip gateway; poller chat-completion yang
+      // menyegel giliran dari chat.history (diukur di CHS-E6A3263B: baris
+      // DONE berisi kosong karena jawaban tidak pernah ada di frame res).
+      // Gateway yang mengembalikan run sekaligus (agent.run keluarga 2026.8)
+      // tetap selesai di sini — dua bentuk gateway, satu jalur kode.
+      if (result.reply) {
+        await mark("DONE", { content: result.reply });
+      }
     } catch (err) {
       // Termasuk penolakan kuota/gateway apa pun: chat tidak punya state
       // machine parkir (§5) — FAILED dengan teks yang bisa dibaca operator.

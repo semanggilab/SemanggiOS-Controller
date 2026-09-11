@@ -353,6 +353,41 @@ test("POST .../brains/test connection-tests an unsaved draft the same way", asyn
   }
 });
 
+// D81's gateway state keys, now on the PROBE path too: Test Connection on
+// groq/qwen3-32b failed live (2026-09-11) with "Legacy workspace setup state
+// requires migration for …/workspaces/probe/groq" — the fleet provisioner
+// recovered from that since D81, but the test-connection provisioner had
+// only the deleted-name retry. A stale probe workspace dir must relocate,
+// not lock the model out of connection testing forever.
+test("connection test auto-provision recovers from legacy workspace state (probe path)", async () => {
+  const h = await buildHarness();
+  const brain = await h.brains.create({ name: "groq-low", provider: "groq", model: "qwen3-32b" });
+  const calls = [];
+  h.runtime.listAgents = async () =>
+    calls.length === 0 ? [] : [{ id: "probe-agent", model: { primary: "groq/qwen3-32b" } }];
+  h.runtime.createProbeAgent = async ({ name, workspace }) => {
+    calls.push({ name, workspace });
+    if (calls.length === 1) {
+      throw new Error(
+        "Legacy workspace setup state requires migration for /opt/semanggi/volumes/shared/service/semanggios/openclaw/workspaces/probe/groq; run openclaw doctor --fix.",
+      );
+    }
+    return { id: "probe-agent", name, workspace };
+  };
+  h.runtime.testAgent = async ({ agentId }) => ({ ok: true, status: "completed", agentId });
+  const api = await startApi(h);
+  try {
+    const res = await api.call("POST", `/api/work/brains/${brain.id}/test`, {});
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, JSON.stringify(res.body));
+    assert.equal(calls.length, 2, "SATU percobaan ulang, bukan loop");
+    assert.equal(calls[1].name, calls[0].name, "path yang direlokasi, nama tetap");
+    assert.match(calls[1].workspace, /-r[0-9a-f]{8}$/, "workspace variasi -r<short> (pola D81)");
+  } finally {
+    await api.close();
+  }
+});
+
 // ── config-only ACP harness agents (2026.8.2) ───────────────────────────────
 //
 // On OpenClaw 2026.8.2, ACP harness agents (e.g. "claude-opus") are not

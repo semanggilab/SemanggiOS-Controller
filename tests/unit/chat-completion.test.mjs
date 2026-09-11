@@ -97,6 +97,29 @@ test("chat.history error → menunggu: socket sesaat bukan vonis giliran", async
   assert.equal((await f.repos.chatMessages.get(id)).status, "RUNNING");
 });
 
+test("vonis gateway: kalimat tetap 'The agent run failed…' → FAILED, bukan DONE", async () => {
+  // Cerebras/qwen-3-8-27b dan groq/qwen-medium (2026-09-11): run gagal di
+  // sisi provider dan gateway fork menutupnya dengan SATU pesan asisten
+  // berkalimat tetap. Tanpa vonis ini, kalimat kegagalan dibungkus DONE dan
+  // operator membacanya sebagai balasan brain.
+  const f = await fixture();
+  const id = await inflightTurn(f);
+  f.history["agent:sem-chat-x:chat:S1"] = {
+    messages: [
+      { role: "user", content: "halo", idempotencyKey: `${id}:user` },
+      { role: "assistant", content: "The agent run failed before producing a reply." },
+    ],
+  };
+
+  const out = await f.completion.completeOnce();
+  assert.equal(out.failed, 1);
+  const row = await f.repos.chatMessages.get(id);
+  assert.equal(row.status, "FAILED");
+  assert.match(row.error, /failed before producing a reply/);
+  assert.equal(row.content, "", "teks vonis tidak pernah jadi konten jawaban");
+  assert.ok((await f.events.list({ kind: "chat.message-failed" })).length === 1);
+});
+
 test("findTurnReply: idempotencyKey polos (tanpa :user) tetap dicocokkan; asisten kosong dilewati", () => {
   const messages = [
     { role: "user", content: "q", idempotencyKey: "CHM-A" },

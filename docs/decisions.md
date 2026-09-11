@@ -3157,7 +3157,7 @@ membungkuk); keeper `reconcileAll` terbukti (tes) tidak memangkas `sem-chat-*`.
 HEAD; pin operator `qwen-high` (D68) dipertahankan — scp sesi ini sempat
 menimpanya dengan salinan tua `codex-*`, tertangkap sebelum commit.
 
-## D94 — Image AgentOS membawa CLI OpenClaw dari FORK, dan versinya dipaku, bukan diwariskan
+## D96 — Image AgentOS membawa CLI OpenClaw dari FORK, dan versinya dipaku, bukan diwariskan
 
 **Yang ditemukan operator.** Baseline produksi adalah AgentOS v0.7.7 dengan
 OpenClaw 2026.8.2 di atas Postgres + Redis. Image yang saya bangun membawa CLI

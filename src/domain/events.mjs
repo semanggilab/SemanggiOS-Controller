@@ -12,6 +12,8 @@ export const EventKind = Object.freeze({
   TASK_EXPEDITED: "task.expedited",
   TASK_DELETED: "task.deleted",
   REVISION_CREATED: "revision.created",
+  CHECKPOINT_CREATED: "checkpoint.created",
+  TASK_DECOMPOSED: "task.decomposed",
   DISPATCH_DECISION: "dispatch.decision",
   DISPATCH_SENT: "dispatch.sent",
   DISPATCH_FAILED: "dispatch.failed",

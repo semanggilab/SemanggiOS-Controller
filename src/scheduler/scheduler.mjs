@@ -126,6 +126,15 @@ export function createScheduler({ admission, repos, events = null, config = {}, 
         executionId: lease.execution_id,
         ttlMs: leaseTtlMs,
       });
+      // POC-11 coordination heartbeat: durable liveness remains
+      // executions.last_event_at; this short-lived Redis value only lets
+      // another replica see active ownership without turning Redis into the
+      // source of execution history.
+      await sharedState?.setJson(
+        `execution:${lease.execution_id}:heartbeat`,
+        { executionId: lease.execution_id, at: now(), workspacePath: lease.workspace_path },
+        { ttlMs: leaseTtlMs },
+      );
       renewed.push(lease.execution_id);
     }
     return renewed;

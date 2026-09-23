@@ -25,6 +25,7 @@ import {
 import { DEFAULT_BRAIN_MAP } from "../domain/brain-map.mjs";
 import { quotaDriverCatalog, quotaDriverIdFor } from "../domain/quota-drivers/index.mjs";
 import { buildPlan, LEVEL_TO_QUALITY, ROLE_CATEGORY } from "../domain/decompose.mjs";
+import { analyzeTaskIntake, progressForChildren, PlanMode } from "../domain/task-intake.mjs";
 import { EventKind } from "../domain/events.mjs";
 import { classify, Intent, Action, isChatEligible } from "../interface/intent.mjs";
 import { markRegistered, parseTasksMd, wantsImmediateRun } from "../interface/tasks-md.mjs";
@@ -173,6 +174,9 @@ const presentTask = (t, now) => ({
   expedited: isExpedited(t, now),
   expediteUntil: t.expedite_until,
   qualityClass: t.quality_class,
+  planMode: t.plan_mode ?? PlanMode.DIRECT,
+  complexityScore: Number(t.complexity_score ?? 0),
+  breakdownReason: t.breakdown_reason ?? null,
   status: t.status,
   waitReason: t.wait_reason,
   workerId: t.worker_id,
@@ -212,6 +216,19 @@ const presentExecution = (e) => ({
   startedAt: e.started_at,
   endedAt: e.ended_at,
   finalized: e.finalized_at != null,
+});
+
+const presentCheckpoint = (c) => ({
+  id: c.id,
+  taskId: c.task_id,
+  executionId: c.execution_id,
+  type: c.checkpoint_type,
+  stopReason: c.stop_reason,
+  objective: c.objective,
+  progress: c.progress,
+  workspaceState: c.workspace_state,
+  contextSummary: c.context_summary,
+  createdAt: c.created_at,
 });
 
 const presentApproval = (a) => ({
@@ -981,10 +998,78 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   });
 
   // --- tasks ----------------------------------------------------------------
+  async function decomposeParent(parent, actor = "operator") {
+    const existing = await repos.tasks.children(parent.id);
+    if (existing.length > 0) return { created: false, workItems: existing };
+    const project = await repos.projects.get(parent.project_id);
+    const level = ["L4", "L5"].includes(parent.quality_class)
+      ? Level.CRITICAL
+      : ["L0", "L1"].includes(parent.quality_class)
+        ? Level.LOW
+        : Level.NORMAL;
+    const plan = buildPlan({
+      request: parent.description || parent.title,
+      template: project?.template ?? "software",
+      levelFor: () => level,
+    });
+    const selected = plan.slice(0, parent.plan_mode === PlanMode.LIGHTWEIGHT ? Math.min(3, plan.length) : plan.length);
+    const idByRole = new Map();
+    const created = [];
+    for (const step of selected) {
+      const dependsOn = step.after.map((role) => idByRole.get(role)).filter(Boolean);
+      const matched = await repos.workers.match({ projectId: parent.project_id, role: step.role });
+      const child = await repos.tasks.create({
+        projectId: parent.project_id,
+        parentTaskId: parent.id,
+        workerId: matched?.id ?? parent.worker_id,
+        title: step.title,
+        description: step.description,
+        priority: parent.priority,
+        qualityClass: step.qualityClass,
+        workspaceMode: step.workspaceMode,
+        workspacePath: parent.workspace_path,
+        modelPolicy: parent.model_policy,
+        dependsOn,
+        planMode: PlanMode.DIRECT,
+        complexityScore: 0,
+        breakdownReason: `child-of:${parent.id}`,
+      });
+      idByRole.set(step.role, child.id);
+      created.push(child);
+      await controller.events.append({
+        kind: EventKind.TASK_DECOMPOSED,
+        subjectType: "task",
+        subjectId: child.id,
+        actor,
+        payload: { parentTaskId: parent.id, role: step.role, dependsOn },
+      });
+    }
+    // Every child enters the native queue. Admission parks dependent children
+    // on WAIT_DEP; completion notifications wake them without a second manual
+    // "start" click or a Redis-only shadow queue.
+    for (const child of created) await repos.tasks.setStatus(child.id, Status.QUEUED, { actor });
+    await scheduler.notify(WakeReason.TASK_CREATED);
+    // Admission may already have moved QUEUED to DISPATCHED/WAIT_* during the
+    // notify above. Re-read instead of returning the pre-queue objects: the UI
+    // must never paint CREATED for work that is already waiting or running.
+    return { created: true, workItems: await repos.tasks.children(parent.id) };
+  }
+
   route("POST", "/api/work/tasks", async (_p, body) => {
     if (!body.projectId || !body.title) throw badRequest("projectId and title are required");
     if (!(await repos.projects.get(body.projectId))) throw badRequest(`unknown project ${body.projectId}`);
-    const task = await repos.tasks.create(body);
+    let intake;
+    try {
+      intake = analyzeTaskIntake({ title: body.title, description: body.description, planMode: body.planMode });
+    } catch (err) {
+      throw badRequest(err.message);
+    }
+    const task = await repos.tasks.create({
+      ...body,
+      planMode: intake.planMode,
+      complexityScore: intake.complexityScore,
+      breakdownReason: intake.reason,
+    });
     log.info("task.created", {
       task: task.id, project: body.projectId, title: body.title,
       priority: body.priority ?? 2, qualityClass: body.qualityClass ?? "L2",
@@ -994,6 +1079,18 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
       modelPolicy: body.modelPolicy ?? {},
       worker: body.workerId ?? null,
     });
+    // POC-12 intake owns this decision at creation time. A planned request
+    // becomes a durable parent plus ordinary child tasks immediately; the
+    // parent itself is never dispatched in parallel with its TODOs.
+    if (intake.shouldDecompose && body.decompose !== false) {
+      const planned = await decomposeParent(task, body.actor ?? "operator");
+      return {
+        task: presentTask(await repos.tasks.get(task.id), now()),
+        intake,
+        workItems: planned.workItems.map((t) => presentTask(t, now())),
+        progress: progressForChildren(planned.workItems),
+      };
+    }
     // `hold: true` stocks the work without starting it, so the model and effort
     // can be decided later. Without this a task is queued the moment it is
     // created and the scheduler often dispatches it before an operator can
@@ -1001,11 +1098,11 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     // workflow was tried on the cluster.
     if (body.hold === true) {
       log.info("task.held", { task: task.id, project: body.projectId });
-      return { task: presentTask(await repos.tasks.get(task.id), now()) };
+      return { task: presentTask(await repos.tasks.get(task.id), now()), intake };
     }
     await repos.tasks.setStatus(task.id, Status.QUEUED);
     await scheduler.notify(WakeReason.TASK_CREATED);
-    return { task: presentTask(await repos.tasks.get(task.id), now()) };
+    return { task: presentTask(await repos.tasks.get(task.id), now()), intake };
   });
 
   route("GET", "/api/work/tasks", async (_p, _b, query) => ({
@@ -1017,11 +1114,32 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
   route("GET", "/api/work/tasks/{id}", async ({ id }) => {
     const task = await repos.tasks.get(id);
     if (!task) throw notFound(`unknown task ${id}`);
+    const children = await repos.tasks.children(id);
     return {
       task: presentTask(task, now()),
       executions: (await repos.executions.listByTask(id)).map(presentExecution),
       approvals: (await repos.approvals.listForTask(id)).map(presentApproval),
       dependencies: await repos.tasks.dependencies(id),
+      checkpoints: (await repos.checkpoints.listForTask(id)).map(presentCheckpoint),
+      workItems: children.map((child) => presentTask(child, now())),
+      progress: progressForChildren(children),
+    };
+  });
+
+  // POC-12: project a structural plan onto ordinary child tasks. The parent is
+  // the WorkPlan and each child is the TODO/WorkItem; dependencies use the
+  // existing relational edge table. Repeating the command is idempotent.
+  route("POST", "/api/work/tasks/{id}/decompose", async ({ id }, body) => {
+    const parent = await repos.tasks.get(id);
+    if (!parent) throw notFound(`unknown task ${id}`);
+    if (parent.plan_mode === PlanMode.DIRECT) {
+      throw badRequest(`task ${id} was classified DIRECT_EXECUTION; set planMode at intake to create TODOs`);
+    }
+    const planned = await decomposeParent(parent, body.actor ?? "operator");
+    return {
+      created: planned.created,
+      workItems: planned.workItems.map((t) => presentTask(t, now())),
+      progress: progressForChildren(planned.workItems),
     };
   });
 
@@ -1043,6 +1161,54 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     }
     await scheduler.notify(WakeReason.MANUAL);
     return { task: presentTask(await repos.tasks.get(updated.id), now()) };
+  });
+
+  // POC-11: Resume is a control-plane command. It never fabricates a user
+  // message such as "continue"; it creates an immutable CONTINUE revision and
+  // carries the latest durable checkpoint as structured context. Redis/shared
+  // state supplies the cross-replica lock and retry idempotency only.
+  route("POST", "/api/work/tasks/{id}/resume", async ({ id }, body) => {
+    const task = await repos.tasks.get(id);
+    if (!task) throw notFound(`unknown task ${id}`);
+    const key = String(body.idempotencyKey ?? `resume:${id}:${task.updated_at}`);
+    const stateKey = `resume:idempotency:${key}`;
+    // A retry observes the task AFTER the first call already moved it out of
+    // BLOCKED. Read the cached response before validating today's status, or
+    // the exact same idempotent request incorrectly becomes a 400.
+    const cached = await controller.sharedState?.getJson(stateKey);
+    if (cached) return cached;
+    if (![Status.BLOCKED, Status.FAILED].includes(task.status)) {
+      throw badRequest(`task ${id} is ${task.status}; only BLOCKED or FAILED work can be resumed`);
+    }
+    const run = async () => {
+      const second = await controller.sharedState?.getJson(stateKey);
+      if (second) return second;
+      const latest = await repos.checkpoints.latestForTask(id);
+      const resumeContext = latest ? {
+        checkpointId: latest.id,
+        sourceExecutionId: latest.execution_id,
+        stopReason: latest.stop_reason,
+        objective: latest.objective,
+        progress: latest.progress,
+        workspace: latest.workspace_state,
+        summary: latest.context_summary,
+      } : { checkpointId: null, objective: task.description || task.title };
+      const instruction = `<semanggi_resume_context>\n${JSON.stringify(resumeContext, null, 2)}\n</semanggi_resume_context>`;
+      await repos.tasks.createRevision(id, {
+        sessionMode: "CONTINUE",
+        instruction,
+        modelPolicy: body.modelPolicy,
+        actor: body.actor ?? "operator",
+      });
+      await scheduler.notify(WakeReason.MANUAL);
+      const result = { task: presentTask(await repos.tasks.get(id), now()), resume: resumeContext };
+      await controller.sharedState?.setJson(stateKey, result, { ttlMs: 24 * 60 * 60 * 1000 });
+      return result;
+    };
+    if (!controller.sharedState) return run();
+    const result = await controller.sharedState.withLock(`resume:${id}`, 30_000, run);
+    if (result === null) throw conflict(`task ${id} is already being resumed`);
+    return result;
   });
 
   // Change the plan of a task that is queued, waiting, or finished — then run
@@ -1096,6 +1262,21 @@ export function createApi(controller, { token, slackSigningSecret = process.env.
     let aborted = { ok: true, aborted: false, status: "nothing-running" };
 
     if (live) {
+      await repos.checkpoints.create({
+        taskId: id,
+        executionId: execution.id,
+        checkpointType: "manual_stop",
+        stopReason: body.reason ?? "USER_REQUESTED",
+        objective: task.description || task.title,
+        progress: {
+          lastObservedAt: execution.last_event_at ?? execution.started_at ?? execution.created_at,
+          executionStatus: execution.status,
+          nextActions: ["Inspect the current workspace", "Continue unfinished work without repeating completed changes"],
+        },
+        workspaceState: { path: task.workspace_path, mode: task.workspace_mode },
+        contextSummary: `Execution ${execution.id} was stopped before a new CONTINUE revision.`,
+        actor: body.actor ?? "operator",
+      });
       // ORDER MATTERS, and getting it wrong cost a run to discover.
       //
       // Aborting first meant the gateway's own lifecycle `end` — carrying

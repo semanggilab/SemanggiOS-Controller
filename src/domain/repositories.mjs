@@ -334,6 +334,9 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
       // omission — sharing has to be asked for.
       workspaceMode = "write",
       dependsOn = [],
+      planMode = "DIRECT_EXECUTION",
+      complexityScore = 0,
+      breakdownReason = null,
     }) {
       // An instruction is sent to a provider verbatim and billed by the token.
       // Without a bound, one oversized description is a denial-of-wallet: a 2MB
@@ -356,8 +359,9 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
         await store.run(
           `INSERT INTO tasks (id, project_id, parent_task_id, title, description, priority,
                               quality_class, status, worker_id, session_policy, model_policy,
-                              approval_level, workspace_path, workspace_mode, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                              approval_level, workspace_path, workspace_mode, plan_mode,
+                              complexity_score, breakdown_reason, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             projectId,
@@ -373,6 +377,9 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
             approvalLevel,
             workspacePath,
             workspaceMode === "read" ? "read" : "write",
+            planMode,
+            complexityScore,
+            breakdownReason,
             ts,
             ts,
           ],
@@ -421,6 +428,14 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
           WHERE d.task_id = ?`,
         [taskId],
       );
+    },
+
+    async children(taskId) {
+      const rows = await store.all(
+        `SELECT * FROM tasks WHERE parent_task_id = ? AND deleted_at IS NULL ORDER BY created_at ASC`,
+        [taskId],
+      );
+      return rows.map(hydrateTask);
     },
 
     // D78 (Process Manager): per worker, the task most recently updated on it —
@@ -844,6 +859,41 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
         });
         return { deleted: true, taskId, method, status: task.status, title: task.title };
       });
+    },
+  };
+
+  const checkpoints = {
+    async create({
+      id = shortId("CHK"), taskId, executionId = null, checkpointType = "automatic",
+      stopReason = null, objective = "", progress = {}, workspaceState = {}, contextSummary = "",
+      actor = "controller",
+    }) {
+      await store.run(
+        `INSERT INTO execution_checkpoints
+           (id, task_id, execution_id, checkpoint_type, stop_reason, objective, progress, workspace_state, context_summary, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [id, taskId, executionId, checkpointType, stopReason, objective, JSON.stringify(progress), JSON.stringify(workspaceState), contextSummary, now()],
+      );
+      await events.append({
+        kind: EventKind.CHECKPOINT_CREATED,
+        subjectType: "task",
+        subjectId: taskId,
+        actor,
+        payload: { checkpointId: id, executionId, checkpointType, stopReason },
+      });
+      return checkpoints.get(id);
+    },
+    async get(id) {
+      const row = await store.get(`SELECT * FROM execution_checkpoints WHERE id = ?`, [id]);
+      return row && { ...row, progress: json(row.progress, {}), workspace_state: json(row.workspace_state, {}) };
+    },
+    async listForTask(taskId) {
+      const rows = await store.all(`SELECT * FROM execution_checkpoints WHERE task_id = ? ORDER BY created_at ASC`, [taskId]);
+      return rows.map((row) => ({ ...row, progress: json(row.progress, {}), workspace_state: json(row.workspace_state, {}) }));
+    },
+    async latestForTask(taskId) {
+      const row = await store.get(`SELECT * FROM execution_checkpoints WHERE task_id = ? ORDER BY created_at DESC LIMIT 1`, [taskId]);
+      return row && { ...row, progress: json(row.progress, {}), workspace_state: json(row.workspace_state, {}) };
     },
   };
 
@@ -1900,6 +1950,7 @@ export function createRepositories(store, events, { now = () => Date.now(), log 
     resources,
     leases,
     approvals,
+    checkpoints,
     messages,
     chatSessions,
     chatMessages,

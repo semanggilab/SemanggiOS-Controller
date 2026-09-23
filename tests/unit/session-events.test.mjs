@@ -377,6 +377,10 @@ test("a late refusal blocks the execution immediately, with the real reason", as
   assert.match(done.result, /Thinking level "max" is not supported/);
   assert.equal((await h.repos.tasks.get(task.id)).status, Status.BLOCKED);
   assert.equal(await h.repos.leases.get(path), null, "the lease must not outlive the refused run");
+  const checkpoint = await h.repos.checkpoints.latestForTask(task.id);
+  assert.equal(checkpoint.execution_id, execution.id);
+  assert.equal(checkpoint.checkpoint_type, "failure");
+  assert.match(checkpoint.context_summary, /gateway\.late-error/);
 });
 
 test("a late refusal reaches the sink through handle() like any other event", async () => {

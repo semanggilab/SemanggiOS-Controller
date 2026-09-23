@@ -77,6 +77,15 @@ class SqliteStore {
         `ALTER TABLE tasks ADD COLUMN workspace_mode TEXT NOT NULL DEFAULT 'write'`,
       );
     }
+    if (taskCols.length > 0 && !taskCols.includes("plan_mode")) {
+      this.#db.exec(`ALTER TABLE tasks ADD COLUMN plan_mode TEXT NOT NULL DEFAULT 'DIRECT_EXECUTION'`);
+    }
+    if (taskCols.length > 0 && !taskCols.includes("complexity_score")) {
+      this.#db.exec(`ALTER TABLE tasks ADD COLUMN complexity_score INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (taskCols.length > 0 && !taskCols.includes("breakdown_reason")) {
+      this.#db.exec(`ALTER TABLE tasks ADD COLUMN breakdown_reason TEXT`);
+    }
 
     // D48: the session key dispatch ACTUALLY SENT. A CONTINUE revision reuses
     // a composite key derived from its inherited ref (`…:s<ref>`), which is
@@ -486,6 +495,9 @@ class PostgresStore {
       "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'DONE'",
     );
     await this.#sql.unsafe("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS error TEXT");
+    await this.#sql.unsafe("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_mode TEXT NOT NULL DEFAULT 'DIRECT_EXECUTION'");
+    await this.#sql.unsafe("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS complexity_score BIGINT NOT NULL DEFAULT 0");
+    await this.#sql.unsafe("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS breakdown_reason TEXT");
     await this.#sql.unsafe(`
       CREATE OR REPLACE FUNCTION semanggi_reject_event_mutation() RETURNS trigger AS $$
       BEGIN RAISE EXCEPTION 'event_log is append-only'; END; $$ LANGUAGE plpgsql;

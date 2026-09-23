@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createApi } from "../../src/api/server.mjs";
 import { Status } from "../../src/domain/state-machine.mjs";
+import { createSharedState } from "../../src/runtime/shared-state.mjs";
 import { buildHarness, seedBasics } from "../helpers/harness.mjs";
 
 const TOKEN = "controller-token-for-tests";
@@ -81,6 +82,74 @@ test("a task runs its whole lifecycle over the API", async () => {
     const stats = await api.call("GET", "/api/work/stats");
     const flash = stats.body.models.find((m) => m.model === "google/gemini-flash" && m.status === "COMPLETE");
     assert.equal(flash.tokensInput, 120);
+  } finally {
+    await api.close();
+  }
+});
+
+test("POC-11 resume retries return the cached response after the task has moved", async () => {
+  const sharedState = await createSharedState({ driver: "memory" });
+  const h = await buildHarness({ sharedState });
+  const { project, worker } = await seedBasics(h);
+  const api = await startApi(h);
+  try {
+    const created = await api.call("POST", "/api/work/tasks", {
+      projectId: project.id,
+      workerId: worker.id,
+      title: "resume idempotently",
+      description: "synthetic runtime task",
+    });
+    const taskId = created.body.task.id;
+    const stopped = await api.call("POST", `/api/work/tasks/${taskId}/stop`, {
+      actor: "test-operator",
+      reason: "integration pause",
+    });
+    assert.equal(stopped.body.task.status, Status.BLOCKED);
+
+    const request = { idempotencyKey: `resume-test-${taskId}`, actor: "test-operator" };
+    const first = await api.call("POST", `/api/work/tasks/${taskId}/resume`, request);
+    const second = await api.call("POST", `/api/work/tasks/${taskId}/resume`, request);
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.deepEqual(second.body, first.body);
+
+    const detail = await api.call("GET", `/api/work/tasks/${taskId}`);
+    assert.equal(detail.body.executions.length, 2, "the retry must not create a third revision");
+    assert.equal(detail.body.checkpoints.length, 1);
+    assert.equal(detail.body.task.sessionPolicy, "CONTINUE");
+  } finally {
+    await api.close();
+    await sharedState.close?.();
+  }
+});
+
+test("POC-12 auto-decomposes once and exposes a derived parent lifecycle", async () => {
+  const h = await buildHarness();
+  const { project, worker } = await seedBasics(h);
+  const api = await startApi(h);
+  try {
+    const created = await api.call("POST", "/api/work/tasks", {
+      projectId: project.id,
+      workerId: worker.id,
+      title: "deliver a cross-area change",
+      description: "Update the frontend and backend, migrate the database schema, then build and test it.",
+      planMode: "FULL_WORKPLAN",
+    });
+    assert.equal(created.status, 200);
+    assert.equal(created.body.task.planMode, "FULL_WORKPLAN");
+    assert.equal(created.body.task.status, Status.CREATED, "the parent is a plan container, not executable work");
+    assert.equal(created.body.workItems.length, 6);
+    assert.equal(created.body.progress.state, "IN_PROGRESS");
+    assert.ok(created.body.workItems.every((item) => item.parentTaskId === created.body.task.id));
+
+    const repeated = await api.call("POST", `/api/work/tasks/${created.body.task.id}/decompose`, {});
+    assert.equal(repeated.status, 200);
+    assert.equal(repeated.body.created, false);
+    assert.equal(repeated.body.workItems.length, 6, "idempotent retry must not duplicate child tasks");
+
+    const detail = await api.call("GET", `/api/work/tasks/${created.body.task.id}`);
+    assert.equal(detail.body.progress.state, "IN_PROGRESS");
+    assert.equal(detail.body.workItems.length, 6);
   } finally {
     await api.close();
   }

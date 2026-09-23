@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- P0 Emergency .. P4 Background (POC-4 §5.2).
   priority       INTEGER NOT NULL DEFAULT 2 CHECK (priority BETWEEN 0 AND 4),
   quality_class  TEXT NOT NULL DEFAULT 'L2' CHECK (quality_class IN ('L0','L1','L2','L3','L4','L5')),
+  -- POC-12: task intake records why this request is direct work or a visible
+  -- parent/child plan. Child tasks remain ordinary tasks; no WorkItem table.
+  plan_mode      TEXT NOT NULL DEFAULT 'DIRECT_EXECUTION' CHECK (plan_mode IN ('DIRECT_EXECUTION','LIGHTWEIGHT_PLAN','FULL_WORKPLAN')),
+  complexity_score INTEGER NOT NULL DEFAULT 0,
+  breakdown_reason TEXT,
   status         TEXT NOT NULL,
   wait_reason    TEXT,                          -- detail for WAIT_* statuses
   worker_id      TEXT REFERENCES workers(id),
@@ -148,6 +153,24 @@ CREATE TABLE IF NOT EXISTS executions (
 CREATE INDEX IF NOT EXISTS idx_executions_task ON executions(task_id);
 -- idx_executions_session_key dibuat oleh migrasi di db/index.mjs: indeks pada
 -- kolom yang belum ada akan gagal di basis data warisan (D48).
+
+-- POC-11: a checkpoint is durable resume evidence, not a second execution.
+-- The execution row stays immutable after finalization; checkpoint metadata is
+-- appended beside it and the next attempt is still createRevision(CONTINUE).
+CREATE TABLE IF NOT EXISTS execution_checkpoints (
+  id               TEXT PRIMARY KEY,
+  task_id          TEXT NOT NULL REFERENCES tasks(id),
+  execution_id     TEXT REFERENCES executions(id),
+  checkpoint_type  TEXT NOT NULL,
+  stop_reason      TEXT,
+  objective        TEXT NOT NULL DEFAULT '',
+  progress         TEXT NOT NULL DEFAULT '{}',
+  workspace_state  TEXT NOT NULL DEFAULT '{}',
+  context_summary  TEXT NOT NULL DEFAULT '',
+  created_at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON execution_checkpoints(task_id, created_at);
 
 CREATE TABLE IF NOT EXISTS resources (
   provider          TEXT NOT NULL,

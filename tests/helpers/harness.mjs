@@ -45,7 +45,7 @@ export class Clock {
   }
 }
 
-export async function buildHarness({ routing = SAMPLE_ROUTING, config = {}, clock = new Clock(), log } = {}) {
+export async function buildHarness({ routing = SAMPLE_ROUTING, config = {}, clock = new Clock(), log, sharedState = null } = {}) {
   const holder = {};
   const runtime = {
     dispatch: (req) => holder.fake.dispatch(req),
@@ -60,6 +60,7 @@ export async function buildHarness({ routing = SAMPLE_ROUTING, config = {}, cloc
     runtime,
     config: { maxRunning: 8, leaseTtlMs: 60_000, watchdogMs: 1_000_000, ...config },
     now: clock.now,
+    sharedState,
     ...(log ? { log } : {}),
   });
   holder.fake = createFakeAgentOS({ repos: controller.repos });

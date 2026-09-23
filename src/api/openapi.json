@@ -22,6 +22,10 @@
         ],
         "description": "Admission failure yields a WAIT_* state, never FAILED (spec induk §5.1)."
       },
+      "PlanMode": {
+        "type": "string",
+        "enum": ["DIRECT_EXECUTION", "LIGHTWEIGHT_PLAN", "FULL_WORKPLAN"]
+      },
       "Task": {
         "type": "object",
         "properties": {
@@ -35,6 +39,9 @@
           "expedited": { "type": "boolean" },
           "expediteUntil": { "type": ["integer", "null"] },
           "qualityClass": { "type": "string", "enum": ["L0", "L1", "L2", "L3", "L4", "L5"] },
+          "planMode": { "$ref": "#/components/schemas/PlanMode" },
+          "complexityScore": { "type": "integer" },
+          "breakdownReason": { "type": ["string", "null"] },
           "status": { "$ref": "#/components/schemas/TaskStatus" },
           "waitReason": { "type": ["string", "null"] },
           "workerId": { "type": ["string", "null"] },
@@ -66,6 +73,22 @@
           "status": { "type": "string" },
           "result": { "type": ["string", "null"] },
           "finalized": { "type": "boolean" }
+        }
+      },
+      "Checkpoint": {
+        "type": "object",
+        "description": "Durable context captured from one interrupted execution (POC-11).",
+        "properties": {
+          "id": { "type": "string" },
+          "taskId": { "type": "string" },
+          "executionId": { "type": ["string", "null"] },
+          "type": { "type": "string" },
+          "stopReason": { "type": ["string", "null"] },
+          "objective": { "type": "string" },
+          "progress": { "type": "object" },
+          "workspaceState": { "type": "object" },
+          "contextSummary": { "type": "string" },
+          "createdAt": { "type": "integer" }
         }
       },
       "Approval": {
@@ -141,6 +164,8 @@
                   "description": { "type": "string" },
                   "priority": { "type": "integer" },
                   "qualityClass": { "type": "string" },
+                  "planMode": { "$ref": "#/components/schemas/PlanMode" },
+                  "decompose": { "type": "boolean", "description": "Set false to store intake metadata without creating child tasks yet." },
                   "workerId": { "type": "string" },
                   "sessionPolicy": { "type": "string" },
                   "modelPolicy": {
@@ -176,7 +201,7 @@
     },
     "/api/work/tasks/{id}": {
       "get": {
-        "summary": "Task detail with executions, approvals and dependencies",
+        "summary": "Task detail with executions, approvals, checkpoints and child TODOs",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
         "responses": {
           "200": {
@@ -189,7 +214,20 @@
                     "task": { "$ref": "#/components/schemas/Task" },
                     "executions": { "type": "array", "items": { "$ref": "#/components/schemas/Execution" } },
                     "approvals": { "type": "array", "items": { "$ref": "#/components/schemas/Approval" } },
-                    "dependencies": { "type": "array", "items": { "type": "object" } }
+                    "dependencies": { "type": "array", "items": { "type": "object" } },
+                    "checkpoints": { "type": "array", "items": { "$ref": "#/components/schemas/Checkpoint" } },
+                    "workItems": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } },
+                    "progress": {
+                      "type": "object",
+                      "properties": {
+                        "state": { "type": "string", "enum": ["EMPTY", "WAITING", "IN_PROGRESS", "NEEDS_ATTENTION", "COMPLETE"] },
+                        "total": { "type": "integer" },
+                        "complete": { "type": "integer" },
+                        "blocked": { "type": "integer" },
+                        "active": { "type": "integer" },
+                        "percent": { "type": "integer" }
+                      }
+                    }
                   }
                 }
               }
@@ -221,6 +259,29 @@
           }
         },
         "responses": { "200": { "description": "Re-queued" }, "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/work/tasks/{id}/resume": {
+      "post": {
+        "summary": "Resume blocked work from its latest checkpoint",
+        "description": "Creates a native CONTINUE revision. The idempotency key is cached in shared state; no artificial user message is inserted.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "content": { "application/json": { "schema": { "type": "object", "properties": {
+            "idempotencyKey": { "type": "string" },
+            "actor": { "type": "string" },
+            "modelPolicy": { "type": "object" }
+          } } } }
+        },
+        "responses": { "200": { "description": "Resume revision queued" }, "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+    "/api/work/tasks/{id}/decompose": {
+      "post": {
+        "summary": "Project a planned task into native child tasks",
+        "description": "Idempotent. Dependencies are stored in task_dependencies and progress is derived from child task states.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Existing or newly created TODO projection" }, "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" } }
       }
     },
     "/api/work/tasks/{id}/expedite": {

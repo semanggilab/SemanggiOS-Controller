@@ -44,6 +44,18 @@ import {
 import { quotaDriverFor } from "../domain/quota-drivers/index.mjs";
 import { nullLogger } from "../domain/logger.mjs";
 
+// D88: acp.spawn wraps our execution id in an announce run id. Non-ACP ids
+// must pass through byte-for-byte because every ordinary run is correlated by
+// this value. The execution id is the final non-empty segment of the measured
+// `announce:v1:...:<execution>` shape.
+export function executionIdFromRunId(runId) {
+  if (runId === null || runId === undefined || runId === "") return null;
+  const value = String(runId);
+  if (!value.startsWith("announce:v1:")) return value;
+  const tail = value.split(":").at(-1);
+  return tail || null;
+}
+
 /**
  * Maps a run outcome onto the execution/task pair.
  *
@@ -162,6 +174,31 @@ export function createSessionEventSink({
   // ends (`stop`) and operator aborts stay immediate — nothing corrects them.
   const pendingEnds = new Map(); // runId -> { timer, data, payload }
   const endGraceMs = () => Number(config?.endGraceMs ?? 1500);
+
+  // POC-11: every interrupted attempt leaves one durable hand-off record.
+  // Redis coordinates the retry/resume, but the checkpoint deliberately lives
+  // in the database so a controller restart cannot erase the work context.
+  async function checkpointInterruption(execution, { type = "failure", reason, source }) {
+    if (!repos.checkpoints || !execution) return null;
+    const latest = await repos.checkpoints.latestForTask(execution.task_id);
+    if (latest?.execution_id === execution.id) return latest;
+    const task = await repos.tasks.get(execution.task_id);
+    if (!task) return null;
+    return repos.checkpoints.create({
+      taskId: task.id,
+      executionId: execution.id,
+      checkpointType: type,
+      stopReason: reason,
+      objective: task.description ?? task.title ?? "",
+      progress: {
+        completed: [],
+        nextActions: ["Inspect the previous execution transcript and continue from the last confirmed result."],
+      },
+      workspaceState: { path: task.workspace_path ?? null, source },
+      contextSummary: `Execution ${execution.id} was interrupted by ${source}: ${reason}`,
+      actor: "session-events",
+    });
+  }
 
   /**
    * The shared tail of every "this run is over, here is the outcome" path:
@@ -305,6 +342,10 @@ export function createSessionEventSink({
         { repos, events, config, log, now },
         { task: { id: execution.task_id }, execution, cause: `run ended: ${verdict.reason}`, source: "sessions.subscribe" },
       );
+      await checkpointInterruption(execution, {
+        reason: verdict.reason,
+        source: "sessions.subscribe",
+      });
       await scheduler?.notify?.("RUN_ENDED");
       log.info("run.ended", {
         task: execution.task_id, exec: runId,
@@ -404,7 +445,7 @@ export function createSessionEventSink({
    * same silent wall — the TASK-E28D15F3/TASK-BFA56024 incident (D47).
    */
   async function applyLateError(payload) {
-    const runId = payload?.runId ?? null;
+    const runId = executionIdFromRunId(payload?.runId);
     const message = payload?.error?.message ?? JSON.stringify(payload?.error ?? {});
     const execution = runId ? await repos.executions.get(runId) : null;
     if (!execution) {
@@ -671,6 +712,10 @@ export function createSessionEventSink({
       waitDetail: detail,
       actor: "gateway-late-error",
     });
+    await checkpointInterruption(execution, {
+      reason: detail,
+      source: "gateway.late-error",
+    });
     const task = await repos.tasks.get(execution.task_id);
     if (task?.workspace_path) {
       const lease = await repos.leases.get(task.workspace_path);
@@ -814,7 +859,7 @@ export function createSessionEventSink({
    * `stop` arriving after a premature `length` must not find the row frozen.
    */
   async function onLifecycleEnd(payload) {
-    const runId = payload?.runId;
+    const runId = executionIdFromRunId(payload?.runId);
     const data = payload?.data ?? {};
     const verdict = classifyRunEnd(data);
     const immediate =
@@ -889,7 +934,8 @@ export function createSessionEventSink({
       // A `start` frame is the first sign of life a dispatched run can give;
       // it counts as activity exactly like a message (D71).
       if (payload?.data?.phase === "start") {
-        if (payload?.runId) await repos.executions.touch(payload.runId, payload.data?.startedAt ?? now());
+        const executionId = executionIdFromRunId(payload?.runId);
+        if (executionId) await repos.executions.touch(executionId, payload.data?.startedAt ?? now());
         return;
       }
       if (payload?.data?.phase !== "end") return;

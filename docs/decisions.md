@@ -3533,3 +3533,36 @@ Verifikasi: kirim 3 pesan ke sesi baru → seq 1..6 di Postgres; kirim ulang
 ke CHS-43DDD754 (yang dulu ditolak) → 200, seq 20. Commit `3f3b8d3`;
 deploy via sync-controller-src.sh (restart service), suite bun 649 lulus
 (2 merah gateway-ws nonce = pra-ada, bukan area ini).
+
+
+## D102 — Resume memakai checkpoint durable + revisi CONTINUE; Redis hanya koordinasi (POC-11)
+
+Resume tidak dimodelkan sebagai pesan pengguna buatan. Stop operator,
+kegagalan lifecycle, dan refusal gateway yang berakhir BLOCKED menulis tepat
+satu `execution_checkpoint` per execution ke database: objective, progress,
+workspace state, stop reason, dan context summary. `POST /tasks/{id}/resume`
+membungkus checkpoint terakhir sebagai konteks terstruktur lalu memanggil
+primitive native `createRevision(..., sessionMode: CONTINUE)`, yang menegakkan
+`BLOCKED → RESUMABLE → QUEUED` dan mempertahankan seluruh execution lama.
+
+Redis menyimpan tiga hal yang boleh hilang dan dibentuk ulang: distributed
+lock resume per task, response idempotency per key, dan heartbeat execution.
+Redis BUKAN sumber kebenaran checkpoint maupun status. Bila Redis tidak ada,
+kontrak durable tetap benar; hanya perlindungan lintas-process yang berkurang.
+
+
+## D103 — WorkPlan adalah proyeksi child task/dependency, bukan subsistem kedua (POC-12)
+
+Intake deterministik menyimpan `plan_mode`, `complexity_score`, dan
+`breakdown_reason` pada task. `DIRECT_EXECUTION` tetap satu task.
+`LIGHTWEIGHT_PLAN`/`FULL_WORKPLAN` memakai `buildPlan` yang sudah ada, membuat
+child sebagai task biasa dengan `parent_task_id`, dan menulis edge lewat
+`task_dependencies`; admission native yang memarkir child pada `WAIT_DEP`.
+Tidak dibuat tabel `work_items`, `work_plans`, scheduler, atau state machine
+tandingan.
+
+Parent adalah container rencana dan tetap `CREATED`; ia tidak didispatch.
+Progress UI/API dihitung setiap kali dari status child (`complete/total`,
+persentase, dan daftar TODO), sehingga tidak ada angka progress mutable yang
+bisa menyimpang dari task sebenarnya. Endpoint decompose idempotent: bila
+child sudah ada, projection yang sama dikembalikan tanpa menggandakan task.
